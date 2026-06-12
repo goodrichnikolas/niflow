@@ -1,0 +1,14 @@
+# Secrets for sensitive NiFi parameters — applied at push time, never committed.
+.niflow-secrets.env
+
+# Python
+__pycache__/
+*.egg-info/
+.pytest_cache/
+
+# Local NiFi container data (mounted volumes)
+.nifi-data/
+
+# Claude Code local state (machine-specific permissions, locks)
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
