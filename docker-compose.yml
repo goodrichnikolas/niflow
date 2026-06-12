@@ -1,0 +1,55 @@
+# Local single-user NiFi instances for developing and testing NiFlow.
+#
+#   docker compose up -d                 -> NiFi 2.7.2  https://localhost:8443/nifi
+#   docker compose --profile v1 up -d    -> NiFi 1.24.0 https://localhost:8444/nifi
+#
+# Both log in as admin / adminpassword123.
+services:
+  # NiFi 1.24.0 — mirrors the work environment (1.24/1.28 line). Opt-in via
+  # the "v1" profile so the default `docker compose up` stays 2.x-only.
+  nifi1:
+    image: apache/nifi:1.24.0
+    container_name: niflow-nifi1
+    profiles: ["v1"]
+    ports:
+      - "8444:8443"
+    environment:
+      NIFI_WEB_HTTPS_PORT: "8443"
+      # 1.x validates the Host header; whitelist the host-mapped port.
+      NIFI_WEB_PROXY_HOST: "localhost:8444"
+      SINGLE_USER_CREDENTIALS_USERNAME: "admin"
+      SINGLE_USER_CREDENTIALS_PASSWORD: "adminpassword123"
+    volumes:
+      - ./.nifi-data/in:/in
+      - ./.nifi-data/out:/out
+    healthcheck:
+      test: ["CMD-SHELL", "curl -k -s -o /dev/null https://$$(hostname):8443/nifi-api/access/config || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 90s
+
+  nifi:
+    image: apache/nifi:2.7.2
+    container_name: niflow-nifi
+    ports:
+      - "8443:8443"
+    environment:
+      NIFI_WEB_HTTPS_PORT: "8443"
+      SINGLE_USER_CREDENTIALS_USERNAME: "admin"
+      # NiFi requires the single-user password to be >= 12 characters.
+      SINGLE_USER_CREDENTIALS_PASSWORD: "adminpassword123"
+    volumes:
+      # Mount host dirs so the GetFile/PutFile examples have somewhere to read/write.
+      - ./.nifi-data/in:/in
+      - ./.nifi-data/out:/out
+    healthcheck:
+      # NiFi binds the web server to the container hostname (not localhost), so
+      # probe via $$(hostname). The endpoint returns 401 (auth required) when up,
+      # so do NOT use curl -f (it fails on 401); connection-refused during boot
+      # makes curl exit non-zero, keeping the container "starting"/unhealthy.
+      test: ["CMD-SHELL", "curl -k -s -o /dev/null https://$$(hostname):8443/nifi-api/access/config || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 90s

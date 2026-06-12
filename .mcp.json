@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "nifi": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory",
+        "/home/nikolas/projects/NiFiMCP",
+        "python",
+        "-m",
+        "nifi_mcp_server.stdio_server"
+      ],
+      "env": {
+        "NIFI_SERVER_ID": "nifi-local"
+      }
+    }
+  }
+}
