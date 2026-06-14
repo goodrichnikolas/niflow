@@ -60,6 +60,10 @@ structurally identical flows produce identical bytes.
 - **Connections** — `a >> b` or `a.to(b, relationships=["failure"], back_pressure_object_threshold=0)`.
   Queue settings (back pressure, expiration, prioritizers, load balancing) round-trip.
 - **Process groups** — nestable (`with flow.process_group("X") as x:`), variables included.
+- **Auto-layout** — components without an explicit `position` are placed along
+  the connection graph; `Flow("X", layout="horizontal")` chains left-to-right
+  (the default), `layout="vertical"` top-to-bottom. Parallel branches fan out
+  on the cross axis. Explicit positions always win.
 - **Ports, funnels, labels** — `InputPort`/`OutputPort`, `Funnel()`, `Label("note")`.
 - **Controller services** — pass an instance as a processor property value; the
   UUID is wired up automatically.
@@ -77,6 +81,14 @@ The CLI and `Flow.push()/Flow.pull()` use a small direct REST client
 (`niflow/client.py`) that speaks the endpoints common to **1.x and 2.x**;
 username/password login covers single-user *and* LDAP. The legacy
 `Flow.deploy()` (component-by-component via nipyapi) remains for 2.x only.
+
+Pushing to a group already under **NiFi Registry version control** rebuilds it
+*in place* — same group id, registry link intact, surfaced as *local changes*
+you commit in the Registry — instead of delete-and-recreate. The in-place
+vehicle differs by line (NiFi 1.x templates, NiFi 2.x copy/paste, since
+templates were removed in 2.x) but the behaviour is identical. Local registries
+for testing come up with `docker compose up` (2.7.2, `:18080`) and the `v1`
+profile (1.24.0, `:18081`).
 
 Local test instances:
 

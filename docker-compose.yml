@@ -1,9 +1,13 @@
 # Local single-user NiFi instances for developing and testing NiFlow.
 #
 #   docker compose up -d                 -> NiFi 2.7.2  https://localhost:8443/nifi
+#                                           + Registry 2.7.2 http://localhost:18080/nifi-registry
 #   docker compose --profile v1 up -d    -> NiFi 1.24.0 https://localhost:8444/nifi
+#                                           + Registry 1.24.0 http://localhost:18081/nifi-registry
 #
-# Both log in as admin / adminpassword123.
+# NiFi logs in as admin / adminpassword123. The registries are unsecured HTTP
+# (local dev only) and are reached from the NiFi containers by service name
+# (http://registry:18080 / http://registry1:18080) when you add a registry client.
 services:
   # NiFi 1.24.0 — mirrors the work environment (1.24/1.28 line). Opt-in via
   # the "v1" profile so the default `docker compose up` stays 2.x-only.
@@ -29,6 +33,21 @@ services:
       retries: 20
       start_period: 90s
 
+  # NiFi Registry paired with the 1.24 line (profile v1). Flow snapshots are
+  # version-line sensitive, so each NiFi talks to a registry on its own version.
+  registry1:
+    image: apache/nifi-registry:1.24.0
+    container_name: niflow-registry1
+    profiles: ["v1"]
+    ports:
+      - "18081:18080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -o /dev/null http://$$(hostname):18080/nifi-registry-api/buckets || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
+
   nifi:
     image: apache/nifi:2.7.2
     container_name: niflow-nifi
@@ -53,3 +72,16 @@ services:
       timeout: 10s
       retries: 20
       start_period: 90s
+
+  # NiFi Registry paired with the default 2.7.2 line.
+  registry:
+    image: apache/nifi-registry:2.7.2
+    container_name: niflow-registry
+    ports:
+      - "18080:18080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -o /dev/null http://$$(hostname):18080/nifi-registry-api/buckets || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
