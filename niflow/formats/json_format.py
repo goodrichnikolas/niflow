@@ -39,24 +39,18 @@ from niflow.core import (
     Processor,
     ProcessGroup,
 )
+from niflow.layout import compute_layout
+from niflow.processors.bundles import default_bundle
 
 # Standard UUID DNS namespace — used as the root for deterministic UUID5s so
 # generated identifiers don't collide with random NiFi-assigned ones.
 _NS = uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
 
-# Sensible-default bundle coordinates for emitted components. NiFi accepts these
-# and resolves the actual NAR on import; we only emit them so the snapshot is
-# well-formed.
-_DEFAULT_PROCESSOR_BUNDLE = {
-    "group": "org.apache.nifi",
-    "artifact": "nifi-standard-nar",
-    "version": "2.7.2",
-}
-_DEFAULT_SERVICE_BUNDLE = {
-    "group": "org.apache.nifi",
-    "artifact": "nifi-standard-services-api-nar",
-    "version": "2.7.2",
-}
+# Bundle (NAR) coordinates for emitted components are resolved per-type by
+# niflow.processors.bundles.default_bundle — most live in nifi-standard-nar, but
+# some (e.g. UpdateAttribute) ship in their own NAR, and emitting the wrong one
+# makes NiFi reject an otherwise-valid type. push() has the final say, rewriting
+# these from the target instance's installed NARs.
 
 
 # =============================================================================
@@ -158,18 +152,17 @@ def _parse_parameter_contexts(raw: Any) -> Dict[str, ParameterContext]:
     return contexts
 
 
-def _parse_bundle(raw: Any) -> Optional[Bundle]:
+def _parse_bundle(raw: Any, type_str: str = "", *, service: bool = False) -> Optional[Bundle]:
     if not raw:
         return None
     group = raw.get("group", "org.apache.nifi")
     artifact = raw.get("artifact", "")
-    # The standard bundles are what we emit as defaults; collapsing them back
-    # to None keeps Python-built flows (bundle=None) round-trip stable. NiFi
-    # resolves these types by name regardless of the bundle version.
-    if group == "org.apache.nifi" and artifact in (
-        _DEFAULT_PROCESSOR_BUNDLE["artifact"],
-        _DEFAULT_SERVICE_BUNDLE["artifact"],
-    ):
+    # If the bundle is just what we'd emit by default for this type, collapse it
+    # back to None so Python-built flows (bundle=None) round-trip stable. We
+    # ignore the version: the default's version is an instance-specific
+    # placeholder, and NiFi resolves the NAR by group+artifact regardless.
+    default = default_bundle(type_str, service=service)
+    if group == default["group"] and artifact == default["artifact"]:
         return None
     return Bundle(group=group, artifact=artifact, version=raw.get("version", ""))
 
@@ -205,7 +198,9 @@ def _populate_group(
             # enabled unless explicitly DISABLED.
             enabled=service_dto.get("scheduledState") != "DISABLED",
             comments=service_dto.get("comments") or "",
-            bundle=_parse_bundle(service_dto.get("bundle")),
+            bundle=_parse_bundle(
+                service_dto.get("bundle"), service_dto.get("type", ""), service=True
+            ),
         )
         identifier = service_dto.get("identifier")
         if identifier:
@@ -271,7 +266,7 @@ def _populate_group(
             retried_relationships=list(proc_dto.get("retriedRelationships") or []),
             backoff_mechanism=proc_dto.get("backoffMechanism") or "PENALIZE_FLOWFILE",
             max_backoff_period=proc_dto.get("maxBackoffPeriod") or "10 mins",
-            bundle=_parse_bundle(proc_dto.get("bundle")),
+            bundle=_parse_bundle(proc_dto.get("bundle"), proc_dto.get("type", "")),
         )
         identifier = proc_dto.get("identifier")
         if identifier:
@@ -456,26 +451,33 @@ def _emit_group(
     group: ProcessGroup,
     parent_identifier: Optional[str],
     identifiers: Dict[int, str],
+    auto_position: Optional[Tuple[float, float]] = None,
 ) -> dict:
     identifier = identifiers[id(group)]
+    # Auto-layout fills in coordinates for components without an explicit
+    # position; explicit positions always win.
+    auto = compute_layout(group)
 
     dto: Dict[str, Any] = {
         "componentType": "PROCESS_GROUP",
         "identifier": identifier,
         "name": group.name,
         "comments": group.comment or "",
-        "position": _emit_position(group.position),
+        "position": _emit_position(group.position or auto_position),
         "controllerServices": [
             _emit_service(svc, identifier, identifiers) for svc in group.controller_services
         ],
         "inputPorts": [
-            _emit_port(p, identifier, identifiers, "INPUT_PORT") for p in group.input_ports
+            _emit_port(p, identifier, identifiers, "INPUT_PORT", auto.get(id(p)))
+            for p in group.input_ports
         ],
         "outputPorts": [
-            _emit_port(p, identifier, identifiers, "OUTPUT_PORT") for p in group.output_ports
+            _emit_port(p, identifier, identifiers, "OUTPUT_PORT", auto.get(id(p)))
+            for p in group.output_ports
         ],
         "processors": [
-            _emit_processor(proc, identifier, identifiers) for proc in group.processors
+            _emit_processor(proc, identifier, identifiers, auto.get(id(proc)))
+            for proc in group.processors
         ],
         "connections": [
             _emit_connection(conn, identifier, identifiers) for conn in group.connections
@@ -485,7 +487,7 @@ def _emit_group(
                 "componentType": "FUNNEL",
                 "identifier": identifiers[id(f)],
                 "groupIdentifier": identifier,
-                "position": _emit_position(f.position),
+                "position": _emit_position(f.position or auto.get(id(f))),
             }
             for f in group.funnels
         ],
@@ -495,7 +497,7 @@ def _emit_group(
                 "identifier": identifiers[id(lbl)],
                 "groupIdentifier": identifier,
                 "label": lbl.text,
-                "position": _emit_position(lbl.position),
+                "position": _emit_position(lbl.position or auto.get(id(lbl))),
                 "width": float(lbl.width),
                 "height": float(lbl.height),
                 "zIndex": 0,
@@ -503,7 +505,8 @@ def _emit_group(
             for lbl in group.labels
         ],
         "processGroups": [
-            _emit_group(child, identifier, identifiers) for child in group.process_groups
+            _emit_group(child, identifier, identifiers, auto.get(id(child)))
+            for child in group.process_groups
         ],
     }
     if group.variables:
@@ -521,9 +524,9 @@ def _emit_position(position: Optional[Tuple[float, float]]) -> dict:
     return {"x": float(position[0]), "y": float(position[1])}
 
 
-def _emit_bundle(bundle: Any, default: dict) -> dict:
+def _emit_bundle(bundle: Any, type_str: str, *, service: bool = False) -> dict:
     if bundle is None:
-        return dict(default)
+        return default_bundle(type_str, service=service)
     return {"group": bundle.group, "artifact": bundle.artifact, "version": bundle.version}
 
 
@@ -538,7 +541,7 @@ def _emit_service(
         "groupIdentifier": group_identifier,
         "name": service.name,
         "type": service.type,
-        "bundle": _emit_bundle(service.bundle, _DEFAULT_SERVICE_BUNDLE),
+        "bundle": _emit_bundle(service.bundle, service.type, service=True),
         "comments": service.comments or "",
         "scheduledState": "ENABLED" if service.enabled else "DISABLED",
         "properties": _emit_properties(service.properties, identifiers),
@@ -551,6 +554,7 @@ def _emit_port(
     group_identifier: str,
     identifiers: Dict[int, str],
     component_type: str,
+    auto_position: Optional[Tuple[float, float]] = None,
 ) -> dict:
     return {
         "componentType": component_type,
@@ -558,7 +562,7 @@ def _emit_port(
         "identifier": identifiers[id(port)],
         "groupIdentifier": group_identifier,
         "name": port.name,
-        "position": _emit_position(port.position),
+        "position": _emit_position(port.position or auto_position),
     }
 
 
@@ -566,6 +570,7 @@ def _emit_processor(
     processor: Processor,
     group_identifier: str,
     identifiers: Dict[int, str],
+    auto_position: Optional[Tuple[float, float]] = None,
 ) -> dict:
     return {
         "componentType": "PROCESSOR",
@@ -573,8 +578,8 @@ def _emit_processor(
         "groupIdentifier": group_identifier,
         "name": processor.name,
         "type": processor.type,
-        "bundle": _emit_bundle(processor.bundle, _DEFAULT_PROCESSOR_BUNDLE),
-        "position": _emit_position(processor.position),
+        "bundle": _emit_bundle(processor.bundle, processor.type),
+        "position": _emit_position(processor.position or auto_position),
         "properties": _emit_properties(processor.properties, identifiers),
         "propertyDescriptors": _emit_service_ref_descriptors(processor.properties),
         "schedulingPeriod": processor.scheduling_period,
@@ -616,11 +621,15 @@ def _emit_service_ref_descriptors(props: dict) -> dict:
     out: Dict[str, Any] = {}
     for key, value in props.items():
         if isinstance(value, ControllerService):
+            # NiFi's VersionedPropertyDescriptor.identifiesControllerService is a
+            # *boolean* flag; the expected service type is resolved from the
+            # referenced service (the property value is its identifier), not the
+            # descriptor. Emitting the type string here is rejected on the JSON
+            # import path ("not of required type boolean").
             out[key] = {
                 "name": key,
                 "displayName": key,
-                "identifiesControllerService": value.type,
-                "identifiesControllerServiceBundle": dict(_DEFAULT_SERVICE_BUNDLE),
+                "identifiesControllerService": True,
             }
     return out
 

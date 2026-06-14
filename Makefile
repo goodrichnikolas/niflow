@@ -1,6 +1,6 @@
 .PHONY: help install nifi-up nifi-down nifi-logs nifi-wait nifi1-up nifi1-down nifi1-wait \
 	test test-integration test-integration-v1 catalog convert example clean \
-	list pull push copy diff
+	list pull push copy diff validate gui
 
 help:
 	@echo "NiFlow make targets:"
@@ -9,8 +9,10 @@ help:
 	@echo "    list             Show the process-group tree with ids"
 	@echo "    copy GROUP=name              Clone a group as a detached working copy"
 	@echo "    pull GROUP=name OUT=flow.py  Pull a group into Python code"
+	@echo "    validate FILE=flow.py        Statically check a flow before pushing"
 	@echo "    diff FILE=flow.py            Diff local Python vs the live group"
 	@echo "    push FILE=flow.py [START=1]  Replace the live group from Python"
+	@echo "    gui                          Launch the NiFlow Helper (needs '.[gui]' extra)"
 	@echo ""
 	@echo "  Environment:"
 	@echo "    install          Install niflow + dev deps (editable)"
@@ -51,28 +53,37 @@ diff:
 	@if [ -z "$(FILE)" ]; then echo "Usage: make diff FILE=flows/my_flow.py"; exit 2; fi
 	python -m niflow diff "$(FILE)"
 
+validate:
+	@if [ -z "$(FILE)" ]; then echo "Usage: make validate FILE=flows/my_flow.py"; exit 2; fi
+	python -m niflow validate "$(FILE)"
+
 push:
 	@if [ -z "$(FILE)" ]; then echo "Usage: make push FILE=flows/my_flow.py [START=1]"; exit 2; fi
 	python -m niflow push "$(FILE)" $(if $(START),--start)
+
+gui:
+	python -m niflow.gui
 
 # --- local NiFi containers ----------------------------------------------------
 
 nifi-up:
 	mkdir -p .nifi-data/in .nifi-data/out
-	docker compose up -d nifi
+	docker compose up -d nifi registry
 	@echo ""
 	@echo "NiFi 2.x starting:"
-	@echo "  UI:  https://localhost:8443/nifi  (admin / adminpassword123)"
-	@echo "  API: https://localhost:8443/nifi-api"
+	@echo "  UI:       https://localhost:8443/nifi  (admin / adminpassword123)"
+	@echo "  API:      https://localhost:8443/nifi-api"
+	@echo "  Registry: http://localhost:18080/nifi-registry"
 	@echo "Run 'make nifi-wait' to block until it's ready."
 
 nifi1-up:
 	mkdir -p .nifi-data/in .nifi-data/out
-	docker compose --profile v1 up -d nifi1
+	docker compose --profile v1 up -d nifi1 registry1
 	@echo ""
 	@echo "NiFi 1.24.0 starting:"
-	@echo "  UI:  https://localhost:8444/nifi  (admin / adminpassword123)"
-	@echo "  API: https://localhost:8444/nifi-api  (set NIFLOW_NIFI_HOST to this for the CLI)"
+	@echo "  UI:       https://localhost:8444/nifi  (admin / adminpassword123)"
+	@echo "  API:      https://localhost:8444/nifi-api  (set NIFLOW_NIFI_HOST to this for the CLI)"
+	@echo "  Registry: http://localhost:18081/nifi-registry"
 	@echo "Run 'make nifi1-wait' to block until it's ready."
 
 nifi-wait:
