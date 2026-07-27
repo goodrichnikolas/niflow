@@ -12,7 +12,7 @@ their endpoints directly.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from niflow.config import NiFiConfig, connect
 from niflow.core import (
@@ -23,7 +23,8 @@ from niflow.core import (
     Processor,
     ProcessGroup,
 )
-from niflow.utils import get_logger, grid_position
+from niflow.layout import compute_layout
+from niflow.utils import get_logger
 
 logger = get_logger()
 
@@ -83,9 +84,13 @@ def _delete_existing(nipyapi: Any, parent_entity: Any, name: str) -> None:
 
 # --- recursive deploy --------------------------------------------------------
 def _deploy_pg(
-    nipyapi: Any, pg: ProcessGroup, parent_entity: Any, auto_terminate_unused: bool
+    nipyapi: Any,
+    pg: ProcessGroup,
+    parent_entity: Any,
+    auto_terminate_unused: bool,
+    auto_position: Optional[Tuple[float, float]] = None,
 ) -> None:
-    location = pg.position or (0.0, 0.0)
+    location = pg.position or auto_position or (0.0, 0.0)
     pg_entity = nipyapi.canvas.create_process_group(
         parent_entity, pg.name, location, comment=getattr(pg, "comment", "") or ""
     )
@@ -93,12 +98,16 @@ def _deploy_pg(
     pg.nifi_id = pg_entity.id
     logger.info("Created process group %r (id=%s)", pg.name, pg.nifi_id)
 
+    # Auto-layout fills in coordinates for components without an explicit
+    # position; explicit positions always win.
+    auto = compute_layout(pg)
+
     _deploy_controller_services(nipyapi, pg, pg_entity)
-    _deploy_ports(nipyapi, pg, pg_entity)
-    _deploy_processors(nipyapi, pg, pg_entity, auto_terminate_unused)
+    _deploy_ports(nipyapi, pg, pg_entity, auto)
+    _deploy_processors(nipyapi, pg, pg_entity, auto_terminate_unused, auto)
 
     for child in pg.process_groups:
-        _deploy_pg(nipyapi, child, pg_entity, auto_terminate_unused)
+        _deploy_pg(nipyapi, child, pg_entity, auto_terminate_unused, auto.get(id(child)))
 
     _deploy_connections(nipyapi, pg)
 
@@ -124,11 +133,12 @@ def _deploy_controller_services(nipyapi: Any, pg: ProcessGroup, pg_entity: Any) 
         )
 
 
-def _deploy_ports(nipyapi: Any, pg: ProcessGroup, pg_entity: Any) -> None:
-    # Lay input ports down the left edge and output ports down the right edge.
-    for column, ports in ((0.0, pg.input_ports), (800.0, pg.output_ports)):
-        for i, port in enumerate(ports):
-            position = port.position or (column, float(i * 150))
+def _deploy_ports(
+    nipyapi: Any, pg: ProcessGroup, pg_entity: Any, auto: Dict[int, Tuple[float, float]]
+) -> None:
+    for ports in (pg.input_ports, pg.output_ports):
+        for port in ports:
+            position = port.position or auto.get(id(port), (0.0, 0.0))
             entity = nipyapi.canvas.create_port(
                 pg_entity.id, port.port_type, port.name, "STOPPED", position=position
             )
@@ -138,11 +148,15 @@ def _deploy_ports(nipyapi: Any, pg: ProcessGroup, pg_entity: Any) -> None:
 
 
 def _deploy_processors(
-    nipyapi: Any, pg: ProcessGroup, pg_entity: Any, auto_terminate_unused: bool
+    nipyapi: Any,
+    pg: ProcessGroup,
+    pg_entity: Any,
+    auto_terminate_unused: bool,
+    auto: Dict[int, Tuple[float, float]],
 ) -> None:
-    for i, proc in enumerate(pg.processors):
+    for proc in pg.processors:
         dtype = _resolve_type(nipyapi.canvas.get_processor_type(proc.type), proc.type, "processor")
-        location = proc.position or grid_position(i)
+        location = proc.position or auto.get(id(proc), (0.0, 0.0))
         entity = nipyapi.canvas.create_processor(pg_entity, dtype, location, name=proc.name)
         proc.nifi_entity = entity
         proc.nifi_id = entity.id

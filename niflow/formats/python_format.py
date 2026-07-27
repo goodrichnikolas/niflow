@@ -473,6 +473,8 @@ def _emit_group_body(
             extra += f", comment={child.comment!r}"
         if child.position is not None:
             extra += f", position={child.position!r}"
+        if child.layout != "horizontal":
+            extra += f", layout={child.layout!r}"
         out.write(f"{indent}with {pg_var}.process_group({child.name!r}{extra}) as {child_var}:\n")
         _emit_group_body(
             child, child_var, varnames, indent + "    ", out, is_top_level=False
@@ -540,10 +542,12 @@ def to_python(flow: Flow, *, module_docstring: Optional[str] = None) -> str:
 
     # 5. The Flow itself, then its body.
     flow_var = varnames[id(flow)]
-    if flow.parent_pg == "root":
-        out.write(f"{flow_var} = Flow({flow.name!r})\n")
-    else:
-        out.write(f"{flow_var} = Flow({flow.name!r}, parent_pg={flow.parent_pg!r})\n")
+    flow_args = [repr(flow.name)]
+    if flow.parent_pg != "root":
+        flow_args.append(f"parent_pg={flow.parent_pg!r}")
+    if flow.layout != "horizontal":
+        flow_args.append(f"layout={flow.layout!r}")
+    out.write(f"{flow_var} = Flow({', '.join(flow_args)})\n")
 
     _emit_group_body(flow, flow_var, varnames, indent="", out=out, is_top_level=True)
 
