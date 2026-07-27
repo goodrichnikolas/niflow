@@ -76,29 +76,22 @@ def from_json(source: Union[str, dict, Path]) -> Flow:
 
     # Two-pass build: first materialise every component so connections (which
     # may reference cross-group endpoints) can resolve ``source.id`` and
-    # ``destination.id`` to live model instances. We also remember each
-    # processor's raw DTO so we can resolve service-ref properties once all
-    # services exist.
+    # ``destination.id`` to live model instances.
     by_identifier: Dict[str, NiFiComponent] = {}
-    processor_dtos: List[Tuple[Processor, dict]] = []
     pending_connections: List[Tuple[ProcessGroup, dict]] = []
 
     flow = Flow(name=contents.get("name", "Flow"))
-    _populate_group(flow, contents, by_identifier, processor_dtos, pending_connections, contexts)
+    _populate_group(flow, contents, by_identifier, pending_connections, contexts)
 
-    # Resolve service-ref properties: any property whose descriptor flags
-    # ``identifiesControllerService`` and whose value matches a known service
-    # identifier is rewritten to hold the service instance itself.
-    for proc, dto in processor_dtos:
-        descriptors = dto.get("propertyDescriptors") or {}
-        for key, descriptor in descriptors.items():
-            if not descriptor or not descriptor.get("identifiesControllerService"):
-                continue
-            current = proc.properties.get(key)
-            if isinstance(current, str):
-                resolved = by_identifier.get(current)
-                if isinstance(resolved, ControllerService):
-                    proc.properties[key] = resolved
+    # Resolve service-ref properties by value: a property holding the id of a
+    # known controller service is rewritten to the service instance itself.
+    # Resolution is deliberately NOT gated on the descriptor's
+    # ``identifiesControllerService`` flag — NiFi 1.x's /download reports it
+    # as false and writes the service's *instance* id as the value (2.x uses
+    # the versioned identifier; both are registered). Ids are UUIDs, so a
+    # value match is unambiguous. Services get the same treatment as
+    # processors — they can reference other services.
+    _resolve_service_refs(flow, by_identifier)
 
     # Build connections once everything is in place.
     for group, conn_dto in pending_connections:
@@ -167,11 +160,24 @@ def _parse_bundle(raw: Any, type_str: str = "", *, service: bool = False) -> Opt
     return Bundle(group=group, artifact=artifact, version=raw.get("version", ""))
 
 
+def _resolve_service_refs(
+    group: ProcessGroup, by_identifier: Dict[str, NiFiComponent]
+) -> None:
+    """Rewrite id-valued properties to their :class:`ControllerService`."""
+    for component in group.processors + group.controller_services:
+        for key, value in component.properties.items():
+            if isinstance(value, str):
+                resolved = by_identifier.get(value)
+                if isinstance(resolved, ControllerService):
+                    component.properties[key] = resolved
+    for child in group.process_groups:
+        _resolve_service_refs(child, by_identifier)
+
+
 def _populate_group(
     group: ProcessGroup,
     dto: dict,
     by_identifier: Dict[str, NiFiComponent],
-    processor_dtos: List[Tuple[Processor, dict]],
     pending_connections: List[Tuple[ProcessGroup, dict]],
     contexts: Dict[str, ParameterContext],
 ) -> None:
@@ -202,9 +208,12 @@ def _populate_group(
                 service_dto.get("bundle"), service_dto.get("type", ""), service=True
             ),
         )
-        identifier = service_dto.get("identifier")
-        if identifier:
-            by_identifier[identifier] = service
+        # Register under the versioned identifier AND the live instance id:
+        # NiFi 1.x service-ref property values carry the latter.
+        for key in ("identifier", "instanceIdentifier"):
+            identifier = service_dto.get(key)
+            if identifier:
+                by_identifier[identifier] = service
         group.controller_services.append(service)
 
     for funnel_dto in dto.get("funnels") or []:
@@ -272,7 +281,6 @@ def _populate_group(
         if identifier:
             by_identifier[identifier] = processor
         group.processors.append(processor)
-        processor_dtos.append((processor, proc_dto))
 
     # Defer connections to the second pass — but still record which group they
     # belong to so we attach them correctly later.
@@ -283,7 +291,7 @@ def _populate_group(
     for child_dto in dto.get("processGroups") or []:
         child = ProcessGroup(name=child_dto.get("name", ""))
         group.process_groups.append(child)
-        _populate_group(child, child_dto, by_identifier, processor_dtos, pending_connections, contexts)
+        _populate_group(child, child_dto, by_identifier, pending_connections, contexts)
 
 
 def _parse_position(raw: Any) -> Optional[Tuple[float, float]]:

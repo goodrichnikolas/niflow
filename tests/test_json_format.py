@@ -130,3 +130,70 @@ def _normalise_positions(node):
     elif isinstance(node, list):
         for v in node:
             _normalise_positions(v)
+
+
+# --- service-ref resolution (NiFi 1.x quirk) --------------------------------
+def test_1x_service_ref_resolves_by_instance_identifier():
+    """NiFi 1.24's /download flags service-ref descriptors as
+    ``identifiesControllerService: false`` and writes the service's *instance*
+    id as the property value. Resolution is by value, so the link survives."""
+    from niflow.core import ControllerService
+
+    snapshot = {
+        "flowContents": {
+            "name": "OneX",
+            "controllerServices": [{
+                "identifier": "svc-versioned-id",
+                "instanceIdentifier": "1111aaaa-0000-1000-8000-instanceuuid",
+                "name": "Reader",
+                "type": "org.apache.nifi.json.JsonTreeReader",
+                "properties": {},
+            }],
+            "processors": [{
+                "identifier": "proc-versioned-id",
+                "name": "Convert",
+                "type": "org.apache.nifi.processors.standard.ConvertRecord",
+                "properties": {"Record Reader": "1111aaaa-0000-1000-8000-instanceuuid"},
+                "propertyDescriptors": {
+                    "Record Reader": {
+                        "name": "Record Reader",
+                        "identifiesControllerService": False,  # the 1.x lie
+                    },
+                },
+            }],
+        }
+    }
+    flow = Flow.from_json(snapshot)
+    ref = flow.processors[0].properties["Record Reader"]
+    assert isinstance(ref, ControllerService)
+    assert ref is flow.controller_services[0]
+
+
+def test_service_to_service_ref_resolves():
+    """A controller service referencing another (e.g. a pool) resolves too."""
+    from niflow.core import ControllerService
+
+    snapshot = {
+        "flowContents": {
+            "name": "SvcRefs",
+            "controllerServices": [
+                {
+                    "identifier": "pool-id",
+                    "name": "Pool",
+                    "type": "org.apache.nifi.dbcp.DBCPConnectionPool",
+                    "properties": {},
+                },
+                {
+                    "identifier": "lookup-id",
+                    "name": "Lookup",
+                    "type": "org.apache.nifi.lookup.db.DatabaseRecordLookupService",
+                    "properties": {"Database Connection Pooling Service": "pool-id"},
+                },
+            ],
+            "processors": [],
+        }
+    }
+    flow = Flow.from_json(snapshot)
+    ref = flow.controller_services[1].properties["Database Connection Pooling Service"]
+    assert isinstance(ref, ControllerService)
+    assert ref is flow.controller_services[0]

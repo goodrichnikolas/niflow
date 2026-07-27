@@ -53,13 +53,14 @@ Steps (do registry/test infra FIRST so we can probe the schema live before commi
       - `_instantiate_template`: the upload response is **XML** on 1.x, not JSON → parse
         `<template>/<id>` via ElementTree; also delete any pre-existing same-named template
         first (templates are instance-global and an interrupted push leaves one behind).
-- [ ] **Known 1.x pull limitation** (pre-existing, now documented): NiFi 1.24's `/download`
-      reports processor service-ref properties with `identifiesControllerService: false` and a
-      value that doesn't match the snapshot's `controllerService.identifier`, so `pull_flow`
-      can't resolve them to `ControllerService` objects (2.x is self-consistent). The live
-      flow is wired correctly — only the pulled Python model loses the link. Worth a 1.x
-      resolver fallback (match by service name/type) if round-tripping 1.x service-ref flows
-      matters.
+- [x] **1.x pull limitation FIXED** (verified live on 1.24): the `/download` property value
+      turned out to be the service's **`instanceIdentifier`** (1.24 flags the display-name
+      descriptor `identifiesControllerService: false` and also emits duplicate internal-name
+      descriptors — `record-reader` — flagged `true` but with `value: null`). `from_json` now
+      resolves service refs **by value** (ids are UUIDs, so a match is unambiguous) instead of
+      trusting the descriptor flag, and registers services under both `identifier` and
+      `instanceIdentifier`. Bonus: service→service refs (lookup → pool) resolve now too.
+      Unit regressions pin the 1.x snapshot shape in `test_json_format.py`.
 - [ ] **Optional `niflow commit` command.** After an in-place push, niflow leaves the
       group with *local changes* for the user to commit in the Registry. Consider a CLI
       command to commit a new version (with a message) so the whole pull→edit→push→commit
