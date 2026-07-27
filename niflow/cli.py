@@ -7,8 +7,10 @@ The day-to-day loop against a live NiFi (1.x or 2.x)::
     niflow pull "My Flow (copy)" -o flows/my_flow.py
     # ... edit flows/my_flow.py ...
     niflow validate flows/my_flow.py           # catch errors before pushing
-    niflow diff flows/my_flow.py               # what changed vs the live group?
-    niflow push flows/my_flow.py               # replace the live group
+    niflow plan flows/my_flow.py               # semantic "what will change"
+    niflow push flows/my_flow.py --update      # apply only the delta in place
+    niflow diff flows/my_flow.py               # raw JSON diff vs the live group
+    niflow push flows/my_flow.py               # full replace (rebuilds the group)
     niflow push flows/my_flow.py --start       # ... and start it
 
 Connection settings come from env vars (``NIFLOW_NIFI_HOST`` / ``_USER`` /
@@ -98,10 +100,33 @@ def cmd_validate(args: argparse.Namespace) -> int:
 def cmd_push(args: argparse.Namespace) -> int:
     flow = _load_flow_py(args.file, args.var)
     client = _client()
+    if args.update:
+        changes = client.push_update(flow, start=args.start, secrets=args.secrets)
+        if changes:
+            from niflow.plan import format_plan
+
+            print(format_plan(changes))
+            print(f"Applied to {flow.name!r} (id={flow.nifi_id}).")
+        else:
+            print(f"{flow.name!r} already matches the model — nothing to do.")
+        return 0
     new_id = client.push_flow(flow, start=args.start, secrets=args.secrets)
     state = "started" if args.start else "stopped"
     print(f"Pushed {flow.name!r} (id={new_id}, {state}).")
     return 0
+
+
+def cmd_plan(args: argparse.Namespace) -> int:
+    """Show what `push --update` would change, without touching NiFi."""
+    from niflow.plan import format_plan
+
+    flow = _load_flow_py(args.file, args.var)
+    client = _client()
+    pg_id, _live, changes = client.plan_flow(flow)
+    if pg_id is None:
+        print(f"Group {flow.name!r} does not exist yet — everything below is new.")
+    print(format_plan(changes))
+    return 1 if changes else 0
 
 
 def cmd_copy(args: argparse.Namespace) -> int:
@@ -211,12 +236,25 @@ def main(argv: Optional[list] = None) -> int:
     p.add_argument("--format", choices=("py", "json"), default="py")
     p.set_defaults(func=cmd_pull)
 
-    p = sub.add_parser("push", help="Push a flow .py to NiFi (delete-and-recreate)")
+    p = sub.add_parser("push", help="Push a flow .py to NiFi")
     p.add_argument("file", help="Python module exposing a top-level Flow")
     p.add_argument("--var", default="flow", help="Flow variable name (default: flow)")
     p.add_argument("--start", action="store_true", help="Enable services and start after push")
     p.add_argument("--secrets", help="Secrets file for sensitive parameters (default: .niflow-secrets.env)")
+    p.add_argument(
+        "--update",
+        action="store_true",
+        help="Apply only the diff with targeted calls (queues/state survive) "
+        "instead of rebuilding the group",
+    )
     p.set_defaults(func=cmd_push)
+
+    p = sub.add_parser(
+        "plan", help="Show what `push --update` would change (read-only)"
+    )
+    p.add_argument("file", help="Python module exposing a top-level Flow")
+    p.add_argument("--var", default="flow")
+    p.set_defaults(func=cmd_plan)
 
     p = sub.add_parser(
         "validate", help="Statically validate a flow .py (no NiFi connection needed)"
