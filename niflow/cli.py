@@ -6,6 +6,7 @@ The day-to-day loop against a live NiFi (1.x or 2.x)::
     niflow copy "My Flow"                      # detached working copy to play with
     niflow pull "My Flow (copy)" -o flows/my_flow.py
     # ... edit flows/my_flow.py ...
+    niflow validate flows/my_flow.py           # catch errors before pushing
     niflow diff flows/my_flow.py               # what changed vs the live group?
     niflow push flows/my_flow.py               # replace the live group
     niflow push flows/my_flow.py --start       # ... and start it
@@ -74,6 +75,24 @@ def cmd_pull(args: argparse.Namespace) -> int:
     else:
         sys.stdout.write(text)
     return 0
+
+
+def cmd_validate(args: argparse.Namespace) -> int:
+    """Statically validate a flow .py — no NiFi connection required.
+
+    Catches the errors NiFi would reject on push (unhandled relationships,
+    missing required properties, bad values) using the harvested rulebook, so
+    you can fix them before pushing. Exit code 1 if any issues are found.
+    """
+    flow = _load_flow_py(args.file, args.var)
+    issues = flow.validate()
+    if not issues:
+        print(f"{flow.name!r} is valid — no issues found.")
+        return 0
+    print(f"{flow.name!r} has {len(issues)} validation issue(s):")
+    for issue in issues:
+        print(f"  • {issue['component']}: {issue['message']}")
+    return 1
 
 
 def cmd_push(args: argparse.Namespace) -> int:
@@ -198,6 +217,13 @@ def main(argv: Optional[list] = None) -> int:
     p.add_argument("--start", action="store_true", help="Enable services and start after push")
     p.add_argument("--secrets", help="Secrets file for sensitive parameters (default: .niflow-secrets.env)")
     p.set_defaults(func=cmd_push)
+
+    p = sub.add_parser(
+        "validate", help="Statically validate a flow .py (no NiFi connection needed)"
+    )
+    p.add_argument("file", help="Python module exposing a top-level Flow")
+    p.add_argument("--var", default="flow")
+    p.set_defaults(func=cmd_validate)
 
     p = sub.add_parser("copy", help="Clone a group as a detached working copy")
     p.add_argument("group", help="Source group name, path, or id")

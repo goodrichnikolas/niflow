@@ -409,6 +409,12 @@ class Flow(ProcessGroup):
 
         return _to_python(self, module_docstring=module_docstring)
 
+    def validate(self) -> List[dict]:
+        """Static pre-push checks; ``[]`` if clean. See :mod:`niflow.validate`."""
+        from niflow.validate import validate_flow
+
+        return validate_flow(self)
+
     @classmethod
     def from_xml(cls, source: Any) -> "Flow":
         """Parse a NiFi 1.x template (``<template><snippet>...``) into a :class:`Flow`."""
