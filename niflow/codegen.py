@@ -41,6 +41,12 @@ _NIFLOW_ROOT = Path(__file__).resolve().parent
 PROCESSORS_CATALOG_PATH = _NIFLOW_ROOT / "processors" / "catalog.py"
 SERVICES_CATALOG_PATH = _NIFLOW_ROOT / "services" / "catalog.py"
 
+# Temp group + client id used while harvesting the rulebook (relationships /
+# descriptors). NiFi only exposes these once a type is instantiated, so we
+# create one of each in a throwaway group, read them back, and delete the group.
+_HARVEST_GROUP = "__niflow_harvest__"
+_CLIENT_ID = "niflow-codegen"
+
 
 # --- name sanitisation ------------------------------------------------------
 
@@ -174,6 +180,51 @@ def _emit_registries(named: List[Tuple[str, Any]]) -> str:
     return "".join(out)
 
 
+def _emit_bundles(named: List[Tuple[str, Any]]) -> str:
+    """Produce the ``BUNDLES`` map: ``type -> {group, artifact, version}``.
+
+    This is the authoritative ``type -> NAR`` mapping for the instance this
+    catalog was generated against; the formats consult it so each type emits the
+    bundle it actually lives in (not every processor is in nifi-standard-nar).
+    """
+    lines = []
+    for _, item in named:
+        bundle = item.bundle
+        lines.append(
+            f"    {item.type!r}: "
+            f"{{'group': {bundle.group!r}, 'artifact': {bundle.artifact!r}, "
+            f"'version': {bundle.version!r}}},"
+        )
+    return "BUNDLES = {\n" + "\n".join(lines) + ("\n" if lines else "") + "}\n"
+
+
+def _emit_relationships(rules: dict) -> str:
+    """Produce the ``RELATIONSHIPS`` map: ``type -> [relationship names]``.
+
+    The harvested rulebook the validator uses to check that every relationship
+    is either connected or auto-terminated — completely, not heuristically.
+    """
+    lines = [
+        f"    {type_str!r}: {sorted(rule.get('relationships', []))!r},"
+        for type_str, rule in sorted(rules.items())
+    ]
+    return "RELATIONSHIPS = {\n" + "\n".join(lines) + ("\n" if lines else "") + "}\n"
+
+
+def _emit_descriptors(rules: dict) -> str:
+    """Produce the ``DESCRIPTORS`` map: ``type -> {prop -> {required, allowable, ...}}``.
+
+    The harvested property rulebook the validator uses to flag missing required
+    properties and out-of-range (non-allowable) values.
+    """
+    lines = []
+    for type_str, rule in sorted(rules.items()):
+        descriptors = rule.get("descriptors") or {}
+        if descriptors:
+            lines.append(f"    {type_str!r}: {descriptors!r},")
+    return "DESCRIPTORS = {\n" + "\n".join(lines) + ("\n" if lines else "") + "}\n"
+
+
 def _render(
     kind: str,
     curated_mod: str,
@@ -182,13 +233,15 @@ def _render(
     component_cls: str,
     named: List[Tuple[str, Any]],
     emit_factory,
+    extra: str = "",
 ) -> str:
     header = _HEADER.format(
         kind=kind, curated=curated_mod, helper=helper,
         component_mod=component_mod, component_cls=component_cls,
     )
     body = "".join(emit_factory(name, item.type) for name, item in named)
-    return header + "\n" + body + _emit_registries(named)
+    rendered = header + "\n" + body + _emit_registries(named) + "\n" + _emit_bundles(named)
+    return rendered + ("\n" + extra if extra else "")
 
 
 # --- public entrypoints -----------------------------------------------------
@@ -208,6 +261,101 @@ def _to_documented_type(dto: dict) -> SimpleNamespace:
     )
 
 
+def _trim_descriptors(descriptors: Optional[dict]) -> dict:
+    """Keep only the descriptor facts the validator can act on.
+
+    A property is worth recording if it's required, constrains values (an enum),
+    is conditionally required (dependencies), or references a controller service.
+    Plain optional free-text properties carry no validation signal, so we drop
+    them to keep the emitted catalog small.
+    """
+    out: dict = {}
+    for name, d in (descriptors or {}).items():
+        entry: dict = {}
+        if d.get("required"):
+            entry["required"] = True
+        default = d.get("defaultValue")
+        if default not in (None, ""):
+            entry["default"] = default
+        allowable = [
+            a["allowableValue"]["value"]
+            for a in (d.get("allowableValues") or [])
+            if a.get("allowableValue")
+        ]
+        if allowable:
+            entry["allowable"] = allowable
+        service = d.get("identifiesControllerService")
+        if service:
+            entry["service"] = service
+        dependencies = [
+            {"property": dep.get("propertyName"),
+             "values": list(dep.get("dependentValues") or [])}
+            for dep in (d.get("dependencies") or [])
+        ]
+        if dependencies:
+            entry["dependencies"] = dependencies
+        if entry:
+            out[name] = entry
+    return out
+
+
+def _harvest_rules(client: Any, proc_types: List[Any]) -> dict:
+    """Instantiate one of each processor type to read its relationships.
+
+    NiFi has no "describe type X" endpoint — relationships (and property
+    descriptors) only appear once a processor exists. So we spin up a throwaway
+    group, create one processor per type (the create response already carries the
+    component's relationships), and delete the group. Best-effort: a type that
+    can't be instantiated (restricted, needs setup) is simply skipped, and the
+    validator falls back to its heuristic for it.
+
+    Returns ``{type: {"relationships": [...]}}``.
+    """
+    rules: dict = {}
+    root = client.root_id()
+    group = client._request(
+        "POST", f"/process-groups/{root}/process-groups",
+        json={"revision": {"version": 0, "clientId": _CLIENT_ID},
+              "component": {"name": _HARVEST_GROUP, "position": {"x": 0.0, "y": 0.0}}},
+    ).json()
+    group_id = group["id"]
+    logger.info("Harvesting rules from %d types into temp group %s", len(proc_types), group_id)
+    try:
+        for i, dt in enumerate(proc_types):
+            try:
+                resp = client._request(
+                    "POST", f"/process-groups/{group_id}/processors",
+                    json={"revision": {"version": 0, "clientId": _CLIENT_ID},
+                          "component": {
+                              "type": dt.type,
+                              "bundle": {"group": dt.bundle.group,
+                                         "artifact": dt.bundle.artifact,
+                                         "version": dt.bundle.version},
+                              "position": {"x": 0.0, "y": float(i)}}},
+                ).json()
+                component = resp.get("component", {})
+                rules[dt.type] = {
+                    "relationships": [r["name"] for r in component.get("relationships", [])],
+                    "descriptors": _trim_descriptors(
+                        (component.get("config") or {}).get("descriptors")
+                    ),
+                }
+            except Exception as exc:  # restricted / un-instantiable type — skip it
+                logger.warning("Skipped %s while harvesting: %s", dt.type, exc)
+    finally:
+        try:
+            version = client._pg_entity(group_id)["revision"]["version"]
+            client._request(
+                "DELETE", f"/process-groups/{group_id}",
+                params={"version": version, "clientId": _CLIENT_ID,
+                        "disconnectedNodeAcknowledged": "false"},
+            )
+            logger.info("Removed temp harvest group %s", group_id)
+        except Exception as exc:  # don't leave it behind silently
+            logger.error("Could not delete temp harvest group %s: %s", group_id, exc)
+    return rules
+
+
 def _fetch(client: Any) -> Tuple[List[Any], List[Any]]:
     """Return ``(processor_types, controller_service_types)`` from the live NiFi.
 
@@ -224,8 +372,17 @@ def _fetch(client: Any) -> Tuple[List[Any], List[Any]]:
     )
 
 
-def generate(config: Optional[NiFiConfig] = None) -> Tuple[int, int]:
-    """Connect to NiFi, regenerate both catalog files, return ``(n_procs, n_svcs)``."""
+def generate(
+    config: Optional[NiFiConfig] = None, *, harvest: bool = True
+) -> Tuple[int, int]:
+    """Connect to NiFi, regenerate both catalog files, return ``(n_procs, n_svcs)``.
+
+    When ``harvest`` is true (the default) each processor type is briefly
+    instantiated to capture its relationships into the ``RELATIONSHIPS`` map the
+    validator uses. This creates and deletes a throwaway group, so it needs
+    write access; pass ``harvest=False`` for a read-only, relationship-less
+    catalog.
+    """
     from niflow.client import NiFiClient
 
     client = NiFiClient(config)
@@ -236,6 +393,8 @@ def generate(config: Optional[NiFiConfig] = None) -> Tuple[int, int]:
     proc_named = _unique_factory_names(procs)
     svc_named = _unique_factory_names(svcs)
 
+    rules = _harvest_rules(client, [item for _, item in proc_named]) if harvest else {}
+
     PROCESSORS_CATALOG_PATH.write_text(
         _render(
             kind="processor",
@@ -245,6 +404,7 @@ def generate(config: Optional[NiFiConfig] = None) -> Tuple[int, int]:
             component_cls="Processor",
             named=proc_named,
             emit_factory=_emit_processor_factory,
+            extra=_emit_relationships(rules) + "\n" + _emit_descriptors(rules),
         )
     )
     SERVICES_CATALOG_PATH.write_text(

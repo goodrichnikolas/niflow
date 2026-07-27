@@ -124,6 +124,14 @@ class FakeNiFi:
             self.created.append(("upload", kw))
             return FakeResponse(201, {"id": "new-id"})
 
+        if (method, path) == ("GET", "/flow/processor-types"):
+            return FakeResponse(200, {"processorTypes": [
+                {"type": "org.x.Fetch",
+                 "bundle": {"group": "org.x", "artifact": "x-nar", "version": "9.9"}},
+            ]})
+        if (method, path) == ("GET", "/flow/controller-service-types"):
+            return FakeResponse(200, {"controllerServiceTypes": []})
+
         if (method, path) == ("GET", "/flow/parameter-contexts"):
             return FakeResponse(200, {"parameterContexts": [{
                 "revision": {"version": 2},
@@ -200,6 +208,11 @@ def test_push_replaces_existing_group_in_order(client, fake):
     # Canvas position of the replaced group is preserved.
     assert body["component"]["position"] == {"x": 123.0, "y": 456.0}
     assert body["versionedFlowSnapshot"]["flowContents"]["name"] == "Prod Flow"
+
+    # Each processor's bundle is rewritten to the target instance's real NAR
+    # (the offline emit can only guess; the live instance is authoritative).
+    proc = body["versionedFlowSnapshot"]["flowContents"]["processors"][0]
+    assert proc["bundle"] == {"group": "org.x", "artifact": "x-nar", "version": "9.9"}
 
     # Parameter update carries the model value AND the secret.
     sent = {p["parameter"]["name"]: p["parameter"]
