@@ -185,6 +185,9 @@ def _populate_group(
     group.comment = dto.get("comments", "") or ""
     group.position = _parse_position(dto.get("position"))
     group.variables = dict(dto.get("variables") or {})
+    # Live snapshots carry each component's canvas id as instanceIdentifier;
+    # keep it so an incremental push can address components directly.
+    group.nifi_id = dto.get("instanceIdentifier")
 
     ctx_name = dto.get("parameterContextName")
     if ctx_name:
@@ -214,6 +217,7 @@ def _populate_group(
             identifier = service_dto.get(key)
             if identifier:
                 by_identifier[identifier] = service
+        service.nifi_id = service_dto.get("instanceIdentifier")
         group.controller_services.append(service)
 
     for funnel_dto in dto.get("funnels") or []:
@@ -221,17 +225,18 @@ def _populate_group(
         identifier = funnel_dto.get("identifier")
         if identifier:
             by_identifier[identifier] = funnel
+        funnel.nifi_id = funnel_dto.get("instanceIdentifier")
         group.funnels.append(funnel)
 
     for label_dto in dto.get("labels") or []:
-        group.labels.append(
-            Label(
-                text=label_dto.get("label") or "",
-                position=_parse_position(label_dto.get("position")),
-                width=float(label_dto.get("width", 150.0)),
-                height=float(label_dto.get("height", 150.0)),
-            )
+        label = Label(
+            text=label_dto.get("label") or "",
+            position=_parse_position(label_dto.get("position")),
+            width=float(label_dto.get("width", 150.0)),
+            height=float(label_dto.get("height", 150.0)),
         )
+        label.nifi_id = label_dto.get("instanceIdentifier")
+        group.labels.append(label)
 
     for port_dto in dto.get("inputPorts") or []:
         port = InputPort(
@@ -241,6 +246,7 @@ def _populate_group(
         identifier = port_dto.get("identifier")
         if identifier:
             by_identifier[identifier] = port
+        port.nifi_id = port_dto.get("instanceIdentifier")
         group.input_ports.append(port)
 
     for port_dto in dto.get("outputPorts") or []:
@@ -251,6 +257,7 @@ def _populate_group(
         identifier = port_dto.get("identifier")
         if identifier:
             by_identifier[identifier] = port
+        port.nifi_id = port_dto.get("instanceIdentifier")
         group.output_ports.append(port)
 
     for proc_dto in dto.get("processors") or []:
@@ -280,6 +287,7 @@ def _populate_group(
         identifier = proc_dto.get("identifier")
         if identifier:
             by_identifier[identifier] = processor
+        processor.nifi_id = proc_dto.get("instanceIdentifier")
         group.processors.append(processor)
 
     # Defer connections to the second pass — but still record which group they
@@ -334,7 +342,7 @@ def _build_connection(
         if not relationships:
             relationships = ["success"]
 
-    return Connection(
+    connection = Connection(
         name=dto.get("name") or "",
         source=source,
         target=target,
@@ -347,6 +355,8 @@ def _build_connection(
         partitioning_attribute=dto.get("partitioningAttribute") or "",
         load_balance_compression=dto.get("loadBalanceCompression") or "DO_NOT_COMPRESS",
     )
+    connection.nifi_id = dto.get("instanceIdentifier")
+    return connection
 
 
 # =============================================================================
