@@ -22,10 +22,12 @@ Features so far:
 * **Find Processor** — type-to-search any processor by name or type and open it
   in your default browser (the Windows default under WSL, not Linux chromium).
 * **Pull / Push / Undo** — pull a live group into a .py flow file, or push a
-  .py back to NiFi (delete-and-recreate, with an explicit confirm). Push first
-  runs a static pre-flight validation (unhandled relationships, etc.) and lists
-  any issues so you can cancel or push anyway. Either way the prior state is
-  stashed so one **Undo** reverts the last pull or push.
+  .py back to NiFi. Push first runs a static pre-flight validation and computes
+  the semantic change plan; the confirm dialog shows both ("Details" holds the
+  full plan) and offers **Apply changes** (incremental — only what differs is
+  touched, queues and running state survive) or **Full rebuild**
+  (delete-and-recreate). Either way the prior state is stashed so one **Undo**
+  reverts the last pull or push.
 * **Purge All Queues** — drop the contents of every queue in the whole tree
   (NiFi's empty-all-connections request from root, which recurses), instead
   of right-clicking through each nested group.
@@ -55,7 +57,7 @@ from typing import Any, Callable, List, Optional
 
 from html import escape
 
-from PyQt6.QtCore import QObject, QThread, Qt, pyqtSignal
+from PyQt6.QtCore import QObject, QThread, Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -333,7 +335,8 @@ class HelperWindow(QMainWindow):
         self.pull_button.setToolTip("Pull a live process group into a Python flow file")
         self.push_button = QPushButton("Push…")
         self.push_button.setToolTip(
-            "Push a Python flow file to NiFi (delete-and-recreate; confirms first)"
+            "Push a Python flow file to NiFi — shows the change plan first, "
+            "then applies just the delta (or a full rebuild if you choose)"
         )
         self.undo_button = QPushButton("Undo")
         self.undo_button.setEnabled(False)
@@ -542,7 +545,7 @@ class HelperWindow(QMainWindow):
         return out
 
     def push_flow(self) -> None:
-        """Push a .py flow file to NiFi after an explicit, destructive-op confirm."""
+        """Push a .py flow file: plan first, then apply the delta (or rebuild)."""
         path, _ = QFileDialog.getOpenFileName(
             self, "Push flow file", str(_default_flows_dir()), "Python (*.py)"
         )
@@ -556,45 +559,82 @@ class HelperWindow(QMainWindow):
             return
 
         issues = flow.validate()  # pre-flight: catch unhandled relationships, etc.
-        warning = (
-            "This DELETES and recreates the live group with this name "
-            "(delete-and-recreate). Any change made only on the canvas is lost.\n\n"
-            "Undo will restore the previous version."
+        self._start_job(
+            lambda: self.client.plan_flow(flow),
+            lambda plan: self._confirm_push(flow, issues, plan),
+            f"Planning push of {flow.name!r}…",
         )
 
+    def _confirm_push(self, flow: Any, issues: list, plan: tuple) -> None:
+        from niflow.plan import format_plan
+
+        pg_id, _live, changes = plan
+        exists = pg_id is not None
+        if exists and not changes and not issues:
+            self.status.setText(f"{flow.name!r} already matches NiFi — nothing to push.")
+            return
+
+        plan_text = format_plan(changes)
         box = QMessageBox(self)
         box.setWindowTitle("Confirm push")
         if issues:
             box.setIcon(QMessageBox.Icon.Critical)
             box.setText(f"{flow.name!r} has {len(issues)} validation issue(s):")
             listing = "\n".join(f"  • {i['component']}: {i['message']}" for i in issues)
-            box.setInformativeText(f"{listing}\n\n{warning}\n\nPush anyway?")
+            box.setInformativeText(
+                f"{listing}\n\nSee Details for the change plan. Push anyway?"
+            )
+        elif exists:
+            summary = plan_text.splitlines()[-1]  # "Plan: X to add, …"
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setText(f"Apply changes to live group {flow.name!r}?")
+            box.setInformativeText(
+                f"{summary}\n\nApply changes only touches what differs — queues "
+                "and running state survive. Full rebuild deletes and recreates "
+                "the group.\n\nUndo restores the previous version either way."
+            )
         else:
             box.setIcon(QMessageBox.Icon.Warning)
-            box.setText(f"Push {flow.name!r} to NiFi?")
-            box.setInformativeText(warning)
+            box.setText(f"Create group {flow.name!r} on NiFi?")
+            box.setInformativeText("No live group with this name exists yet.")
+        box.setDetailedText(plan_text)
 
-        go = box.addButton(
-            "Push anyway" if issues else "Push", QMessageBox.ButtonRole.AcceptRole
-        )
-        box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
-        box.setDefaultButton(go if not issues else box.buttons()[-1])
+        apply_btn = rebuild_btn = None
+        if exists:
+            apply_btn = box.addButton(
+                "Apply changes anyway" if issues else "Apply changes",
+                QMessageBox.ButtonRole.AcceptRole,
+            )
+            rebuild_btn = box.addButton("Full rebuild", QMessageBox.ButtonRole.DestructiveRole)
+        else:
+            apply_btn = box.addButton(
+                "Create anyway" if issues else "Create", QMessageBox.ButtonRole.AcceptRole
+            )
+        cancel = box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(cancel if issues else apply_btn)
         start_box = QCheckBox("Start processors after push")
         box.setCheckBox(start_box)
         box.exec()
-        if box.clickedButton() is not go:
+
+        clicked = box.clickedButton()
+        start = start_box.isChecked()
+        if clicked is apply_btn and exists:
+            self._start_job(
+                lambda: self._do_push_update(flow, start),
+                self._after_push,
+                f"Applying {len(changes)} change(s) to {flow.name!r}…",
+            )
+        elif clicked is apply_btn or clicked is rebuild_btn:
+            self._start_job(
+                lambda: self._do_push(flow, start),
+                self._after_push,
+                f"Pushing {flow.name!r}…",
+            )
+        else:
             self.status.setText(
                 f"Push cancelled — {len(issues)} validation issue(s)." if issues
                 else "Push cancelled."
             )
-            return
-
-        start = start_box.isChecked()
-        self._start_job(
-            lambda: self._do_push(flow, start),
-            self._after_push,
-            f"Pushing {flow.name!r}…",
-        )
 
     def _do_push(self, flow: Any, start: bool) -> dict:
         # Back up the current live group (if any) so Undo can restore it.
@@ -605,12 +645,25 @@ class HelperWindow(QMainWindow):
         new_id = self.client.push_flow(flow, start=start)
         return {"name": flow.name, "new_id": new_id, "pre_state": pre_state}
 
+    def _do_push_update(self, flow: Any, start: bool) -> dict:
+        try:
+            pre_state = self.client.pull_flow(flow.name)
+        except ValueError:
+            pre_state = None
+        changes = self.client.push_update(flow, start=start)
+        return {"name": flow.name, "new_id": flow.nifi_id,
+                "pre_state": pre_state, "applied": len(changes)}
+
     def _after_push(self, result: dict) -> None:
         existed = result["pre_state"] is not None
+        applied = result.get("applied")
+        verb = (
+            f"Applied {applied} change(s) to" if applied is not None else "Pushed"
+        )
         self._record_undo(
             {"kind": "push", "name": result["name"],
              "pre_state": result["pre_state"], "label": f"push {result['name']}"},
-            f"✓ Pushed {result['name']!r} (id={result['new_id']}) — "
+            f"✓ {verb} {result['name']!r} (id={result['new_id']}) — "
             + ("Undo restores the previous version."
                if existed else "Undo deletes it."),
         )
@@ -820,6 +873,19 @@ class InspectorWindow(QMainWindow):
         self.resize(1100, 640)
 
         self.refresh_button = QPushButton("⟳ Refresh queues & sinks")
+        self.auto_refresh = QCheckBox("Auto-refresh (2s)")
+        self.auto_refresh.setToolTip(
+            "Re-list queues and sinks every 2 seconds while debugging a running flow"
+        )
+        self._auto_timer = QTimer(self)
+        self._auto_timer.setInterval(2000)
+        # Skip a tick rather than queue a second job while one is running.
+        self._auto_timer.timeout.connect(
+            lambda: self.refresh() if self.refresh_button.isEnabled() else None
+        )
+        self.auto_refresh.toggled.connect(
+            lambda on: self._auto_timer.start() if on else self._auto_timer.stop()
+        )
         self.sources = QListWidget()          # left: queues + sinks
         self.items = QListWidget()            # middle: flowfiles / events
         self.attributes = QPlainTextEdit()    # right-top: attributes
@@ -839,8 +905,11 @@ class InspectorWindow(QMainWindow):
         split.addWidget(right)
         split.setSizes([320, 320, 460])
 
+        top_row = QHBoxLayout()
+        top_row.addWidget(self.refresh_button, stretch=1)
+        top_row.addWidget(self.auto_refresh)
         column = QVBoxLayout()
-        column.addWidget(self.refresh_button)
+        column.addLayout(top_row)
         column.addWidget(split, stretch=1)
         column.addWidget(self.status)
         container = QWidget()
