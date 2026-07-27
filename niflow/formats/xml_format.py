@@ -48,6 +48,7 @@ from niflow.core import (
     Processor,
     ProcessGroup,
 )
+from niflow.processors.bundles import default_bundle
 
 # Standard UUID DNS namespace — used as the root for deterministic UUID5s so
 # generated identifiers don't collide with random NiFi-assigned ones.
@@ -490,7 +491,7 @@ def _emit_service(
     _sub_text(elem, "id", identifiers[id(service)])
     _sub_text(elem, "parentGroupId", parent_identifier)
     _emit_position(elem, None)
-    _emit_bundle(elem, _DEFAULT_SERVICE_BUNDLE)
+    _emit_bundle(elem, _bundle_for(service, service.type, _DEFAULT_SERVICE_BUNDLE, service=True))
     _sub_text(elem, "comments", "")
     _emit_descriptors(elem, service.properties)
     _emit_properties(elem, service.properties, identifiers)
@@ -529,7 +530,7 @@ def _emit_processor(
     _sub_text(elem, "id", identifiers[id(processor)])
     _sub_text(elem, "parentGroupId", parent_identifier)
     _emit_position(elem, processor.position)
-    _emit_bundle(elem, _DEFAULT_PROCESSOR_BUNDLE)
+    _emit_bundle(elem, _bundle_for(processor, processor.type, _DEFAULT_PROCESSOR_BUNDLE))
 
     # Config block.
     config = ET.SubElement(elem, "config")
@@ -637,6 +638,24 @@ def _fmt_float(value: float) -> str:
     if float(value).is_integer():
         return f"{float(value):.1f}"
     return repr(float(value))
+
+
+def _bundle_for(
+    component: Any, type_str: str, default: Dict[str, str], *, service: bool = False
+) -> Dict[str, str]:
+    """Resolve a component's NAR coordinates for the XML template.
+
+    Honours an explicit ``component.bundle`` first; otherwise resolves the
+    correct artifact per type (so e.g. UpdateAttribute lands in
+    nifi-update-attribute-nar, not nifi-standard-nar). The template's own
+    version string is kept for byte-stability — NiFi resolves the NAR from
+    group+artifact regardless of version.
+    """
+    bundle = getattr(component, "bundle", None)
+    if bundle is not None:
+        return {"group": bundle.group, "artifact": bundle.artifact, "version": bundle.version}
+    resolved = default_bundle(type_str, service=service)
+    return {"group": resolved["group"], "artifact": resolved["artifact"], "version": default["version"]}
 
 
 def _emit_bundle(parent: ET.Element, bundle: Dict[str, str]) -> None:
