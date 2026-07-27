@@ -262,6 +262,9 @@ class ProcessGroup(NiFiComponent):
 
     comment: str = ""
     position: Optional[Tuple[float, float]] = None
+    # Direction for auto-placing components that have no explicit position:
+    # connected chains march right ("horizontal") or down ("vertical").
+    layout: Literal["horizontal", "vertical"] = "horizontal"
     processors: List[Processor] = Field(default_factory=list)
     controller_services: List[ControllerService] = Field(default_factory=list)
     input_ports: List[InputPort] = Field(default_factory=list)

@@ -12,6 +12,7 @@ from pathlib import Path
 
 from niflow import Flow
 from niflow.core import Port
+from niflow.layout import apply_layout
 
 FIXTURE = Path(__file__).parent / "fixtures" / "nested_groups.flow.json"
 
@@ -106,11 +107,14 @@ def test_python_example_round_trips_through_json():
     _normalize_port_rels(original)
     _normalize_port_rels(parsed)
 
+    # to_json materialises auto-layout coordinates for unpositioned
+    # components; resolve them on the original so the dumps line up.
+    apply_layout(original)
+
     d_orig = original.model_dump(exclude={"nifi_id", "nifi_entity"})
     d_back = parsed.model_dump(exclude={"nifi_id", "nifi_entity"})
 
-    # `from_json` defaults missing position to (0,0) (NiFi always carries one);
-    # the Python builder leaves position=None. Normalise both sides to (0,0).
+    # The group itself still defaults to NiFi's (0,0) when unpositioned.
     _normalise_positions(d_orig)
     _normalise_positions(d_back)
 
