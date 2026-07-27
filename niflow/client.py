@@ -588,6 +588,98 @@ class NiFiClient:
             self.start_group(new_id)
         return new_id
 
+    # ------------------------------------------------------ incremental push
+
+    def plan_flow(self, flow: Flow) -> Tuple[Optional[str], Flow, List[Any]]:
+        """Diff ``flow`` against its live group.
+
+        Returns ``(pg_id, live, changes)``. ``pg_id`` is ``None`` when the
+        group doesn't exist yet — the plan is then "everything is an add".
+        """
+        from niflow.formats.json_format import from_json
+        from niflow.layout import apply_layout
+        from niflow.plan import diff_flows
+
+        # Materialise auto-layout coordinates so planned adds carry positions.
+        apply_layout(flow)
+        parent_id = self.resolve_group(flow.parent_pg or "root")
+        existing = [c for c in self._child_groups(parent_id) if c["name"] == flow.name]
+        if not existing:
+            live = Flow(name=flow.name)
+            return None, live, diff_flows(live, flow)
+        pg_id = existing[0]["id"]
+        live = from_json(self.download_snapshot(pg_id))
+        live.nifi_id = pg_id
+        return pg_id, live, diff_flows(live, flow)
+
+    def push_update(
+        self,
+        flow: Flow,
+        *,
+        start: bool = False,
+        secrets: Union[None, dict, str, Path] = None,
+    ) -> List[Any]:
+        """Incrementally reconcile the live group with ``flow``.
+
+        Unlike :meth:`push_flow` this never rebuilds: it computes the change
+        plan and applies each change with a targeted call, so untouched
+        components keep their state and queues. Returns the applied plan
+        (empty list = live already matched). Creating a missing group falls
+        back to a full :meth:`push_flow`.
+        """
+        from niflow.apply import PlanApplier
+
+        pg_id, live, changes = self.plan_flow(flow)
+        if pg_id is None:
+            logger.info("Group %r not found — creating it in full", flow.name)
+            self.push_flow(flow, start=start, secrets=secrets)
+            return changes
+
+        # Contexts first: a plan may bind a group to a brand-new context, and
+        # value updates (incl. secrets) are independent of the tree diff.
+        self.ensure_parameter_contexts(flow)
+        self.apply_parameters(flow, secrets)
+
+        if changes:
+            PlanApplier(self, pg_id, live, flow).apply(changes)
+            logger.info("Applied %d change(s) to group %r (%s)", len(changes), flow.name, pg_id)
+        else:
+            logger.info("No changes for group %r (%s)", flow.name, pg_id)
+        flow.nifi_id = pg_id
+
+        if start:
+            self.enable_services(pg_id)
+            self.start_group(pg_id)
+        return changes
+
+    def ensure_parameter_contexts(self, flow: Flow) -> None:
+        """Create any parameter context the flow references that NiFi lacks."""
+        for ctx in _iter_contexts(flow):
+            if self._find_context_entity(ctx.name) is not None:
+                continue
+            component: Dict[str, Any] = {
+                "name": ctx.name,
+                "description": ctx.description or "",
+                "parameters": [],
+            }
+            if ctx.inherited_contexts:
+                inherited = []
+                for name in ctx.inherited_contexts:
+                    entity = self._find_context_entity(name)
+                    if entity is None:
+                        logger.warning(
+                            "Inherited parameter context %r not found; skipping link", name
+                        )
+                        continue
+                    inherited.append({"id": entity["id"], "component": {"id": entity["id"]}})
+                component["inheritedParameterContexts"] = inherited
+            self._request(
+                "POST",
+                "/parameter-contexts",
+                json={"revision": {"version": 0, "clientId": "niflow"}, "component": component},
+            )
+            logger.info("Created parameter context %r", ctx.name)
+
     # ----------------------------------------------------- in-place rebuild
 
     def _under_version_control(self, pg_id: str) -> bool:
