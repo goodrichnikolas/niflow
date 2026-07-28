@@ -6,12 +6,21 @@ The day-to-day loop against a live NiFi (1.x or 2.x)::
     niflow copy "My Flow"                      # detached working copy to play with
     niflow pull "My Flow (copy)" -o flows/my_flow.py
     # ... edit flows/my_flow.py ...
-    niflow validate flows/my_flow.py           # catch errors before pushing
+    niflow validate flows/my_flow.py [--live]  # rulebook check (+ NiFi's own, sandboxed)
     niflow plan flows/my_flow.py               # semantic "what will change"
+    niflow test flows/my_flow.py               # inject FlowFiles, assert what comes out
     niflow push flows/my_flow.py --update      # apply only the delta in place
+    niflow rollback "My Flow (copy)"           # undo from the automatic backup
     niflow diff flows/my_flow.py               # raw JSON diff vs the live group
-    niflow push flows/my_flow.py               # full replace (rebuilds the group)
-    niflow push flows/my_flow.py --start       # ... and start it
+    niflow push flows/my_flow.py --env prod    # full replace, prod parameter overlay
+    niflow commit "My Flow" -m "msg"           # save a versioned group to the Registry
+
+Whole-instance workflows::
+
+    niflow pull --all -o flows/                # mirror every top-level group
+    niflow drift                               # ok/DRIFT per flow; exit 1 on any
+    niflow push --all flows/ --update          # reconcile the directory
+    niflow diagram flows/my_flow.py -o doc.md  # Mermaid flowchart for PR review
 
 Connection settings come from env vars (``NIFLOW_NIFI_HOST`` / ``_USER`` /
 ``_PASSWORD`` / ``_VERIFY_SSL``) or the local-Docker defaults; see

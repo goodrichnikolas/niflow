@@ -292,10 +292,22 @@ and pushes flows as code; the MCP server inspects and pokes the live canvas.
 niflow/
   core.py          # models: Flow, ProcessGroup, Processor, Connection, Port,
                    #         ControllerService, ParameterContext, Funnel, Label
-  client.py        # direct REST client: pull/push/copy/delete (NiFi 1.x + 2.x)
+  client.py        # NiFiClient facade (NiFi 1.x + 2.x) — implementation in rest/
+  rest/            #   transport (auth/inventory) / inspect (queues, FlowFiles)
+                   #   / flows (pull/plan/push/parameters) / ops (lifecycle,
+                   #   registry, backup) / common
+  plan.py          # semantic diff: the terraform-style change plan
+  apply.py         # targeted apply of a plan (incremental push)
+  sync.py          # whole-instance mirror: pull --all / push --all / drift
+  testing.py       # flow-test harness: sandbox + inject + assert (niflow test)
+  backup.py        # pre-push snapshots + rollback
+  validate.py      # static rulebook validation (harvested from a live NiFi)
+  mermaid.py       # Mermaid flowchart rendering (niflow diagram)
+  doctor.py        # connection/auth/catalog diagnostician (niflow doctor)
+  layout.py        # auto-placement along the connection graph
   cli.py           # `niflow` CLI (also `python -m niflow`)
-  config.py        # NiFiConfig (+ legacy nipyapi connect())
-  deployment.py    # legacy deploy(): nipyapi orchestration, 2.x only
+  config.py        # NiFiConfig: defaults < .niflow.env file < environment
+  gui.py, webgui.py# desktop (Qt) and browser (stdlib) helpers
   convert.py       # `python -m niflow.convert` offline converter CLI
   formats/         # offline converters (Python <-> JSON <-> XML)
   processors/      # processor factories (curated + generated catalog)
