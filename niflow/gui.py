@@ -47,10 +47,7 @@ Requires the gui extra:  pip install -e ".[gui]"
 """
 from __future__ import annotations
 
-import shutil
-import subprocess
 import sys
-import webbrowser
 from collections import deque
 from pathlib import Path
 from typing import Any, Callable, List, Optional
@@ -115,53 +112,9 @@ def _load_flow_file(path: str):
     return _load_python_flow(path, "flow")
 
 
-def _is_wsl() -> bool:
-    """True when running under WSL (so we should hand URLs to Windows)."""
-    try:
-        with open("/proc/version") as fh:
-            return "microsoft" in fh.read().lower()
-    except OSError:
-        return False
-
-
-def _windows_open_command(url: str) -> Optional[List[str]]:
-    """A command to open *url* in the **Windows default** browser from WSL.
-
-    Plain ``webbrowser``/``xdg-open`` resolve to the *Linux* chromium under WSL;
-    these cross the boundary to Windows so the URL lands in your real default
-    browser (Chrome, if that's the default). Prefers ``wslview``; falls back to
-    PowerShell (single-quoting the URL so an ``&`` in the query string stays
-    literal), then ``cmd.exe``.
-    """
-    if shutil.which("wslview"):
-        return ["wslview", url]
-    if shutil.which("powershell.exe"):
-        return ["powershell.exe", "-NoProfile", "-Command", f"Start-Process '{url}'"]
-    if shutil.which("cmd.exe"):
-        return ["cmd.exe", "/c", "start", "", url]
-    return None
-
-
-def open_url(url: str) -> bool:
-    """Open *url* in the user's real default browser; True if a launcher ran.
-
-    On WSL that means the Windows default browser; elsewhere, the OS default via
-    :mod:`webbrowser`.
-    """
-    if _is_wsl():
-        command = _windows_open_command(url)
-        if command:
-            try:
-                subprocess.Popen(
-                    command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-                )
-                return True
-            except OSError:
-                pass
-    try:
-        return webbrowser.open(url)
-    except Exception:
-        return False
+# Browser-opening helpers live in niflow.utils (stdlib-only) so the web GUI
+# can share them; re-exported here for compatibility.
+from niflow.utils import _is_wsl, _windows_open_command, open_url  # noqa: E402,F401
 
 
 class _Job(QObject):

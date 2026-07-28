@@ -1,22 +1,27 @@
-"""ProcessorPicker filtering + the WSL-aware browser opener."""
+"""ProcessorPicker filtering + the WSL-aware browser opener.
+
+The opener helpers live in niflow.utils (stdlib) so the web GUI shares them;
+gui re-exports them, and the picker tests still need PyQt6.
+"""
 import pytest
 
 pytest.importorskip("PyQt6")
 
 import niflow.gui as gui
+import niflow.utils as nutils
 
 
 # --- WSL browser opener: which command gets chosen --------------------------
 
 def test_windows_open_prefers_wslview(monkeypatch):
-    monkeypatch.setattr(gui.shutil, "which", lambda c: "/usr/bin/wslview" if c == "wslview" else None)
+    monkeypatch.setattr(nutils.shutil, "which", lambda c: "/usr/bin/wslview" if c == "wslview" else None)
     assert gui._windows_open_command("http://h/nifi/?a=1&b=2") == [
         "wslview", "http://h/nifi/?a=1&b=2"]
 
 
 def test_windows_open_falls_back_to_powershell_quoting_the_url(monkeypatch):
     have = {"powershell.exe", "cmd.exe"}
-    monkeypatch.setattr(gui.shutil, "which", lambda c: c if c in have else None)
+    monkeypatch.setattr(nutils.shutil, "which", lambda c: c if c in have else None)
     cmd = gui._windows_open_command("http://h/nifi/?a=1&b=2")
     # Single-quoted so the '&' in the query string stays literal for PowerShell.
     assert cmd == ["powershell.exe", "-NoProfile", "-Command",
@@ -24,28 +29,28 @@ def test_windows_open_falls_back_to_powershell_quoting_the_url(monkeypatch):
 
 
 def test_windows_open_falls_back_to_cmd(monkeypatch):
-    monkeypatch.setattr(gui.shutil, "which", lambda c: c if c == "cmd.exe" else None)
+    monkeypatch.setattr(nutils.shutil, "which", lambda c: c if c == "cmd.exe" else None)
     assert gui._windows_open_command("http://h/x")[:4] == ["cmd.exe", "/c", "start", ""]
 
 
 def test_windows_open_none_when_no_launcher(monkeypatch):
-    monkeypatch.setattr(gui.shutil, "which", lambda c: None)
+    monkeypatch.setattr(nutils.shutil, "which", lambda c: None)
     assert gui._windows_open_command("http://h/x") is None
 
 
 def test_open_url_uses_windows_command_under_wsl(monkeypatch):
     calls = []
-    monkeypatch.setattr(gui, "_is_wsl", lambda: True)
-    monkeypatch.setattr(gui, "_windows_open_command", lambda url: ["wslview", url])
-    monkeypatch.setattr(gui.subprocess, "Popen", lambda cmd, **kw: calls.append(cmd))
+    monkeypatch.setattr(nutils, "_is_wsl", lambda: True)
+    monkeypatch.setattr(nutils, "_windows_open_command", lambda url: ["wslview", url])
+    monkeypatch.setattr(nutils.subprocess, "Popen", lambda cmd, **kw: calls.append(cmd))
     assert gui.open_url("http://h/x") is True
     assert calls == [["wslview", "http://h/x"]]
 
 
 def test_open_url_uses_webbrowser_off_wsl(monkeypatch):
     opened = []
-    monkeypatch.setattr(gui, "_is_wsl", lambda: False)
-    monkeypatch.setattr(gui.webbrowser, "open", lambda u: opened.append(u) or True)
+    monkeypatch.setattr(nutils, "_is_wsl", lambda: False)
+    monkeypatch.setattr(nutils.webbrowser, "open", lambda u: opened.append(u) or True)
     assert gui.open_url("http://h/x") is True
     assert opened == ["http://h/x"]
 
