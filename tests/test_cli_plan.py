@@ -13,7 +13,7 @@ class FakeClient:
 
         return "pg-1", self._live, diff_flows(self._live, flow)
 
-    def push_update(self, flow, *, start=False, secrets=None):
+    def push_update(self, flow, *, start=False, secrets=None, env=None):
         _, _, changes = self.plan_flow(flow)
         self.updated = flow
         flow.nifi_id = "pg-1"

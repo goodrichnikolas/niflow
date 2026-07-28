@@ -1,5 +1,7 @@
 # Secrets for sensitive NiFi parameters — applied at push time, never committed.
-.niflow-secrets.env
+# (Covers per-environment variants like .niflow-secrets.prod.env too. The
+# non-sensitive .niflow-params.<env>.env overlays are MEANT to be committed.)
+.niflow-secrets*.env
 
 # Python
 __pycache__/
@@ -12,6 +14,9 @@ __pycache__/
 # Claude Code local state (machine-specific permissions, locks)
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
+
+# Automatic pre-push snapshots (niflow rollback restores from here)
+.niflow-backups/
 
 # Per-environment connection config (may hold a work password) + TLS material
 .niflow.env

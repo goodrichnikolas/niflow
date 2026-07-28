@@ -145,10 +145,13 @@ NIFLOW_NIFI_CA_BUNDLE=/home/you/certs/nifi-ca.pem
 ## 6. Verify, then work
 
 ```bash
-niflow doctor          # all ✓
+niflow doctor          # all ✓  (also warns if the catalog was harvested
+                       #         from a different NiFi version — run
+                       #         `make catalog` once against this server)
 niflow list            # see the canvas tree
-niflow pull "Top Level Group" -o flows/top.py
+niflow pull "Top Level Group" -o flows/top.py     # or: pull --all -o flows/
 niflow plan flows/top.py
+niflow drift           # cron/CI friendly: exit 1 when code and canvas diverge
 ```
 
 Notes for a Liquibase/CI-managed instance:

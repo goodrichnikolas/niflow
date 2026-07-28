@@ -145,3 +145,28 @@ def test_push_to_unversioned_group_still_recreates(nifi_client):
         for path, comp in list(client.walk_groups()):
             if comp["name"] == name:
                 client.delete_group(comp["id"])
+
+
+def test_commit_saves_local_changes_as_a_new_version(versioned):
+    client, reg_id, bucket_id = versioned
+
+    pg_id = client.push_flow(_convert_flow(f"{NAME}-commit", "ConvertA"))
+    client.start_version_control(pg_id, reg_id, bucket_id, f"{NAME}-commit", "v1")
+
+    flow2 = _convert_flow(f"{NAME}-commit", "ConvertA")
+    flow2.processors[0].scheduling_period = "5 sec"
+    client.push_flow(flow2)
+    assert client.version_control_state(pg_id) == "LOCALLY_MODIFIED"
+
+    info = client.commit_version(pg_id, "tweaked scheduling via niflow")
+    assert str(info.get("version")) not in ("1", "None")
+    assert client.version_control_state(pg_id) == "UP_TO_DATE"
+
+
+def test_commit_refuses_unversioned_group(nifi_client):
+    pg_id = nifi_client.push_flow(_convert_flow(f"{NAME}-plain", "ConvertA"))
+    try:
+        with pytest.raises(ValueError, match="not under version control"):
+            nifi_client.commit_version(pg_id)
+    finally:
+        nifi_client.delete_group(pg_id)

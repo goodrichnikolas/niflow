@@ -234,14 +234,32 @@ def _render(
     named: List[Tuple[str, Any]],
     emit_factory,
     extra: str = "",
+    meta: str = "",
 ) -> str:
     header = _HEADER.format(
         kind=kind, curated=curated_mod, helper=helper,
         component_mod=component_mod, component_cls=component_cls,
     )
     body = "".join(emit_factory(name, item.type) for name, item in named)
-    rendered = header + "\n" + body + _emit_registries(named) + "\n" + _emit_bundles(named)
+    rendered = header + meta + "\n" + body + _emit_registries(named) + "\n" + _emit_bundles(named)
     return rendered + ("\n" + extra if extra else "")
+
+
+def _emit_meta(version: str) -> str:
+    """The provenance stamp: which NiFi wrote this catalog, and when.
+
+    The rulebook silently went stale once (weeks of heuristic-only
+    validation); `niflow doctor` now compares this against the live server.
+    """
+    from datetime import datetime, timezone
+
+    generated = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return (
+        "\nCATALOG_META = {\n"
+        f"    'nifi_version': {version!r},\n"
+        f"    'generated': {generated!r},\n"
+        "}\n"
+    )
 
 
 # --- public entrypoints -----------------------------------------------------
@@ -386,7 +404,9 @@ def generate(
     from niflow.client import NiFiClient
 
     client = NiFiClient(config)
-    logger.info("Generating catalogs from NiFi %s", client.version())
+    nifi_version = client.version()
+    meta = _emit_meta(nifi_version)
+    logger.info("Generating catalogs from NiFi %s", nifi_version)
     procs, svcs = _fetch(client)
     logger.info("Catalog: %d processors, %d controller services on this NiFi", len(procs), len(svcs))
 
@@ -405,6 +425,7 @@ def generate(
             named=proc_named,
             emit_factory=_emit_processor_factory,
             extra=_emit_relationships(rules) + "\n" + _emit_descriptors(rules),
+            meta=meta,
         )
     )
     SERVICES_CATALOG_PATH.write_text(
@@ -416,6 +437,7 @@ def generate(
             component_cls="ControllerService",
             named=svc_named,
             emit_factory=_emit_service_factory,
+            meta=meta,
         )
     )
     return len(proc_named), len(svc_named)

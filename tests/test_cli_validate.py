@@ -18,7 +18,7 @@ def test_validate_clean_flow_exits_zero(tmp_path, capsys):
         "flow.add_connection(gen >> sink)\n"
     ))
     assert main(["validate", path]) == 0
-    assert "no issues found" in capsys.readouterr().out
+    assert "passes static validation" in capsys.readouterr().out
 
 
 def test_validate_reports_issues_and_exits_one(tmp_path, capsys):

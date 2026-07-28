@@ -122,10 +122,11 @@ def run_checks(config: Optional[NiFiConfig] = None, session=None) -> List[Check]
     # --- 4. do the configured credentials actually work? -------------------
     try:
         about = client._get_json("/flow/about").get("about", {})
+        live_version = about.get("version", "?")
         checks.append(Check(OK, "authentication", (
-            f"authenticated via {config.auth_mode}; NiFi version "
-            f"{about.get('version', '?')}"
+            f"authenticated via {config.auth_mode}; NiFi version {live_version}"
         )))
+        checks.append(_catalog_check(live_version))
     except Exception as exc:
         text = str(exc)
         hint = {
@@ -155,6 +156,35 @@ def run_checks(config: Optional[NiFiConfig] = None, session=None) -> List[Check]
             f"lacks 'view the user interface'/component policies: {str(exc)[:160]}"
         )))
     return checks
+
+
+def _catalog_check(live_version: str) -> Check:
+    """Compare the generated catalog's provenance stamp to the live server.
+
+    The catalog (factories + the validation rulebook) is harvested FROM a
+    NiFi instance; against a different version it can miss types or carry
+    stale rules — and it already went silently stale once. WARN, not FAIL:
+    everything works, validation is just only as good as its rulebook.
+    """
+    try:
+        from niflow.processors.catalog import CATALOG_META
+    except ImportError:
+        return Check(WARN, "catalog", (
+            "the processor catalog has no provenance stamp (generated before "
+            "stamping existed) — regenerate against this server: make catalog"
+        ))
+    cat_version = CATALOG_META.get("nifi_version", "?")
+    if cat_version != live_version:
+        return Check(WARN, "catalog", (
+            f"catalog was generated from NiFi {cat_version} "
+            f"({CATALOG_META.get('generated', '?')}) but this server is "
+            f"{live_version} — validation rules may not match; regenerate "
+            "with: make catalog"
+        ))
+    return Check(OK, "catalog", (
+        f"catalog matches this server (NiFi {cat_version}, "
+        f"generated {CATALOG_META.get('generated', '?')})"
+    ))
 
 
 def format_checks(checks: List[Check]) -> str:

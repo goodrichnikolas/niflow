@@ -12,7 +12,10 @@ help:
 	@echo "    validate FILE=flow.py        Statically check a flow before pushing"
 	@echo "    diff FILE=flow.py            Diff local Python vs the live group"
 	@echo "    push FILE=flow.py [START=1]  Replace the live group from Python"
-	@echo "    gui                          Launch the NiFlow Helper (needs '.[gui]' extra)"
+	@echo "    gui / webgui                 Desktop helper / browser helper"
+	@echo ""
+	@echo "  More CLI (run 'niflow <cmd> -h'): plan, test, drift, diagram, backup,"
+	@echo "    rollback, commit, doctor, pull --all, push --all --update, --env overlays"
 	@echo ""
 	@echo "  Environment:"
 	@echo "    install          Install niflow + dev deps (editable)"
@@ -27,6 +30,7 @@ help:
 	@echo "    test-integration     Integration tests against NiFi 2.x (localhost:8443)"
 	@echo "    test-integration-v1  Integration tests against NiFi 1.24 (localhost:8444)"
 	@echo "    catalog              Regenerate processor/service catalogs from NiFi"
+	@echo "    fixtures             Refresh real-server golden snapshots (tests/fixtures/real/)"
 	@echo "    convert              make convert IN=flow.json OUT=flow.py [FLAGS=...]"
 	@echo "    example              Deploy examples/simple_etl.py"
 	@echo "    clean                Remove caches and NiFi data dirs"
@@ -145,6 +149,13 @@ test-integration-v1:
 
 catalog:
 	python -m niflow.codegen
+
+# Refresh the real-server golden fixtures (tests/fixtures/real/) from the
+# NiFi in NIFLOW_NIFI_HOST. Run once per NiFi line:
+#   make fixtures
+#   NIFLOW_NIFI_HOST=https://localhost:8444/nifi-api make fixtures
+fixtures:
+	python scripts/capture_fixtures.py
 
 convert:
 	@if [ -z "$(IN)" ] || [ -z "$(OUT)" ]; then \

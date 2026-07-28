@@ -14,7 +14,17 @@ niflow pull "Prod Flow (copy)" -o flows/prod_flow.py
 niflow plan flows/prod_flow.py               # semantic "what will change"
 niflow push flows/prod_flow.py --update      # apply just that delta in place
 niflow diff flows/prod_flow.py               # raw JSON diff vs the live canvas
+niflow test flows/prod_flow.py               # inject FlowFiles, assert what comes out
 niflow push flows/prod_flow.py --start       # or: full replace and start
+
+niflow pull --all -o flows/                  # mirror EVERY top-level group
+niflow drift                                 # exit 1 if code and canvas diverged
+niflow push --all flows/ --update            # reconcile the whole directory
+
+niflow validate flows/prod_flow.py --live    # NiFi's own validation, via a sandbox
+niflow push flows/prod_flow.py --env prod    # per-environment parameter values
+niflow diagram flows/prod_flow.py -o doc.md  # Mermaid flowchart for PR review
+niflow commit "Prod Flow" -m "tuned batch"   # save a versioned group to the Registry
 ```
 
 …or define a flow from scratch:
@@ -49,6 +59,13 @@ are stopped/updated/restarted, removed connections are drained first, and
 everything untouched keeps its id, state, and **queued FlowFiles**. The loop
 converges: a pull followed by a plan reports zero changes.
 
+Identity is name-based, so renaming a component is really remove+add — the
+plan detects that shape (same type, same group) and **warns before you lose
+state or queued data**. And every mutating push first snapshots the live group
+to `.niflow-backups/`; `niflow rollback <group>` rebuilds it from the newest
+backup (`--list` to browse, `niflow backup` for a manual save point), so a bad
+apply is one command away from undone.
+
 Plain `push` remains the full **delete-and-recreate**: the old group is
 stopped, drained, and replaced, keeping its canvas position. Parameter contexts
 survive replacement (they live outside the group), so sensitive values stored
@@ -61,6 +78,43 @@ fully detached — edit and push at will, delete when done.
 `diff` compares your local `.py` against the live group using the
 deterministic JSON emission (UUID5 identifiers seeded on component paths), so
 structurally identical flows produce identical bytes.
+
+## Test flows with real data (`niflow test`)
+
+Declare cases next to the flow and `niflow test` answers "what does this flow
+actually DO to a file" without a single canvas click:
+
+```python
+from niflow.testing import TestCase
+
+tests = [
+    TestCase(
+        name="urgent CSV is routed, converted, and audited as JSON",
+        inject_at="Stamp",                       # any processor or input port; "Group/Name" paths work
+        content="id,priority\n1,urgent\n",
+        attributes={"origin": "unit-test"},      # extra FlowFile attributes
+        expect_at="Audit",                       # results are read from its input queue
+        expect_attributes={"mime.type": "application/json"},
+        expect_content_contains='"priority"',
+    ),
+]
+```
+
+The harness pushes a **sandbox copy** (the real group is untouched), starts
+everything *except* data sources (the test injects its own FlowFile via a
+temporary run-once generator) and the `expect_at` collector (so results queue
+up instead of being consumed), then checks every arriving FlowFile's
+attributes and content. `--keep` leaves the sandbox on the canvas for
+autopsy. Works identically on 1.x and 2.x; see `examples/kitchen_sink.py`
+for runnable cases.
+
+## Mirror the whole instance (`--all`, `drift`)
+
+`niflow pull --all -o flows/` writes every child group of `--parent`
+(default: the root canvas) to `flows/<slug>.py` — the repo becomes the
+instance. `niflow plan --all flows/` and `niflow push --all flows/ --update`
+iterate the directory; `niflow drift` prints one `ok`/`DRIFT` line per flow
+and exits non-zero on any divergence, made for cron or CI.
 
 ## What's supported
 
@@ -114,6 +168,14 @@ make nifi-mtls-up && make nifi-mtls-wait  # NiFi 1.24.0 secured by CLIENT CERTS 
 The first two log in as **admin** / **adminpassword123**; the mTLS one
 authenticates with the generated `certs/mtls/client.pem`.
 
+Every claim above is tested against real servers, two ways. CI boots
+dockerized NiFi 2.7.2 **and** 1.24.0 and runs the integration suite against
+both on every push. And the unit suite parses **golden fixtures captured from
+live servers** (`tests/fixtures/real/`, refreshed with `make fixtures`) — real
+server output, not hand-built dicts, which is where version quirks actually
+show up (e.g. 2.x silently migrates ConvertRecord's property keys from 1.x
+`record-reader` to `Record Reader`).
+
 Connection settings resolve **defaults < `.niflow.env` config file < real
 environment**. Copy `.niflow.env.example` to `.niflow.env` (git-ignored; also
 searched at `$NIFLOW_CONFIG` and `~/.niflow.env`), fill it out once, and every
@@ -133,6 +195,11 @@ and each failure names the `.niflow.env` key to fix. Full playbook for a work
 instance (Podman, unknown auth): [docs/work-nifi-setup.md](docs/work-nifi-setup.md).
 
 ## Secrets / sensitive parameters
+
+Per-environment values use the same file format: `niflow push --env prod`
+overrides non-sensitive parameter values from `.niflow-params.prod.env`
+(committed — it's config, not secrets) and reads sensitive ones from
+`.niflow-secrets.prod.env` (git-ignored). One flow module, N environments.
 
 A pulled flow renders sensitive parameters without values:
 
@@ -225,10 +292,22 @@ and pushes flows as code; the MCP server inspects and pokes the live canvas.
 niflow/
   core.py          # models: Flow, ProcessGroup, Processor, Connection, Port,
                    #         ControllerService, ParameterContext, Funnel, Label
-  client.py        # direct REST client: pull/push/copy/delete (NiFi 1.x + 2.x)
+  client.py        # NiFiClient facade (NiFi 1.x + 2.x) — implementation in rest/
+  rest/            #   transport (auth/inventory) / inspect (queues, FlowFiles)
+                   #   / flows (pull/plan/push/parameters) / ops (lifecycle,
+                   #   registry, backup) / common
+  plan.py          # semantic diff: the terraform-style change plan
+  apply.py         # targeted apply of a plan (incremental push)
+  sync.py          # whole-instance mirror: pull --all / push --all / drift
+  testing.py       # flow-test harness: sandbox + inject + assert (niflow test)
+  backup.py        # pre-push snapshots + rollback
+  validate.py      # static rulebook validation (harvested from a live NiFi)
+  mermaid.py       # Mermaid flowchart rendering (niflow diagram)
+  doctor.py        # connection/auth/catalog diagnostician (niflow doctor)
+  layout.py        # auto-placement along the connection graph
   cli.py           # `niflow` CLI (also `python -m niflow`)
-  config.py        # NiFiConfig (+ legacy nipyapi connect())
-  deployment.py    # legacy deploy(): nipyapi orchestration, 2.x only
+  config.py        # NiFiConfig: defaults < .niflow.env file < environment
+  gui.py, webgui.py# desktop (Qt) and browser (stdlib) helpers
   convert.py       # `python -m niflow.convert` offline converter CLI
   formats/         # offline converters (Python <-> JSON <-> XML)
   processors/      # processor factories (curated + generated catalog)

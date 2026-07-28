@@ -347,13 +347,58 @@ class PlanApplier:
                     )
                 component["parameterContext"] = {"id": entity["id"]}
         if "variables" in change.fields:
-            logger.warning(
-                "Variable registry changes on %s are not applied incrementally "
-                "(use parameter contexts); skipped: %r -> %r",
-                change.location, *change.fields["variables"],
-            )
+            if self.client._major_version() >= 2:
+                logger.warning(
+                    "NiFi 2.x removed the variable registry (use parameter "
+                    "contexts); skipped on %s: %r -> %r",
+                    change.location, *change.fields["variables"],
+                )
+            else:
+                self._update_variables(gid, *change.fields["variables"])
         if len(component) > 1:
             self._put(f"/process-groups/{gid}", component)
+
+    def _update_variables(self, gid: str, live_vars: dict, desired_vars: dict) -> None:
+        """Reconcile a 1.x group's variable registry (async update-request).
+
+        Variables are set via ``POST .../variable-registry/update-requests``;
+        a ``null`` value deletes the variable. The request is asynchronous
+        (NiFi stops/restarts affected components itself), so poll to
+        completion and clean up the request.
+        """
+        updates = [
+            {"variable": {"name": k, "value": v}}
+            for k, v in desired_vars.items()
+            if live_vars.get(k) != v
+        ]
+        updates += [
+            {"variable": {"name": k, "value": None}}
+            for k in live_vars
+            if k not in desired_vars
+        ]
+        if not updates:
+            return
+        revision = self._get(f"/process-groups/{gid}")["revision"]
+        base = f"/process-groups/{gid}/variable-registry/update-requests"
+        req = self.client._request("POST", base, json={
+            "processGroupRevision": revision,
+            "disconnectedNodeAcknowledged": False,
+            "variableRegistry": {"processGroupId": gid, "variables": updates},
+        }).json()["request"]
+        req_id = req.get("requestId") or req.get("id")
+        try:
+            deadline = time.monotonic() + _POLL_TIMEOUT_S
+            while not req.get("complete"):
+                if time.monotonic() > deadline:
+                    raise TimeoutError(f"variable update on {gid} timed out")
+                time.sleep(_POLL_INTERVAL_S)
+                req = self._get(f"{base}/{req_id}")["request"]
+            if req.get("failureReason"):
+                raise RuntimeError(
+                    f"variable update on {gid} failed: {req['failureReason']}"
+                )
+        finally:
+            self.client._request("DELETE", f"{base}/{req_id}")
 
     # --- controller services
 
@@ -485,21 +530,7 @@ class PlanApplier:
         self.client._delete_component("connections", conn_id)
 
     def _drain_connection(self, conn_id: str) -> None:
-        req = self.client._request(
-            "POST", f"/flowfile-queues/{conn_id}/drop-requests"
-        ).json()["dropRequest"]
-        req_id = req["id"]
-        try:
-            deadline = time.monotonic() + _POLL_TIMEOUT_S
-            while not req.get("finished"):
-                if time.monotonic() > deadline:
-                    raise TimeoutError(f"draining connection {conn_id} timed out")
-                time.sleep(_POLL_INTERVAL_S)
-                req = self._get(f"/flowfile-queues/{conn_id}/drop-requests/{req_id}")["dropRequest"]
-        finally:
-            self.client._request(
-                "DELETE", f"/flowfile-queues/{conn_id}/drop-requests/{req_id}"
-            )
+        self.client.drain_connection(conn_id)
 
     # --- processors
 

@@ -1,0 +1,64 @@
+# CI: unit tests on every push/PR, plus integration tests against REAL NiFi
+# servers (2.7.2 and 1.24.0 in Docker). The unit fakes encode assumptions;
+# every emitter bug so far was only visible against a live server — so a
+# live server is part of the gate, on both major lines.
+#
+# Not covered here: the mTLS server (cert generation needs OpenSSL >= 3.2
+# for -jdktrust; runners ship 3.0) and the full catalog instantiation sweep
+# (5+ min, and 1.24 lacks the 2.x-only types). Both stay local:
+# `make nifi-mtls-up` / `make test-integration`.
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.13"]  # floor per requires-python, plus current
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install -e ".[dev]"
+      - run: pytest -m "not integration" -q
+
+  integration:
+    runs-on: ubuntu-latest
+    needs: unit
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - nifi: "2.7.2"
+            up: nifi-up
+            wait: nifi-wait
+            host: https://localhost:8443/nifi-api
+          - nifi: "1.24.0"
+            up: nifi1-up
+            wait: nifi1-wait
+            host: https://localhost:8444/nifi-api
+    name: integration (NiFi ${{ matrix.nifi }})
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install -e ".[dev]"
+      - name: Start NiFi ${{ matrix.nifi }}
+        run: make ${{ matrix.up }}
+      - name: Wait for NiFi to become healthy
+        timeout-minutes: 8
+        run: make ${{ matrix.wait }}
+      - name: Integration tests against the live server
+        env:
+          NIFLOW_NIFI_HOST: ${{ matrix.host }}
+        run: pytest -m integration --ignore=tests/test_catalog.py -q
+      - name: NiFi logs (on failure)
+        if: failure()
+        run: docker compose logs --tail=200
