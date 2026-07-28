@@ -54,9 +54,20 @@ class FakeClient:
             return self.entities[path]
         return {"revision": {"version": 1}, "component": {}}
 
+    def _major_version(self) -> int:
+        return 1
+
     def _request(self, method: str, path: str, **kw):
         body = kw.get("json") or {}
-        if method == "POST" and path.endswith("/drop-requests"):
+        if method == "POST" and path.endswith("/variable-registry/update-requests"):
+            self.ops.append(
+                "variables "
+                + json.dumps({v["variable"]["name"]: v["variable"]["value"]
+                              for v in body["variableRegistry"]["variables"]},
+                             sort_keys=True)
+            )
+            resp = {"request": {"requestId": "vr1", "complete": True}}
+        elif method == "POST" and path.endswith("/drop-requests"):
             self.ops.append(f"drain {path.split('/')[2]}")
             resp = {"dropRequest": {"id": "dr1", "finished": True}}
         elif method == "PUT" and path.endswith("/run-status"):
@@ -273,3 +284,20 @@ def test_cross_boundary_connection_add_to_child_port():
     body = json.loads(post_conn.split(" ", 2)[2])
     assert body["destination"] == {"id": "port-in", "groupId": "child-pg", "type": "INPUT_PORT"}
     assert body["source"]["id"] == "p-gen"
+
+
+def test_variable_registry_update_is_applied_on_1x():
+    def build(variables):
+        flow = Flow("F")
+        flow.variables = dict(variables)
+        return flow
+
+    client = FakeClient()
+    live = build({"env": "dev", "old": "x"})
+    desired = build({"env": "prod", "new": "y"})
+    _apply(client, live, desired)
+    var_ops = [op for op in client.ops if op.startswith("variables ")]
+    assert var_ops == ['variables {"env": "prod", "new": "y", "old": null}']
+    assert "DELETE /process-groups/root-live/variable-registry/update-requests/vr1" in (
+        " ".join(client.ops)
+    ) or any("update-requests/vr1" in op for op in client.ops)

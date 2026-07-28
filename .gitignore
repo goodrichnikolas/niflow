@@ -1,5 +1,7 @@
 # Secrets for sensitive NiFi parameters — applied at push time, never committed.
-.niflow-secrets.env
+# (Covers per-environment variants like .niflow-secrets.prod.env too. The
+# non-sensitive .niflow-params.<env>.env overlays are MEANT to be committed.)
+.niflow-secrets*.env
 
 # Python
 __pycache__/

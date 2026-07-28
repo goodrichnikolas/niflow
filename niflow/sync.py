@@ -107,18 +107,19 @@ def push_all(
     update: bool = True,
     start: bool = False,
     secrets: Any = None,
+    env: Optional[str] = None,
     var: str = "flow",
 ) -> List[dict]:
     """Push every flow module; incremental by default. Returns per-flow reports."""
     results = []
     for path, flow in load_flows(directory, var):
         if update:
-            changes = client.push_update(flow, start=start, secrets=secrets)
+            changes = client.push_update(flow, start=start, secrets=secrets, env=env)
             results.append({
                 "file": str(path), "name": flow.name,
                 "changes": changes, "id": flow.nifi_id,
             })
         else:
-            new_id = client.push_flow(flow, start=start, secrets=secrets)
+            new_id = client.push_flow(flow, start=start, secrets=secrets, env=env)
             results.append({"file": str(path), "name": flow.name, "changes": None, "id": new_id})
     return results

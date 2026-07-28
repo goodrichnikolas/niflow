@@ -15,6 +15,11 @@ from typing import Any, Dict, Optional
 from niflow.services.standard import _service
 from niflow.core import ControllerService
 
+CATALOG_META = {
+    'nifi_version': '2.7.2',
+    'generated': '2026-07-28',
+}
+
 def ApicurioSchemaRegistry(name: str = 'ApicurioSchemaRegistry', properties: Optional[Dict[str, Any]] = None) -> ControllerService:
     return _service('org.apache.nifi.apicurio.schemaregistry.ApicurioSchemaRegistry', name, properties=properties)
 

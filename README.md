@@ -20,6 +20,11 @@ niflow push flows/prod_flow.py --start       # or: full replace and start
 niflow pull --all -o flows/                  # mirror EVERY top-level group
 niflow drift                                 # exit 1 if code and canvas diverged
 niflow push --all flows/ --update            # reconcile the whole directory
+
+niflow validate flows/prod_flow.py --live    # NiFi's own validation, via a sandbox
+niflow push flows/prod_flow.py --env prod    # per-environment parameter values
+niflow diagram flows/prod_flow.py -o doc.md  # Mermaid flowchart for PR review
+niflow commit "Prod Flow" -m "tuned batch"   # save a versioned group to the Registry
 ```
 
 …or define a flow from scratch:
@@ -190,6 +195,11 @@ and each failure names the `.niflow.env` key to fix. Full playbook for a work
 instance (Podman, unknown auth): [docs/work-nifi-setup.md](docs/work-nifi-setup.md).
 
 ## Secrets / sensitive parameters
+
+Per-environment values use the same file format: `niflow push --env prod`
+overrides non-sensitive parameter values from `.niflow-params.prod.env`
+(committed — it's config, not secrets) and reads sensitive ones from
+`.niflow-secrets.prod.env` (git-ignored). One flow module, N environments.
 
 A pulled flow renders sensitive parameters without values:
 

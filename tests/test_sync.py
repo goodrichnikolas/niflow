@@ -40,7 +40,7 @@ class FakeClient:
 
         return "pg-1", live, diff_flows(live, flow)
 
-    def push_update(self, flow, start=False, secrets=None):
+    def push_update(self, flow, start=False, secrets=None, env=None):
         self.pushed.append(flow.name)
         _, _, changes = self.plan_flow(flow)
         return changes

@@ -131,3 +131,13 @@ def test_doctor_cli_exit_codes(monkeypatch, capsys):
         "niflow.doctor.run_checks", lambda config: [Check(FAIL, "reachability", "down")]
     )
     assert cli_mod.main(["doctor"]) == 1
+
+
+def test_catalog_check_matches_and_mismatches():
+    from niflow.doctor import OK, WARN, _catalog_check
+    from niflow.processors.catalog import CATALOG_META
+
+    ok = _catalog_check(CATALOG_META["nifi_version"])
+    assert ok.status == OK and "matches" in ok.detail
+    warn = _catalog_check("0.0.0-other")
+    assert warn.status == WARN and "make catalog" in warn.detail

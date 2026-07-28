@@ -61,7 +61,9 @@ Steps (do registry/test infra FIRST so we can probe the schema live before commi
       trusting the descriptor flag, and registers services under both `identifier` and
       `instanceIdentifier`. Bonus: service→service refs (lookup → pool) resolve now too.
       Unit regressions pin the 1.x snapshot shape in `test_json_format.py`.
-- [ ] **Optional `niflow commit` command.** After an in-place push, niflow leaves the
+- [x] **`niflow commit`** — commits a versioned group's local changes back to the
+      Registry (`-m` for the message); verified live on 1.24 + 2.7.2 (2026-07-27).
+      Original sketch: After an in-place push, niflow leaves the
       group with *local changes* for the user to commit in the Registry. Consider a CLI
       command to commit a new version (with a message) so the whole pull→edit→push→commit
       loop can stay in niflow.
@@ -70,13 +72,13 @@ Steps (do registry/test infra FIRST so we can probe the schema live before commi
 - [x] **Diff/plan preview before push** — the push dialog now shows the semantic change
       plan (Details pane) and applies it incrementally by default (2026-07-27).
 - [x] **Auto-refresh toggle** on the Inspector window (2026-07-27).
-- [ ] Surface the WSL browser opener (`open_url`) in the Bulletins/Errors panels so those
-      links open the Windows default browser too (currently plain selectable text).
+- [x] Bulletins/Errors panel links are now clickable anchors routed through the
+      WSL-aware `open_url` (2026-07-27).
 
 ## Validation
-- [ ] **Live dry-run validator (phase 1).** Complement the static rulebook with an
-      optional pre-push dry run against a live NiFi to catch value-level errors that
-      can't be encoded as static rules.
+- [x] **Live dry-run validator** — `niflow validate --live` pushes a throwaway
+      sandbox, waits for NiFi's async validation, reports the server's own errors,
+      deletes the sandbox. Verified live on both lines (2026-07-27).
 
 ## Incremental push (2026-07-27) — SHIPPED, verified live on 1.24 + 2.7.2
 - [x] `plan_flow` / `push_update` / `niflow plan` / `niflow push --update`: semantic
@@ -91,8 +93,8 @@ Steps (do registry/test infra FIRST so we can probe the schema live before commi
       concurrentlySchedulableTaskCount + scheduledState, and connection endpoints
       MUST carry groupId — 2.7.2's synchronizer NPEs otherwise (1.x tolerated both;
       first-ever snapshot push of a ported flow to 2.x flushed them out).
-- [ ] Variables (1.x registry) updates in the incremental path (async update-request
-      dance) — plan reports them, apply skips with a warning.
+- [x] Variables (1.x registry) now APPLY incrementally (async update-request dance,
+      null value = delete); live-verified on 1.24. 2.x still warns (no registry there).
 - [ ] Funnel-heavy flows: connection identity for funnels is ordinal-based; inserting
       a funnel mid-list churns adjacent connections. Fine for now.
 
@@ -148,12 +150,18 @@ Implements the top of the "how would you make this better" critique.
       drift on any commented group (fixed + regression test).
 
 ## Remaining critique items (in priority order)
-- [ ] Split client.py (~1.6k lines: transport / pull-push / ops) before it doubles.
-- [ ] Stamp catalogs with source NiFi version; doctor/validate warn on mismatch
-      (the rulebook silently went stale once already).
-- [ ] Environment overlays for parameter values (dev/test/prod, `--env`).
-- [ ] `niflow drift` (plan, exit non-zero) for cron/CI drift detection.
-- [ ] Recursive REST endpoints for walk_groups/list_queues (N+1 calls per group
-      is slow on a big work tree).
-- [ ] Two GUIs duplicate operation surfaces — extract shared ops layer or bless one.
-- [ ] Mermaid flow-diagram generation for PR review.
+- [x] client.py split into niflow/rest/ mixins — transport (197) / inspect (385) /
+      flows (656) / ops (317) / common (81); client.py is a 56-line facade. Public
+      import surface unchanged (`from niflow.client import NiFiClient`).
+- [x] Catalogs carry CATALOG_META (source NiFi version + date); `niflow doctor`
+      warns when the live server's version differs.
+- [x] `push --env <name>`: non-sensitive values from .niflow-params.<name>.env
+      override the model; .niflow-secrets.<name>.env becomes the default secrets file.
+- [x] `niflow drift` shipped with the multi-group sync work.
+- [x] walk_groups/list_queues fast path: ONE recursive /status call for the whole
+      tree (per-group walk kept as fallback); verified live on both lines.
+- [x] Decision: NiFiClient IS the shared ops layer — both GUIs are thin views over
+      it (verified: neither holds flow logic of its own). Web GUI is primary
+      (stdlib, remote-friendly); the Qt helper stays as the desktop fallback.
+- [x] `niflow diagram` renders flows as Mermaid flowcharts (subgraphs per group,
+      relationship-labelled edges, `--all` for a directory) — GitHub draws them inline.

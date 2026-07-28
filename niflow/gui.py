@@ -194,9 +194,10 @@ class JobRunner(QObject):
 class TextPanel(QWidget):
     """A toggleable read-only window for aggregated text (bulletins, errors).
 
-    Renders HTML so entries can show the NiFi UI deep-link for each component as
-    selectable text — copy it into your own browser. Nothing is clickable and no
-    link routing happens, deliberately.
+    Renders HTML; each entry carries the NiFi UI deep-link for its component
+    as a clickable anchor. Clicks route through :func:`niflow.utils.open_url`
+    (so the WSL-aware opener launches the *Windows* default browser), never
+    through Qt's own navigation.
     Emits ``closed`` when the user closes it so the toggle button that opened
     it can untick itself; ``refresh_requested`` when its Refresh is clicked.
     """
@@ -212,8 +213,9 @@ class TextPanel(QWidget):
         self.refresh_button = QPushButton("⟳ Refresh")
         self.summary = QLabel("")
         self.text = QTextBrowser()
-        # Show URLs as plain text; never navigate or hand a link to anything.
+        # Never let the view navigate itself; anchors go to the system opener.
         self.text.setOpenLinks(False)
+        self.text.anchorClicked.connect(lambda url: open_url(url.toString()))
 
         top = QHBoxLayout()
         top.addWidget(self.refresh_button)
@@ -704,7 +706,10 @@ class HelperWindow(QMainWindow):
             )
             if b.get("source_id"):
                 link = self.client.ui_url(b.get("group_id", ""), b["source_id"])
-                row += f'<div style="color:#888">{escape(link)}</div>'
+                row += (
+                    f'<div style="color:#888">'
+                    f'<a href="{escape(link)}">{escape(link)}</a></div>'
+                )
             rows.append(row)
         self.bulletin_panel.show_html(
             f"{len(bulletins)} bulletin(s), newest first",
@@ -725,7 +730,10 @@ class HelperWindow(QMainWindow):
             heading = f"<b>{escape(processor_label(proc))}</b>"
             link = self.client.ui_url(proc.get("group_id", ""), proc.get("id", ""))
             if link:
-                heading += f'<div style="color:#888">{escape(link)}</div>'
+                heading += (
+                    f'<div style="color:#888">'
+                    f'<a href="{escape(link)}">{escape(link)}</a></div>'
+                )
             warnings = "".join(f"<div>&nbsp;&nbsp;⚠ {escape(e)}</div>" for e in proc["errors"])
             blocks.append(f"<div>{heading}{warnings}</div>")
         self.error_panel.show_html(

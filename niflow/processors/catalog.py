@@ -15,6 +15,11 @@ from typing import Any, Dict, Optional
 from niflow.processors.standard import _processor
 from niflow.core import Processor
 
+CATALOG_META = {
+    'nifi_version': '2.7.2',
+    'generated': '2026-07-28',
+}
+
 def ConsumeAMQP(name: str = 'ConsumeAMQP', properties: Optional[Dict[str, Any]] = None, **settings: Any) -> Processor:
     return _processor('org.apache.nifi.amqp.processors.ConsumeAMQP', name, properties=properties, **settings)
 

@@ -114,13 +114,25 @@ def cmd_validate(args: argparse.Namespace) -> int:
     """
     flow = _load_flow_py(args.file, args.var)
     issues = flow.validate()
-    if not issues:
-        print(f"{flow.name!r} is valid — no issues found.")
-        return 0
-    print(f"{flow.name!r} has {len(issues)} validation issue(s):")
-    for issue in issues:
-        print(f"  • {issue['component']}: {issue['message']}")
-    return 1
+    if issues:
+        print(f"{flow.name!r} has {len(issues)} static validation issue(s):")
+        for issue in issues:
+            print(f"  • {issue['component']}: {issue['message']}")
+    else:
+        print(f"{flow.name!r} passes static validation.")
+
+    live_errors = []
+    if args.live:
+        live_errors = _client().validate_flow_live(flow)
+        if live_errors:
+            print(f"NiFi reports {len(live_errors)} invalid component(s) (live dry run):")
+            for err in live_errors:
+                where = f"{err['path']}/{err['name']}".lstrip("/")
+                for message in err["errors"]:
+                    print(f"  • {where}: {message}")
+        else:
+            print("Live dry run: NiFi reports every component valid.")
+    return 1 if (issues or live_errors) else 0
 
 
 def cmd_push(args: argparse.Namespace) -> int:
@@ -130,7 +142,7 @@ def cmd_push(args: argparse.Namespace) -> int:
 
         reports = push_all(
             client, args.file, update=args.update, start=args.start,
-            secrets=args.secrets, var=args.var,
+            secrets=args.secrets, env=args.env, var=args.var,
         )
         for r in reports:
             if r["changes"] is None:
@@ -142,7 +154,7 @@ def cmd_push(args: argparse.Namespace) -> int:
         return 0
     flow = _load_flow_py(args.file, args.var)
     if args.update:
-        changes = client.push_update(flow, start=args.start, secrets=args.secrets)
+        changes = client.push_update(flow, start=args.start, secrets=args.secrets, env=args.env)
         if changes:
             from niflow.plan import format_plan
 
@@ -151,7 +163,7 @@ def cmd_push(args: argparse.Namespace) -> int:
         else:
             print(f"{flow.name!r} already matches the model — nothing to do.")
         return 0
-    new_id = client.push_flow(flow, start=args.start, secrets=args.secrets)
+    new_id = client.push_flow(flow, start=args.start, secrets=args.secrets, env=args.env)
     state = "started" if args.start else "stopped"
     print(f"Pushed {flow.name!r} (id={new_id}, {state}).")
     return 0
@@ -192,6 +204,25 @@ def cmd_plan(args: argparse.Namespace) -> int:
         print(f"Group {flow.name!r} does not exist yet — everything below is new.")
     print(format_plan(changes))
     return 1 if changes else 0
+
+
+def cmd_diagram(args: argparse.Namespace) -> int:
+    """Render flow module(s) as Mermaid markdown (GitHub draws it inline)."""
+    from niflow.mermaid import to_markdown
+
+    if args.all:
+        from niflow.sync import load_flows
+
+        docs = [to_markdown(f) for _, f in load_flows(args.file, var=args.var)]
+        text = "\n".join(docs)
+    else:
+        text = to_markdown(_load_flow_py(args.file, args.var))
+    if args.output:
+        Path(args.output).write_text(text)
+        print(f"Wrote {args.output}")
+    else:
+        sys.stdout.write(text)
+    return 0
 
 
 def cmd_drift(args: argparse.Namespace) -> int:
@@ -345,6 +376,15 @@ def cmd_rollback(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_commit(args: argparse.Namespace) -> int:
+    info = _client().commit_version(args.group, args.message or "")
+    print(
+        f"Committed {args.group!r} as version {info.get('version', '?')} "
+        f"(state: {info.get('state', '?')})."
+    )
+    return 0
+
+
 def cmd_delete(args: argparse.Namespace) -> int:
     client = _client()
     pg_id = client.resolve_group(args.group)
@@ -405,6 +445,11 @@ def main(argv: Optional[list] = None) -> int:
     p.add_argument("--var", default="flow", help="Flow variable name (default: flow)")
     p.add_argument("--start", action="store_true", help="Enable services and start after push")
     p.add_argument("--secrets", help="Secrets file for sensitive parameters (default: .niflow-secrets.env)")
+    p.add_argument("--env", help=(
+        "Environment overlay: parameter values from .niflow-params.<ENV>.env "
+        "override the model's (and .niflow-secrets.<ENV>.env becomes the "
+        "default secrets file)"
+    ))
     p.add_argument(
         "--update",
         action="store_true",
@@ -428,6 +473,15 @@ def main(argv: Optional[list] = None) -> int:
     p.set_defaults(func=cmd_plan)
 
     p = sub.add_parser(
+        "diagram", help="Render a flow .py as a Mermaid flowchart (markdown)"
+    )
+    p.add_argument("file", help="Flow module; a directory with --all")
+    p.add_argument("--all", action="store_true", help="Render every flow module in the directory")
+    p.add_argument("-o", "--output", help="Output .md file (default: stdout)")
+    p.add_argument("--var", default="flow")
+    p.set_defaults(func=cmd_diagram)
+
+    p = sub.add_parser(
         "drift",
         help="One line per flow module vs live NiFi; exit 1 on drift (cron/CI friendly)",
     )
@@ -439,6 +493,10 @@ def main(argv: Optional[list] = None) -> int:
         "validate", help="Statically validate a flow .py (no NiFi connection needed)"
     )
     p.add_argument("file", help="Python module exposing a top-level Flow")
+    p.add_argument("--live", action="store_true", help=(
+        "Also dry-run against the live NiFi: push a throwaway sandbox, collect "
+        "the server's own validation errors, delete it"
+    ))
     p.add_argument("--var", default="flow")
     p.set_defaults(func=cmd_validate)
 
@@ -481,6 +539,14 @@ def main(argv: Optional[list] = None) -> int:
     p.add_argument("--secrets", help="Secrets file for sensitive parameters")
     p.add_argument("-y", "--yes", action="store_true", help="Skip confirmation")
     p.set_defaults(func=cmd_rollback)
+
+    p = sub.add_parser(
+        "commit",
+        help="Commit a versioned group's local changes to NiFi Registry",
+    )
+    p.add_argument("group", help="Group name, path, or id (must be under version control)")
+    p.add_argument("-m", "--message", help="Commit message shown in the Registry")
+    p.set_defaults(func=cmd_commit)
 
     p = sub.add_parser("delete", help="Stop, drain, and delete a process group")
     p.add_argument("group", help="Group name, path, or id")

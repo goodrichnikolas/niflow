@@ -58,7 +58,7 @@ def test_push_update_backs_up_before_applying(monkeypatch):
     changes = diff_flows(live, desired)
     monkeypatch.setattr(client, "plan_flow", lambda f: ("pg-1", live, changes))
     monkeypatch.setattr(client, "ensure_parameter_contexts", lambda f: None)
-    monkeypatch.setattr(client, "apply_parameters", lambda f, s: None)
+    monkeypatch.setattr(client, "apply_parameters", lambda f, s=None, env=None: None)
     monkeypatch.setattr(
         client, "_backup", lambda g, name=None: events.append(("backup", g, name))
     )
@@ -83,7 +83,7 @@ def test_push_update_skips_backup_when_no_changes(monkeypatch):
     live = Flow("F")
     monkeypatch.setattr(client, "plan_flow", lambda f: ("pg-1", live, []))
     monkeypatch.setattr(client, "ensure_parameter_contexts", lambda f: None)
-    monkeypatch.setattr(client, "apply_parameters", lambda f, s: None)
+    monkeypatch.setattr(client, "apply_parameters", lambda f, s=None, env=None: None)
     monkeypatch.setattr(
         client, "_backup", lambda g, name=None: events.append(("backup", g))
     )
