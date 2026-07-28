@@ -48,6 +48,39 @@ services:
       retries: 20
       start_period: 60s
 
+  # NiFi 1.24.0 secured with CLIENT CERTIFICATES (no username/password) —
+  # mirrors a work instance doing mTLS. Opt-in via the "mtls" profile; certs
+  # come from `scripts/gen-mtls-certs.sh` (make nifi-mtls-up runs it).
+  # Identity: CN=niflow-client (the generated client cert) is initial admin.
+  nifi-mtls:
+    image: apache/nifi:1.24.0
+    container_name: niflow-nifi-mtls
+    profiles: ["mtls"]
+    ports:
+      - "8445:8443"
+    environment:
+      AUTH: "tls"
+      KEYSTORE_PATH: "/opt/certs/keystore.p12"
+      KEYSTORE_TYPE: "PKCS12"
+      KEYSTORE_PASSWORD: "niflowpass123"
+      TRUSTSTORE_PATH: "/opt/certs/truststore.p12"
+      TRUSTSTORE_TYPE: "PKCS12"
+      TRUSTSTORE_PASSWORD: "niflowpass123"
+      INITIAL_ADMIN_IDENTITY: "CN=niflow-client"
+      NIFI_WEB_PROXY_HOST: "localhost:8445"
+    volumes:
+      - ./certs/mtls:/opt/certs:ro
+    healthcheck:
+      # Authenticated probe with the client cert — proves mTLS end to end.
+      # 1.x binds HTTPS to the container hostname (not localhost), and the
+      # server cert's SAN is localhost, so probe by hostname with -k; strict
+      # CA verification is exercised from the host by `niflow doctor`.
+      test: ["CMD-SHELL", "curl -k -s -o /dev/null --cert /opt/certs/client.pem --key /opt/certs/client.key https://$$(hostname):8443/nifi-api/flow/about || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 90s
+
   nifi:
     image: apache/nifi:2.7.2
     container_name: niflow-nifi
