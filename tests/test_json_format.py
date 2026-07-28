@@ -197,3 +197,30 @@ def test_service_to_service_ref_resolves():
     ref = flow.controller_services[1].properties["Database Connection Pooling Service"]
     assert isinstance(ref, ControllerService)
     assert ref is flow.controller_services[0]
+
+
+# --- lossy-pull warnings ----------------------------------------------------
+def test_unrepresentable_components_produce_pull_warnings():
+    snapshot = {
+        "externalControllerServiceReferences": {
+            "abc-123": {"identifier": "abc-123", "name": "SharedPool"},
+        },
+        "flowContents": {
+            "name": "Lossy",
+            "processors": [],
+            "processGroups": [{
+                "name": "Sub",
+                "remoteProcessGroups": [{"targetUris": "https://other:8443/nifi"}],
+            }],
+        },
+    }
+    flow = Flow.from_json(snapshot)
+    assert len(flow.pull_warnings) == 2
+    joined = "\n".join(flow.pull_warnings)
+    assert "Sub: remote process group -> https://other:8443/nifi" in joined
+    assert "SharedPool" in joined
+
+
+def test_clean_snapshot_has_no_pull_warnings():
+    flow = Flow.from_json(FIXTURE)
+    assert flow.pull_warnings == []

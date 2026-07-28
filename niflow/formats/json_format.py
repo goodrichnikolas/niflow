@@ -81,7 +81,19 @@ def from_json(source: Union[str, dict, Path]) -> Flow:
     pending_connections: List[Tuple[ProcessGroup, dict]] = []
 
     flow = Flow(name=contents.get("name", "Flow"))
-    _populate_group(flow, contents, by_identifier, pending_connections, contexts)
+    warnings: List[str] = []
+    _populate_group(flow, contents, by_identifier, pending_connections, contexts, warnings)
+
+    # Processors may reference controller services defined ABOVE the
+    # downloaded group (ancestor scope). Those arrive only as pointers — the
+    # service itself is not in the snapshot, so the model keeps a raw id.
+    for ref in (data.get("externalControllerServiceReferences") or {}).values():
+        warnings.append(
+            f"references controller service {ref.get('name', '?')!r} defined "
+            "outside this group — its definition is not part of the pull; "
+            "the property keeps the raw id (pull an ancestor group to include it)"
+        )
+    flow.pull_warnings = warnings
 
     # Resolve service-ref properties by value: a property holding the id of a
     # known controller service is rewritten to the service instance itself.
@@ -180,8 +192,17 @@ def _populate_group(
     by_identifier: Dict[str, NiFiComponent],
     pending_connections: List[Tuple[ProcessGroup, dict]],
     contexts: Dict[str, ParameterContext],
+    warnings: Optional[List[str]] = None,
+    path: str = "",
 ) -> None:
     """Fill ``group`` from ``dto`` (a ``VersionedProcessGroup``) in place."""
+    if warnings is not None:
+        for rpg in dto.get("remoteProcessGroups") or []:
+            target = rpg.get("targetUris") or rpg.get("targetUri") or "?"
+            warnings.append(
+                f"{path or '.'}: remote process group -> {target} is not modeled "
+                "by niflow and will NOT survive a push of this flow"
+            )
     group.comment = dto.get("comments", "") or ""
     group.position = _parse_position(dto.get("position"))
     group.variables = dict(dto.get("variables") or {})
@@ -299,7 +320,11 @@ def _populate_group(
     for child_dto in dto.get("processGroups") or []:
         child = ProcessGroup(name=child_dto.get("name", ""))
         group.process_groups.append(child)
-        _populate_group(child, child_dto, by_identifier, pending_connections, contexts)
+        child_path = f"{path}/{child.name}" if path else child.name
+        _populate_group(
+            child, child_dto, by_identifier, pending_connections, contexts,
+            warnings, child_path,
+        )
 
 
 def _parse_position(raw: Any) -> Optional[Tuple[float, float]]:
