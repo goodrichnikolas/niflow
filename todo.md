@@ -76,3 +76,21 @@ Steps (do registry/test infra FIRST so we can probe the schema live before commi
 - [ ] **Live dry-run validator (phase 1).** Complement the static rulebook with an
       optional pre-push dry run against a live NiFi to catch value-level errors that
       can't be encoded as static rules.
+
+## Incremental push (2026-07-27) — SHIPPED, verified live on 1.24 + 2.7.2
+- [x] `plan_flow` / `push_update` / `niflow plan` / `niflow push --update`: semantic
+      diff (niflow/plan.py) + targeted apply (niflow/apply.py). Group id, untouched
+      component ids, and queued FlowFiles all survive; pull→plan converges to zero.
+- [x] GUI push shows the plan first (Details pane) and applies incrementally by
+      default; Full rebuild is the explicit destructive option. Inspector gained an
+      auto-refresh toggle.
+- [x] Lossy pulls warn (remote process groups, external service refs) via
+      Flow.pull_warnings — CLI prints to stderr, GUI flags the status line.
+- [x] Two 2.x snapshot-emitter bugs found by live verification: ports MUST carry
+      concurrentlySchedulableTaskCount + scheduledState, and connection endpoints
+      MUST carry groupId — 2.7.2's synchronizer NPEs otherwise (1.x tolerated both;
+      first-ever snapshot push of a ported flow to 2.x flushed them out).
+- [ ] Variables (1.x registry) updates in the incremental path (async update-request
+      dance) — plan reports them, apply skips with a warning.
+- [ ] Funnel-heavy flows: connection identity for funnels is ordinal-based; inserting
+      a funnel mid-list churns adjacent connections. Fine for now.
