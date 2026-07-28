@@ -102,24 +102,35 @@ templates were removed in 2.x) but the behaviour is identical. Local registries
 for testing come up with `docker compose up` (2.7.2, `:18080`) and the `v1`
 profile (1.24.0, `:18081`).
 
-Local test instances:
+Local test instances (Docker is only ever used to host these disposable
+NiFis — niflow's runtime is pure Python):
 
 ```bash
-make nifi-up   && make nifi-wait    # NiFi 2.7.2  -> https://localhost:8443/nifi
-make nifi1-up  && make nifi1-wait   # NiFi 1.24.0 -> https://localhost:8444/nifi
+make nifi-up      && make nifi-wait       # NiFi 2.7.2  -> https://localhost:8443/nifi
+make nifi1-up     && make nifi1-wait      # NiFi 1.24.0 -> https://localhost:8444/nifi
+make nifi-mtls-up && make nifi-mtls-wait  # NiFi 1.24.0 secured by CLIENT CERTS -> :8445
 ```
 
-Both log in as **admin** / **adminpassword123**. Point the CLI at either (or at
-a real instance) with env vars:
+The first two log in as **admin** / **adminpassword123**; the mTLS one
+authenticates with the generated `certs/mtls/client.pem`.
 
-| Env var | Default |
+Connection settings resolve **defaults < `.niflow.env` config file < real
+environment**. Copy `.niflow.env.example` to `.niflow.env` (git-ignored; also
+searched at `$NIFLOW_CONFIG` and `~/.niflow.env`), fill it out once, and every
+command — CLI, both GUIs, library — connects the same way:
+
+| Key | Meaning |
 | --- | --- |
-| `NIFLOW_NIFI_HOST` | `https://localhost:8443/nifi-api` |
-| `NIFLOW_NIFI_USER` | `admin` |
-| `NIFLOW_NIFI_PASSWORD` | `adminpassword123` |
-| `NIFLOW_NIFI_VERIFY_SSL` | `false` |
+| `NIFLOW_NIFI_HOST` | REST base, must end in `/nifi-api` |
+| `NIFLOW_NIFI_USER` / `NIFLOW_NIFI_PASSWORD` | token login (single-user or LDAP); empty password = anonymous |
+| `NIFLOW_NIFI_CLIENT_CERT` / `NIFLOW_NIFI_CLIENT_KEY` | PEM client certificate -> mTLS (token login skipped) |
+| `NIFLOW_NIFI_CA_BUNDLE` | CA/server PEM to trust (beats `VERIFY_SSL`) |
+| `NIFLOW_NIFI_VERIFY_SSL` | `false` for self-signed dev certs |
 
-> The host URL must include the `/nifi-api` base path.
+**`niflow doctor`** diagnoses an unknown server step by step — reachability,
+TLS trust, which auth mode the server wants, whether your credentials work —
+and each failure names the `.niflow.env` key to fix. Full playbook for a work
+instance (Podman, unknown auth): [docs/work-nifi-setup.md](docs/work-nifi-setup.md).
 
 ## Secrets / sensitive parameters
 
@@ -159,6 +170,16 @@ make push FILE=flows/my_flow.py
 make test                            # unit tests (no NiFi needed)
 make test-integration-v1             # integration tests against 1.24
 ```
+
+## GUIs (both optional)
+
+- **`niflow-web`** (`make webgui`) — browser-based helper on
+  `http://127.0.0.1:7777`, zero extra dependencies: processor list with
+  run-once/start/stop, queue browser with FlowFile attribute+content
+  inspection, bulletins/error panels, and plan-preview + incremental push for
+  `flows/*.py`. Under WSL it opens the *Windows* default browser.
+- **`niflow-gui`** (`make gui`) — the PyQt6 desktop helper (`pip install -e
+  ".[gui]"`), same capabilities as a native window.
 
 ## Convert flows
 
