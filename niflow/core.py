@@ -359,6 +359,11 @@ class Flow(ProcessGroup):
     """
 
     parent_pg: str = "root"
+    # Filled by from_json when a live snapshot contained things the model
+    # cannot represent (remote process groups, external service references).
+    # Never serialised; surfaced by `niflow pull` and the GUI so a lossy pull
+    # is loud instead of silent.
+    pull_warnings: List[str] = Field(default_factory=list, exclude=True)
 
     def deploy(self, config: Any = None, start: bool = False, auto_terminate_unused: bool = True) -> "Flow":
         """Deploy this flow to NiFi component-by-component via nipyapi (legacy, 2.x only).

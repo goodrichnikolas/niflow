@@ -76,6 +76,18 @@ def cmd_pull(args: argparse.Namespace) -> int:
         print(f"Pulled {flow.name!r} -> {args.output}")
     else:
         sys.stdout.write(text)
+    if flow.pull_warnings:
+        print(
+            f"\nWARNING: pull of {flow.name!r} is LOSSY "
+            f"({len(flow.pull_warnings)} issue(s)):",
+            file=sys.stderr,
+        )
+        for warning in flow.pull_warnings:
+            print(f"  ! {warning}", file=sys.stderr)
+        print(
+            "  Pushing this file back will drop the components above.",
+            file=sys.stderr,
+        )
     return 0
 
 

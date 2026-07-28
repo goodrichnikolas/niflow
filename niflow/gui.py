@@ -528,21 +528,24 @@ class HelperWindow(QMainWindow):
         previous = Path(out).read_text() if Path(out).exists() else None
         self._start_job(
             lambda: self._do_pull(label, name, out),
-            lambda _: self._record_undo(
+            lambda warnings: self._record_undo(
                 {"kind": "pull", "path": out, "previous": previous,
                  "label": f"pull → {Path(out).name}"},
-                f"✓ Pulled {name!r} → {out}",
+                f"✓ Pulled {name!r} → {out}"
+                + (f" — ⚠ LOSSY: {len(warnings)} component(s) not modeled "
+                   "(remote groups / external services); see the log"
+                   if warnings else ""),
             ),
             f"Pulling {name!r}…",
         )
 
-    def _do_pull(self, group_ref: str, name: str, out: str) -> str:
+    def _do_pull(self, group_ref: str, name: str, out: str) -> list:
         flow = self.client.pull_flow(group_ref)
         text = flow.to_python(
             module_docstring=f"Pulled from NiFi group {name!r} — edit and push to apply."
         )
         Path(out).write_text(text)
-        return out
+        return list(flow.pull_warnings)
 
     def push_flow(self) -> None:
         """Push a .py flow file: plan first, then apply the delta (or rebuild)."""

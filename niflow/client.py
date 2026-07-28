@@ -516,6 +516,9 @@ class NiFiClient:
         # contexts may also exist with values only NiFi knows. Pull live
         # non-sensitive values so the Python file reflects reality.
         self._refresh_parameter_values(flow)
+
+        for warning in flow.pull_warnings:
+            logger.warning("Pull of %r is lossy: %s", flow.name, warning)
         return flow
 
     def _refresh_parameter_values(self, flow: Flow) -> None:
