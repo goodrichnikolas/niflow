@@ -95,3 +95,14 @@ Steps (do registry/test infra FIRST so we can probe the schema live before commi
       dance) — plan reports them, apply skips with a warning.
 - [ ] Funnel-heavy flows: connection identity for funnels is ordinal-based; inserting
       a funnel mid-list churns adjacent connections. Fine for now.
+
+## Work-connection hardening + web GUI (2026-07-27) — SHIPPED
+- [x] `.niflow.env` config file (defaults < file < env), mTLS client-cert auth
+      (cert = identity, token login skipped), CA-bundle trust, `niflow doctor`
+      diagnostician. Verified live against a cert-only NiFi 1.24 (compose profile
+      `mtls`): doctor all green with strict CA verification + push/pull/plan round
+      trip over cert auth (tests/test_mtls_integration.py).
+- [x] docs/work-nifi-setup.md — determine an unknown server's auth, p12→PEM,
+      trust, policies gotcha (initial admin lacks root PG policies).
+- [x] Browser GUI `niflow-web` (stdlib-only) alongside the PyQt helper.
+- [ ] OIDC/SSO login is unsupported by design — use a service account or cert.

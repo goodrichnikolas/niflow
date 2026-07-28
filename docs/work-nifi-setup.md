@@ -120,6 +120,12 @@ unauthorized`, the cert works at the TLS layer but NiFi doesn't know the
 identity: an admin must add your certificate DN (shown in the error / in
 `openssl x509 -in me.cert.pem -noout -subject`) as a user with policies.
 
+Gotcha worth knowing (verified on 1.24): even NiFi's *initial admin*
+identity only gets tenant/policy/controller rights — **view/modify on the
+process groups is a separate policy** an admin grants per group (or on root).
+`niflow doctor` green through "identity" but a 403 like `No applicable
+policies could be found` on push means exactly this.
+
 ## 5. Trusting the server certificate
 
 Best practice at work is real verification instead of `VERIFY_SSL=false`.
