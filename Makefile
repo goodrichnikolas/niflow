@@ -64,6 +64,9 @@ push:
 gui:
 	python -m niflow.gui
 
+webgui:
+	python -m niflow.webgui
+
 # --- local NiFi containers ----------------------------------------------------
 
 nifi-up:
@@ -99,6 +102,26 @@ nifi1-wait:
 		printf "."; sleep 5; \
 	done; echo " ready."
 	@echo "NiFi 1.24.0 is up at https://localhost:8444/nifi  (admin / adminpassword123)"
+
+nifi-mtls-up:
+	./scripts/gen-mtls-certs.sh certs/mtls
+	docker compose --profile mtls up -d nifi-mtls
+	@echo ""
+	@echo "mTLS NiFi 1.24.0 starting (client-certificate auth, NO password):"
+	@echo "  API:  https://localhost:8445/nifi-api"
+	@echo "  Test: NIFLOW_CONFIG=certs/mtls/niflow.env niflow doctor"
+	@printf "NIFLOW_NIFI_HOST=https://localhost:8445/nifi-api\nNIFLOW_NIFI_CLIENT_CERT=certs/mtls/client.pem\nNIFLOW_NIFI_CLIENT_KEY=certs/mtls/client.key\nNIFLOW_NIFI_CA_BUNDLE=certs/mtls/ca.pem\nNIFLOW_NIFI_PASSWORD=\n" > certs/mtls/niflow.env
+	@echo "Run 'make nifi-mtls-wait' to block until it's ready."
+
+nifi-mtls-wait:
+	@echo "Waiting for mTLS NiFi to become healthy..."
+	@until [ "$$(docker inspect -f '{{.State.Health.Status}}' niflow-nifi-mtls 2>/dev/null)" = "healthy" ]; do \
+		printf "."; sleep 5; \
+	done; echo " ready."
+	@echo "mTLS NiFi is up at https://localhost:8445/nifi-api (auth: certs/mtls/client.pem)"
+
+nifi-mtls-down:
+	docker compose --profile mtls down
 
 nifi-down:
 	docker compose down

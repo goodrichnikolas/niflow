@@ -28,6 +28,7 @@ gui = [
 [project.scripts]
 niflow = "niflow.cli:main"
 niflow-gui = "niflow.gui:main"
+niflow-web = "niflow.webgui:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["niflow"]
