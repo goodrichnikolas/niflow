@@ -67,8 +67,9 @@ Steps (do registry/test infra FIRST so we can probe the schema live before commi
       loop can stay in niflow.
 
 ## Helper GUI
-- [ ] **Diff… button** in the helper (wraps `niflow diff`) to preview a push before applying.
-- [ ] **Auto-refresh toggle** on the Inspector window.
+- [x] **Diff/plan preview before push** — the push dialog now shows the semantic change
+      plan (Details pane) and applies it incrementally by default (2026-07-27).
+- [x] **Auto-refresh toggle** on the Inspector window (2026-07-27).
 - [ ] Surface the WSL browser opener (`open_url`) in the Bulletins/Errors panels so those
       links open the Windows default browser too (currently plain selectable text).
 
