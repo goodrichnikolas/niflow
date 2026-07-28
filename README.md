@@ -11,8 +11,10 @@ niflow list                                  # see the canvas tree + ids
 niflow copy "Prod Flow"                      # safe, detached working copy
 niflow pull "Prod Flow (copy)" -o flows/prod_flow.py
 # ...edit flows/prod_flow.py: tweak a SQL query, add a processor, rewire...
-niflow diff flows/prod_flow.py               # what changed vs the live canvas?
-niflow push flows/prod_flow.py --start       # replace the live group and start it
+niflow plan flows/prod_flow.py               # semantic "what will change"
+niflow push flows/prod_flow.py --update      # apply just that delta in place
+niflow diff flows/prod_flow.py               # raw JSON diff vs the live canvas
+niflow push flows/prod_flow.py --start       # or: full replace and start
 ```
 
 …or define a flow from scratch:
@@ -36,8 +38,18 @@ flow.push(start=True)
 
 `pull` downloads the group as a NiFi *flow definition* (`GET
 /process-groups/{id}/download`, available since NiFi 1.11) and generates a
-runnable Python module. `push` re-serialises the model to a flow definition and
-creates the group in one POST — **delete-and-recreate**: the old group is
+runnable Python module. Pulls that hit something the model can't represent
+(remote process groups, services defined above the pulled group) say so loudly
+instead of dropping components silently.
+
+`plan` diffs your `.py` against the live group into a terraform-style change
+plan — adds, removes, and field-level updates by component. `push --update`
+applies exactly that plan with targeted REST calls: only changed processors
+are stopped/updated/restarted, removed connections are drained first, and
+everything untouched keeps its id, state, and **queued FlowFiles**. The loop
+converges: a pull followed by a plan reports zero changes.
+
+Plain `push` remains the full **delete-and-recreate**: the old group is
 stopped, drained, and replaced, keeping its canvas position. Parameter contexts
 survive replacement (they live outside the group), so sensitive values stored
 in NiFi are not lost.
@@ -209,7 +221,7 @@ for the legacy 2.x deploy path and codegen). Docker for local NiFi.
 
 ## Out of scope (for now)
 
-Remote Process Groups, NiFi Registry *sync* (copy detaches from it instead),
-mTLS/token-file auth, and incremental in-place updates (push is
-delete-and-recreate by design — simple and predictable; contexts and their
-sensitive values survive).
+Remote Process Groups (pull warns when it drops one), NiFi Registry *sync*
+(copy detaches from it instead), and mTLS/token-file auth. NiFi 1.x variable
+registry edits are reported by `plan` but not applied incrementally — use
+parameter contexts.

@@ -396,11 +396,16 @@ def to_json(flow: Flow, *, indent: int = 2) -> str:
     # Python object identity so connection emission can look them up later.
     identifiers: Dict[int, str] = {}
     _assign_identifiers(flow, parent_path=(), identifiers=identifiers)
+    # NiFi 2.x's synchronizer requires every connection endpoint to carry the
+    # identifier of the group that owns it ("groupId" NPE otherwise).
+    owners: Dict[int, str] = {}
+    _assign_owners(flow, identifiers, owners)
 
     flow_contents = _emit_group(
         flow,
         parent_identifier=None,
         identifiers=identifiers,
+        owners=owners,
     )
 
     envelope = {
@@ -490,11 +495,28 @@ def _det_uuid(kind: str, path: Tuple[str, ...]) -> str:
     return str(uuid.uuid5(_NS, name))
 
 
+def _assign_owners(
+    group: ProcessGroup, identifiers: Dict[int, str], owners: Dict[int, str]
+) -> None:
+    """Map every connectable component to its owning group's identifier."""
+    gid = identifiers[id(group)]
+    for component in (
+        list(group.processors)
+        + list(group.input_ports)
+        + list(group.output_ports)
+        + list(group.funnels)
+    ):
+        owners[id(component)] = gid
+    for child in group.process_groups:
+        _assign_owners(child, identifiers, owners)
+
+
 def _emit_group(
     group: ProcessGroup,
     parent_identifier: Optional[str],
     identifiers: Dict[int, str],
     auto_position: Optional[Tuple[float, float]] = None,
+    owners: Optional[Dict[int, str]] = None,
 ) -> dict:
     identifier = identifiers[id(group)]
     # Auto-layout fills in coordinates for components without an explicit
@@ -523,7 +545,8 @@ def _emit_group(
             for proc in group.processors
         ],
         "connections": [
-            _emit_connection(conn, identifier, identifiers) for conn in group.connections
+            _emit_connection(conn, identifier, identifiers, owners)
+            for conn in group.connections
         ],
         "funnels": [
             {
@@ -548,7 +571,7 @@ def _emit_group(
             for lbl in group.labels
         ],
         "processGroups": [
-            _emit_group(child, identifier, identifiers, auto.get(id(child)))
+            _emit_group(child, identifier, identifiers, auto.get(id(child)), owners)
             for child in group.process_groups
         ],
     }
@@ -606,6 +629,11 @@ def _emit_port(
         "groupIdentifier": group_identifier,
         "name": port.name,
         "position": _emit_position(port.position or auto_position),
+        # NiFi 2.x's flow synchronizer NPEs when these are absent (it calls
+        # Integer.intValue()/enum handling on them unguarded); 1.x tolerates
+        # both. Always emit explicit defaults.
+        "concurrentlySchedulableTaskCount": 1,
+        "scheduledState": "ENABLED",
     }
 
 
@@ -681,9 +709,10 @@ def _emit_connection(
     connection: Connection,
     group_identifier: str,
     identifiers: Dict[int, str],
+    owners: Optional[Dict[int, str]] = None,
 ) -> dict:
-    source_ref = _emit_endpoint(connection.source, identifiers)
-    target_ref = _emit_endpoint(connection.target, identifiers)
+    source_ref = _emit_endpoint(connection.source, identifiers, owners)
+    target_ref = _emit_endpoint(connection.target, identifiers, owners)
 
     # Ports/funnels have no named relationships; NiFi expects ``[""]`` as a
     # placeholder.
@@ -713,7 +742,11 @@ def _emit_connection(
     }
 
 
-def _emit_endpoint(component: NiFiComponent, identifiers: Dict[int, str]) -> dict:
+def _emit_endpoint(
+    component: NiFiComponent,
+    identifiers: Dict[int, str],
+    owners: Optional[Dict[int, str]] = None,
+) -> dict:
     if isinstance(component, Processor):
         kind = "PROCESSOR"
     elif isinstance(component, InputPort):
@@ -726,8 +759,12 @@ def _emit_endpoint(component: NiFiComponent, identifiers: Dict[int, str]) -> dic
         kind = "PROCESS_GROUP"
     else:
         kind = "PROCESSOR"  # defensive fallback; shouldn't happen in valid flows
-    return {
+    ref = {
         "id": identifiers[id(component)],
         "name": component.name,
         "type": kind,
     }
+    # NiFi 2.x NPEs on a missing endpoint groupId during synchronization.
+    if owners is not None and id(component) in owners:
+        ref["groupId"] = owners[id(component)]
+    return ref
