@@ -12,3 +12,9 @@ __pycache__/
 # Claude Code local state (machine-specific permissions, locks)
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
+
+# Per-environment connection config (may hold a work password) + TLS material
+.niflow.env
+*.p12
+*.pfx
+certs/
