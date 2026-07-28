@@ -1,9 +1,13 @@
 # Local single-user NiFi instances for developing and testing NiFlow.
 #
 #   docker compose up -d                 -> NiFi 2.7.2  https://localhost:8443/nifi
+#                                           + Registry 2.7.2 http://localhost:18080/nifi-registry
 #   docker compose --profile v1 up -d    -> NiFi 1.24.0 https://localhost:8444/nifi
+#                                           + Registry 1.24.0 http://localhost:18081/nifi-registry
 #
-# Both log in as admin / adminpassword123.
+# NiFi logs in as admin / adminpassword123. The registries are unsecured HTTP
+# (local dev only) and are reached from the NiFi containers by service name
+# (http://registry:18080 / http://registry1:18080) when you add a registry client.
 services:
   # NiFi 1.24.0 — mirrors the work environment (1.24/1.28 line). Opt-in via
   # the "v1" profile so the default `docker compose up` stays 2.x-only.
@@ -24,6 +28,54 @@ services:
       - ./.nifi-data/out:/out
     healthcheck:
       test: ["CMD-SHELL", "curl -k -s -o /dev/null https://$$(hostname):8443/nifi-api/access/config || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 90s
+
+  # NiFi Registry paired with the 1.24 line (profile v1). Flow snapshots are
+  # version-line sensitive, so each NiFi talks to a registry on its own version.
+  registry1:
+    image: apache/nifi-registry:1.24.0
+    container_name: niflow-registry1
+    profiles: ["v1"]
+    ports:
+      - "18081:18080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -o /dev/null http://$$(hostname):18080/nifi-registry-api/buckets || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
+
+  # NiFi 1.24.0 secured with CLIENT CERTIFICATES (no username/password) —
+  # mirrors a work instance doing mTLS. Opt-in via the "mtls" profile; certs
+  # come from `scripts/gen-mtls-certs.sh` (make nifi-mtls-up runs it).
+  # Identity: CN=niflow-client (the generated client cert) is initial admin.
+  nifi-mtls:
+    image: apache/nifi:1.24.0
+    container_name: niflow-nifi-mtls
+    profiles: ["mtls"]
+    ports:
+      - "8445:8443"
+    environment:
+      AUTH: "tls"
+      KEYSTORE_PATH: "/opt/certs/keystore.p12"
+      KEYSTORE_TYPE: "PKCS12"
+      KEYSTORE_PASSWORD: "niflowpass123"
+      TRUSTSTORE_PATH: "/opt/certs/truststore.p12"
+      TRUSTSTORE_TYPE: "PKCS12"
+      TRUSTSTORE_PASSWORD: "niflowpass123"
+      INITIAL_ADMIN_IDENTITY: "CN=niflow-client"
+      NIFI_WEB_PROXY_HOST: "localhost:8445"
+    volumes:
+      - ./certs/mtls:/opt/certs:ro
+    healthcheck:
+      # Authenticated probe with the client cert — proves mTLS end to end.
+      # 1.x binds HTTPS to the container hostname (not localhost), and the
+      # server cert's SAN is localhost, so probe by hostname with -k; strict
+      # CA verification is exercised from the host by `niflow doctor`.
+      test: ["CMD-SHELL", "curl -k -s -o /dev/null --cert /opt/certs/client.pem --key /opt/certs/client.key https://$$(hostname):8443/nifi-api/flow/about || exit 1"]
       interval: 15s
       timeout: 10s
       retries: 20
@@ -53,3 +105,16 @@ services:
       timeout: 10s
       retries: 20
       start_period: 90s
+
+  # NiFi Registry paired with the default 2.7.2 line.
+  registry:
+    image: apache/nifi-registry:2.7.2
+    container_name: niflow-registry
+    ports:
+      - "18080:18080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -o /dev/null http://$$(hostname):18080/nifi-registry-api/buckets || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 60s

@@ -12,6 +12,7 @@ from pathlib import Path
 
 from niflow import Flow
 from niflow.core import Port
+from niflow.layout import apply_layout
 
 FIXTURE = Path(__file__).parent / "fixtures" / "nested_groups.flow.json"
 
@@ -106,11 +107,14 @@ def test_python_example_round_trips_through_json():
     _normalize_port_rels(original)
     _normalize_port_rels(parsed)
 
+    # to_json materialises auto-layout coordinates for unpositioned
+    # components; resolve them on the original so the dumps line up.
+    apply_layout(original)
+
     d_orig = original.model_dump(exclude={"nifi_id", "nifi_entity"})
     d_back = parsed.model_dump(exclude={"nifi_id", "nifi_entity"})
 
-    # `from_json` defaults missing position to (0,0) (NiFi always carries one);
-    # the Python builder leaves position=None. Normalise both sides to (0,0).
+    # The group itself still defaults to NiFi's (0,0) when unpositioned.
     _normalise_positions(d_orig)
     _normalise_positions(d_back)
 
@@ -126,3 +130,97 @@ def _normalise_positions(node):
     elif isinstance(node, list):
         for v in node:
             _normalise_positions(v)
+
+
+# --- service-ref resolution (NiFi 1.x quirk) --------------------------------
+def test_1x_service_ref_resolves_by_instance_identifier():
+    """NiFi 1.24's /download flags service-ref descriptors as
+    ``identifiesControllerService: false`` and writes the service's *instance*
+    id as the property value. Resolution is by value, so the link survives."""
+    from niflow.core import ControllerService
+
+    snapshot = {
+        "flowContents": {
+            "name": "OneX",
+            "controllerServices": [{
+                "identifier": "svc-versioned-id",
+                "instanceIdentifier": "1111aaaa-0000-1000-8000-instanceuuid",
+                "name": "Reader",
+                "type": "org.apache.nifi.json.JsonTreeReader",
+                "properties": {},
+            }],
+            "processors": [{
+                "identifier": "proc-versioned-id",
+                "name": "Convert",
+                "type": "org.apache.nifi.processors.standard.ConvertRecord",
+                "properties": {"Record Reader": "1111aaaa-0000-1000-8000-instanceuuid"},
+                "propertyDescriptors": {
+                    "Record Reader": {
+                        "name": "Record Reader",
+                        "identifiesControllerService": False,  # the 1.x lie
+                    },
+                },
+            }],
+        }
+    }
+    flow = Flow.from_json(snapshot)
+    ref = flow.processors[0].properties["Record Reader"]
+    assert isinstance(ref, ControllerService)
+    assert ref is flow.controller_services[0]
+
+
+def test_service_to_service_ref_resolves():
+    """A controller service referencing another (e.g. a pool) resolves too."""
+    from niflow.core import ControllerService
+
+    snapshot = {
+        "flowContents": {
+            "name": "SvcRefs",
+            "controllerServices": [
+                {
+                    "identifier": "pool-id",
+                    "name": "Pool",
+                    "type": "org.apache.nifi.dbcp.DBCPConnectionPool",
+                    "properties": {},
+                },
+                {
+                    "identifier": "lookup-id",
+                    "name": "Lookup",
+                    "type": "org.apache.nifi.lookup.db.DatabaseRecordLookupService",
+                    "properties": {"Database Connection Pooling Service": "pool-id"},
+                },
+            ],
+            "processors": [],
+        }
+    }
+    flow = Flow.from_json(snapshot)
+    ref = flow.controller_services[1].properties["Database Connection Pooling Service"]
+    assert isinstance(ref, ControllerService)
+    assert ref is flow.controller_services[0]
+
+
+# --- lossy-pull warnings ----------------------------------------------------
+def test_unrepresentable_components_produce_pull_warnings():
+    snapshot = {
+        "externalControllerServiceReferences": {
+            "abc-123": {"identifier": "abc-123", "name": "SharedPool"},
+        },
+        "flowContents": {
+            "name": "Lossy",
+            "processors": [],
+            "processGroups": [{
+                "name": "Sub",
+                "remoteProcessGroups": [{"targetUris": "https://other:8443/nifi"}],
+            }],
+        },
+    }
+    flow = Flow.from_json(snapshot)
+    assert len(flow.pull_warnings) == 2
+    joined = "\n".join(flow.pull_warnings)
+    assert "Sub: remote process group -> https://other:8443/nifi" in joined
+    assert "SharedPool" in joined
+
+
+def test_clean_snapshot_has_no_pull_warnings():
+    flow = Flow.from_json(FIXTURE)
+    assert flow.pull_warnings == []

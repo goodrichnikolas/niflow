@@ -39,24 +39,18 @@ from niflow.core import (
     Processor,
     ProcessGroup,
 )
+from niflow.layout import compute_layout
+from niflow.processors.bundles import default_bundle
 
 # Standard UUID DNS namespace — used as the root for deterministic UUID5s so
 # generated identifiers don't collide with random NiFi-assigned ones.
 _NS = uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
 
-# Sensible-default bundle coordinates for emitted components. NiFi accepts these
-# and resolves the actual NAR on import; we only emit them so the snapshot is
-# well-formed.
-_DEFAULT_PROCESSOR_BUNDLE = {
-    "group": "org.apache.nifi",
-    "artifact": "nifi-standard-nar",
-    "version": "2.7.2",
-}
-_DEFAULT_SERVICE_BUNDLE = {
-    "group": "org.apache.nifi",
-    "artifact": "nifi-standard-services-api-nar",
-    "version": "2.7.2",
-}
+# Bundle (NAR) coordinates for emitted components are resolved per-type by
+# niflow.processors.bundles.default_bundle — most live in nifi-standard-nar, but
+# some (e.g. UpdateAttribute) ship in their own NAR, and emitting the wrong one
+# makes NiFi reject an otherwise-valid type. push() has the final say, rewriting
+# these from the target instance's installed NARs.
 
 
 # =============================================================================
@@ -82,29 +76,34 @@ def from_json(source: Union[str, dict, Path]) -> Flow:
 
     # Two-pass build: first materialise every component so connections (which
     # may reference cross-group endpoints) can resolve ``source.id`` and
-    # ``destination.id`` to live model instances. We also remember each
-    # processor's raw DTO so we can resolve service-ref properties once all
-    # services exist.
+    # ``destination.id`` to live model instances.
     by_identifier: Dict[str, NiFiComponent] = {}
-    processor_dtos: List[Tuple[Processor, dict]] = []
     pending_connections: List[Tuple[ProcessGroup, dict]] = []
 
     flow = Flow(name=contents.get("name", "Flow"))
-    _populate_group(flow, contents, by_identifier, processor_dtos, pending_connections, contexts)
+    warnings: List[str] = []
+    _populate_group(flow, contents, by_identifier, pending_connections, contexts, warnings)
 
-    # Resolve service-ref properties: any property whose descriptor flags
-    # ``identifiesControllerService`` and whose value matches a known service
-    # identifier is rewritten to hold the service instance itself.
-    for proc, dto in processor_dtos:
-        descriptors = dto.get("propertyDescriptors") or {}
-        for key, descriptor in descriptors.items():
-            if not descriptor or not descriptor.get("identifiesControllerService"):
-                continue
-            current = proc.properties.get(key)
-            if isinstance(current, str):
-                resolved = by_identifier.get(current)
-                if isinstance(resolved, ControllerService):
-                    proc.properties[key] = resolved
+    # Processors may reference controller services defined ABOVE the
+    # downloaded group (ancestor scope). Those arrive only as pointers — the
+    # service itself is not in the snapshot, so the model keeps a raw id.
+    for ref in (data.get("externalControllerServiceReferences") or {}).values():
+        warnings.append(
+            f"references controller service {ref.get('name', '?')!r} defined "
+            "outside this group — its definition is not part of the pull; "
+            "the property keeps the raw id (pull an ancestor group to include it)"
+        )
+    flow.pull_warnings = warnings
+
+    # Resolve service-ref properties by value: a property holding the id of a
+    # known controller service is rewritten to the service instance itself.
+    # Resolution is deliberately NOT gated on the descriptor's
+    # ``identifiesControllerService`` flag — NiFi 1.x's /download reports it
+    # as false and writes the service's *instance* id as the value (2.x uses
+    # the versioned identifier; both are registered). Ids are UUIDs, so a
+    # value match is unambiguous. Services get the same treatment as
+    # processors — they can reference other services.
+    _resolve_service_refs(flow, by_identifier)
 
     # Build connections once everything is in place.
     for group, conn_dto in pending_connections:
@@ -158,34 +157,58 @@ def _parse_parameter_contexts(raw: Any) -> Dict[str, ParameterContext]:
     return contexts
 
 
-def _parse_bundle(raw: Any) -> Optional[Bundle]:
+def _parse_bundle(raw: Any, type_str: str = "", *, service: bool = False) -> Optional[Bundle]:
     if not raw:
         return None
     group = raw.get("group", "org.apache.nifi")
     artifact = raw.get("artifact", "")
-    # The standard bundles are what we emit as defaults; collapsing them back
-    # to None keeps Python-built flows (bundle=None) round-trip stable. NiFi
-    # resolves these types by name regardless of the bundle version.
-    if group == "org.apache.nifi" and artifact in (
-        _DEFAULT_PROCESSOR_BUNDLE["artifact"],
-        _DEFAULT_SERVICE_BUNDLE["artifact"],
-    ):
+    # If the bundle is just what we'd emit by default for this type, collapse it
+    # back to None so Python-built flows (bundle=None) round-trip stable. We
+    # ignore the version: the default's version is an instance-specific
+    # placeholder, and NiFi resolves the NAR by group+artifact regardless.
+    default = default_bundle(type_str, service=service)
+    if group == default["group"] and artifact == default["artifact"]:
         return None
     return Bundle(group=group, artifact=artifact, version=raw.get("version", ""))
+
+
+def _resolve_service_refs(
+    group: ProcessGroup, by_identifier: Dict[str, NiFiComponent]
+) -> None:
+    """Rewrite id-valued properties to their :class:`ControllerService`."""
+    for component in group.processors + group.controller_services:
+        for key, value in component.properties.items():
+            if isinstance(value, str):
+                resolved = by_identifier.get(value)
+                if isinstance(resolved, ControllerService):
+                    component.properties[key] = resolved
+    for child in group.process_groups:
+        _resolve_service_refs(child, by_identifier)
 
 
 def _populate_group(
     group: ProcessGroup,
     dto: dict,
     by_identifier: Dict[str, NiFiComponent],
-    processor_dtos: List[Tuple[Processor, dict]],
     pending_connections: List[Tuple[ProcessGroup, dict]],
     contexts: Dict[str, ParameterContext],
+    warnings: Optional[List[str]] = None,
+    path: str = "",
 ) -> None:
     """Fill ``group`` from ``dto`` (a ``VersionedProcessGroup``) in place."""
+    if warnings is not None:
+        for rpg in dto.get("remoteProcessGroups") or []:
+            target = rpg.get("targetUris") or rpg.get("targetUri") or "?"
+            warnings.append(
+                f"{path or '.'}: remote process group -> {target} is not modeled "
+                "by niflow and will NOT survive a push of this flow"
+            )
     group.comment = dto.get("comments", "") or ""
     group.position = _parse_position(dto.get("position"))
     group.variables = dict(dto.get("variables") or {})
+    # Live snapshots carry each component's canvas id as instanceIdentifier;
+    # keep it so an incremental push can address components directly.
+    group.nifi_id = dto.get("instanceIdentifier")
 
     ctx_name = dto.get("parameterContextName")
     if ctx_name:
@@ -205,11 +228,17 @@ def _populate_group(
             # enabled unless explicitly DISABLED.
             enabled=service_dto.get("scheduledState") != "DISABLED",
             comments=service_dto.get("comments") or "",
-            bundle=_parse_bundle(service_dto.get("bundle")),
+            bundle=_parse_bundle(
+                service_dto.get("bundle"), service_dto.get("type", ""), service=True
+            ),
         )
-        identifier = service_dto.get("identifier")
-        if identifier:
-            by_identifier[identifier] = service
+        # Register under the versioned identifier AND the live instance id:
+        # NiFi 1.x service-ref property values carry the latter.
+        for key in ("identifier", "instanceIdentifier"):
+            identifier = service_dto.get(key)
+            if identifier:
+                by_identifier[identifier] = service
+        service.nifi_id = service_dto.get("instanceIdentifier")
         group.controller_services.append(service)
 
     for funnel_dto in dto.get("funnels") or []:
@@ -217,17 +246,18 @@ def _populate_group(
         identifier = funnel_dto.get("identifier")
         if identifier:
             by_identifier[identifier] = funnel
+        funnel.nifi_id = funnel_dto.get("instanceIdentifier")
         group.funnels.append(funnel)
 
     for label_dto in dto.get("labels") or []:
-        group.labels.append(
-            Label(
-                text=label_dto.get("label") or "",
-                position=_parse_position(label_dto.get("position")),
-                width=float(label_dto.get("width", 150.0)),
-                height=float(label_dto.get("height", 150.0)),
-            )
+        label = Label(
+            text=label_dto.get("label") or "",
+            position=_parse_position(label_dto.get("position")),
+            width=float(label_dto.get("width", 150.0)),
+            height=float(label_dto.get("height", 150.0)),
         )
+        label.nifi_id = label_dto.get("instanceIdentifier")
+        group.labels.append(label)
 
     for port_dto in dto.get("inputPorts") or []:
         port = InputPort(
@@ -237,6 +267,7 @@ def _populate_group(
         identifier = port_dto.get("identifier")
         if identifier:
             by_identifier[identifier] = port
+        port.nifi_id = port_dto.get("instanceIdentifier")
         group.input_ports.append(port)
 
     for port_dto in dto.get("outputPorts") or []:
@@ -247,6 +278,7 @@ def _populate_group(
         identifier = port_dto.get("identifier")
         if identifier:
             by_identifier[identifier] = port
+        port.nifi_id = port_dto.get("instanceIdentifier")
         group.output_ports.append(port)
 
     for proc_dto in dto.get("processors") or []:
@@ -271,13 +303,13 @@ def _populate_group(
             retried_relationships=list(proc_dto.get("retriedRelationships") or []),
             backoff_mechanism=proc_dto.get("backoffMechanism") or "PENALIZE_FLOWFILE",
             max_backoff_period=proc_dto.get("maxBackoffPeriod") or "10 mins",
-            bundle=_parse_bundle(proc_dto.get("bundle")),
+            bundle=_parse_bundle(proc_dto.get("bundle"), proc_dto.get("type", "")),
         )
         identifier = proc_dto.get("identifier")
         if identifier:
             by_identifier[identifier] = processor
+        processor.nifi_id = proc_dto.get("instanceIdentifier")
         group.processors.append(processor)
-        processor_dtos.append((processor, proc_dto))
 
     # Defer connections to the second pass — but still record which group they
     # belong to so we attach them correctly later.
@@ -288,7 +320,11 @@ def _populate_group(
     for child_dto in dto.get("processGroups") or []:
         child = ProcessGroup(name=child_dto.get("name", ""))
         group.process_groups.append(child)
-        _populate_group(child, child_dto, by_identifier, processor_dtos, pending_connections, contexts)
+        child_path = f"{path}/{child.name}" if path else child.name
+        _populate_group(
+            child, child_dto, by_identifier, pending_connections, contexts,
+            warnings, child_path,
+        )
 
 
 def _parse_position(raw: Any) -> Optional[Tuple[float, float]]:
@@ -331,7 +367,7 @@ def _build_connection(
         if not relationships:
             relationships = ["success"]
 
-    return Connection(
+    connection = Connection(
         name=dto.get("name") or "",
         source=source,
         target=target,
@@ -344,6 +380,8 @@ def _build_connection(
         partitioning_attribute=dto.get("partitioningAttribute") or "",
         load_balance_compression=dto.get("loadBalanceCompression") or "DO_NOT_COMPRESS",
     )
+    connection.nifi_id = dto.get("instanceIdentifier")
+    return connection
 
 
 # =============================================================================
@@ -358,11 +396,16 @@ def to_json(flow: Flow, *, indent: int = 2) -> str:
     # Python object identity so connection emission can look them up later.
     identifiers: Dict[int, str] = {}
     _assign_identifiers(flow, parent_path=(), identifiers=identifiers)
+    # NiFi 2.x's synchronizer requires every connection endpoint to carry the
+    # identifier of the group that owns it ("groupId" NPE otherwise).
+    owners: Dict[int, str] = {}
+    _assign_owners(flow, identifiers, owners)
 
     flow_contents = _emit_group(
         flow,
         parent_identifier=None,
         identifiers=identifiers,
+        owners=owners,
     )
 
     envelope = {
@@ -452,40 +495,65 @@ def _det_uuid(kind: str, path: Tuple[str, ...]) -> str:
     return str(uuid.uuid5(_NS, name))
 
 
+def _assign_owners(
+    group: ProcessGroup, identifiers: Dict[int, str], owners: Dict[int, str]
+) -> None:
+    """Map every connectable component to its owning group's identifier."""
+    gid = identifiers[id(group)]
+    for component in (
+        list(group.processors)
+        + list(group.input_ports)
+        + list(group.output_ports)
+        + list(group.funnels)
+    ):
+        owners[id(component)] = gid
+    for child in group.process_groups:
+        _assign_owners(child, identifiers, owners)
+
+
 def _emit_group(
     group: ProcessGroup,
     parent_identifier: Optional[str],
     identifiers: Dict[int, str],
+    auto_position: Optional[Tuple[float, float]] = None,
+    owners: Optional[Dict[int, str]] = None,
 ) -> dict:
     identifier = identifiers[id(group)]
+    # Auto-layout fills in coordinates for components without an explicit
+    # position; explicit positions always win.
+    auto = compute_layout(group)
 
     dto: Dict[str, Any] = {
         "componentType": "PROCESS_GROUP",
         "identifier": identifier,
         "name": group.name,
         "comments": group.comment or "",
-        "position": _emit_position(group.position),
+        "position": _emit_position(group.position or auto_position),
         "controllerServices": [
             _emit_service(svc, identifier, identifiers) for svc in group.controller_services
         ],
         "inputPorts": [
-            _emit_port(p, identifier, identifiers, "INPUT_PORT") for p in group.input_ports
+            _emit_port(p, identifier, identifiers, "INPUT_PORT", auto.get(id(p)))
+            for p in group.input_ports
         ],
         "outputPorts": [
-            _emit_port(p, identifier, identifiers, "OUTPUT_PORT") for p in group.output_ports
+            _emit_port(p, identifier, identifiers, "OUTPUT_PORT", auto.get(id(p)))
+            for p in group.output_ports
         ],
         "processors": [
-            _emit_processor(proc, identifier, identifiers) for proc in group.processors
+            _emit_processor(proc, identifier, identifiers, auto.get(id(proc)))
+            for proc in group.processors
         ],
         "connections": [
-            _emit_connection(conn, identifier, identifiers) for conn in group.connections
+            _emit_connection(conn, identifier, identifiers, owners)
+            for conn in group.connections
         ],
         "funnels": [
             {
                 "componentType": "FUNNEL",
                 "identifier": identifiers[id(f)],
                 "groupIdentifier": identifier,
-                "position": _emit_position(f.position),
+                "position": _emit_position(f.position or auto.get(id(f))),
             }
             for f in group.funnels
         ],
@@ -495,7 +563,7 @@ def _emit_group(
                 "identifier": identifiers[id(lbl)],
                 "groupIdentifier": identifier,
                 "label": lbl.text,
-                "position": _emit_position(lbl.position),
+                "position": _emit_position(lbl.position or auto.get(id(lbl))),
                 "width": float(lbl.width),
                 "height": float(lbl.height),
                 "zIndex": 0,
@@ -503,7 +571,8 @@ def _emit_group(
             for lbl in group.labels
         ],
         "processGroups": [
-            _emit_group(child, identifier, identifiers) for child in group.process_groups
+            _emit_group(child, identifier, identifiers, auto.get(id(child)), owners)
+            for child in group.process_groups
         ],
     }
     if group.variables:
@@ -521,9 +590,9 @@ def _emit_position(position: Optional[Tuple[float, float]]) -> dict:
     return {"x": float(position[0]), "y": float(position[1])}
 
 
-def _emit_bundle(bundle: Any, default: dict) -> dict:
+def _emit_bundle(bundle: Any, type_str: str, *, service: bool = False) -> dict:
     if bundle is None:
-        return dict(default)
+        return default_bundle(type_str, service=service)
     return {"group": bundle.group, "artifact": bundle.artifact, "version": bundle.version}
 
 
@@ -538,7 +607,7 @@ def _emit_service(
         "groupIdentifier": group_identifier,
         "name": service.name,
         "type": service.type,
-        "bundle": _emit_bundle(service.bundle, _DEFAULT_SERVICE_BUNDLE),
+        "bundle": _emit_bundle(service.bundle, service.type, service=True),
         "comments": service.comments or "",
         "scheduledState": "ENABLED" if service.enabled else "DISABLED",
         "properties": _emit_properties(service.properties, identifiers),
@@ -551,6 +620,7 @@ def _emit_port(
     group_identifier: str,
     identifiers: Dict[int, str],
     component_type: str,
+    auto_position: Optional[Tuple[float, float]] = None,
 ) -> dict:
     return {
         "componentType": component_type,
@@ -558,7 +628,12 @@ def _emit_port(
         "identifier": identifiers[id(port)],
         "groupIdentifier": group_identifier,
         "name": port.name,
-        "position": _emit_position(port.position),
+        "position": _emit_position(port.position or auto_position),
+        # NiFi 2.x's flow synchronizer NPEs when these are absent (it calls
+        # Integer.intValue()/enum handling on them unguarded); 1.x tolerates
+        # both. Always emit explicit defaults.
+        "concurrentlySchedulableTaskCount": 1,
+        "scheduledState": "ENABLED",
     }
 
 
@@ -566,6 +641,7 @@ def _emit_processor(
     processor: Processor,
     group_identifier: str,
     identifiers: Dict[int, str],
+    auto_position: Optional[Tuple[float, float]] = None,
 ) -> dict:
     return {
         "componentType": "PROCESSOR",
@@ -573,8 +649,8 @@ def _emit_processor(
         "groupIdentifier": group_identifier,
         "name": processor.name,
         "type": processor.type,
-        "bundle": _emit_bundle(processor.bundle, _DEFAULT_PROCESSOR_BUNDLE),
-        "position": _emit_position(processor.position),
+        "bundle": _emit_bundle(processor.bundle, processor.type),
+        "position": _emit_position(processor.position or auto_position),
         "properties": _emit_properties(processor.properties, identifiers),
         "propertyDescriptors": _emit_service_ref_descriptors(processor.properties),
         "schedulingPeriod": processor.scheduling_period,
@@ -616,11 +692,15 @@ def _emit_service_ref_descriptors(props: dict) -> dict:
     out: Dict[str, Any] = {}
     for key, value in props.items():
         if isinstance(value, ControllerService):
+            # NiFi's VersionedPropertyDescriptor.identifiesControllerService is a
+            # *boolean* flag; the expected service type is resolved from the
+            # referenced service (the property value is its identifier), not the
+            # descriptor. Emitting the type string here is rejected on the JSON
+            # import path ("not of required type boolean").
             out[key] = {
                 "name": key,
                 "displayName": key,
-                "identifiesControllerService": value.type,
-                "identifiesControllerServiceBundle": dict(_DEFAULT_SERVICE_BUNDLE),
+                "identifiesControllerService": True,
             }
     return out
 
@@ -629,9 +709,10 @@ def _emit_connection(
     connection: Connection,
     group_identifier: str,
     identifiers: Dict[int, str],
+    owners: Optional[Dict[int, str]] = None,
 ) -> dict:
-    source_ref = _emit_endpoint(connection.source, identifiers)
-    target_ref = _emit_endpoint(connection.target, identifiers)
+    source_ref = _emit_endpoint(connection.source, identifiers, owners)
+    target_ref = _emit_endpoint(connection.target, identifiers, owners)
 
     # Ports/funnels have no named relationships; NiFi expects ``[""]`` as a
     # placeholder.
@@ -661,7 +742,11 @@ def _emit_connection(
     }
 
 
-def _emit_endpoint(component: NiFiComponent, identifiers: Dict[int, str]) -> dict:
+def _emit_endpoint(
+    component: NiFiComponent,
+    identifiers: Dict[int, str],
+    owners: Optional[Dict[int, str]] = None,
+) -> dict:
     if isinstance(component, Processor):
         kind = "PROCESSOR"
     elif isinstance(component, InputPort):
@@ -674,8 +759,12 @@ def _emit_endpoint(component: NiFiComponent, identifiers: Dict[int, str]) -> dic
         kind = "PROCESS_GROUP"
     else:
         kind = "PROCESSOR"  # defensive fallback; shouldn't happen in valid flows
-    return {
+    ref = {
         "id": identifiers[id(component)],
         "name": component.name,
         "type": kind,
     }
+    # NiFi 2.x NPEs on a missing endpoint groupId during synchronization.
+    if owners is not None and id(component) in owners:
+        ref["groupId"] = owners[id(component)]
+    return ref

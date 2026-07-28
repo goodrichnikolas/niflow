@@ -30,6 +30,7 @@ import re
 import time
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
+from xml.etree import ElementTree
 
 from niflow.config import NiFiConfig
 from niflow.core import Flow, ParameterContext, ProcessGroup
@@ -68,22 +69,37 @@ class NiFiClient:
             import requests
 
             session = requests.Session()
-            session.verify = self.config.verify_ssl
-            if not self.config.verify_ssl and self.config.suppress_ssl_warnings:
+            # A CA bundle path beats the verify boolean (work servers have
+            # real certs signed by an internal CA; export it and point
+            # NIFLOW_NIFI_CA_BUNDLE at the PEM).
+            session.verify = self.config.ca_bundle or self.config.verify_ssl
+            if self.config.client_cert:
+                session.cert = (
+                    (self.config.client_cert, self.config.client_key)
+                    if self.config.client_key
+                    else self.config.client_cert
+                )
+            if not session.verify and self.config.suppress_ssl_warnings:
                 import urllib3
 
                 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
         self.session = session
         self._token: Optional[str] = None
         self._root_id: Optional[str] = None
+        self._bundle_index: Optional[Dict[str, dict]] = None
 
     # ------------------------------------------------------------------ auth
 
     def login(self) -> None:
         """Fetch a bearer token (single-user and LDAP both use /access/token).
 
-        Skipped for anonymous/plain-HTTP servers (no password configured).
+        Skipped under mTLS (the client certificate IS the identity — servers
+        configured for cert auth don't even expose /access/token) and for
+        anonymous/plain-HTTP servers (no password configured).
         """
+        if self.config.client_cert:
+            logger.info("Authenticating with client certificate %s", self.config.client_cert)
+            return
         if not self.config.password:
             logger.info("No password configured; using anonymous access")
             return
@@ -105,7 +121,7 @@ class NiFiClient:
         logger.info("Authenticated to %s as %r", self.base, self.config.username)
 
     def _request(self, method: str, path: str, **kwargs: Any) -> Any:
-        if self._token is None and self.config.password:
+        if self._token is None and self.config.password and not self.config.client_cert:
             self.login()
         headers = dict(kwargs.pop("headers", {}))
         if self._token:
@@ -130,6 +146,23 @@ class NiFiClient:
         """The server version string, e.g. ``"1.24.0"`` or ``"2.7.2"``."""
         about = self._get_json("/flow/about").get("about", {})
         return about.get("version", "unknown")
+
+    def ui_url(self, group_id: str = "", component_id: str = "") -> str:
+        """A deep link into the NiFi *UI* that selects a component on the canvas.
+
+        Derives the UI base from the API base (``…/nifi-api`` -> ``…/nifi``) and
+        appends ``?processGroupId=…&componentIds=…`` so opening it drops you
+        right on the processor — no drilling through nested groups by hand.
+        """
+        ui = self.base
+        if ui.endswith("/nifi-api"):
+            ui = ui[: -len("/nifi-api")] + "/nifi"
+        params = []
+        if group_id:
+            params.append(f"processGroupId={group_id}")
+        if component_id:
+            params.append(f"componentIds={component_id}")
+        return ui + ("/?" + "&".join(params) if params else "")
 
     def root_id(self) -> str:
         if self._root_id is None:
@@ -177,6 +210,297 @@ class NiFiClient:
     def _pg_entity(self, pg_id: str) -> dict:
         return self._get_json(f"/process-groups/{pg_id}")
 
+    # ------------------------------------------------------------- processors
+
+    def walk_processors(self, group: str = "root") -> Iterator[Tuple[str, str, dict]]:
+        """Yield ``(group_path, group_id, component)`` for every processor under
+        ``group``, depth-first. ``group_path`` is ``""`` for the start group.
+
+        ``group_id`` is the id of the group the processor *lives in* — taken from
+        the group we're reading, not the component DTO — so deep links land on
+        the right nested level instead of falling back to the root canvas."""
+
+        def visit(pg_id: str, prefix: str) -> Iterator[Tuple[str, str, dict]]:
+            flow = self._get_json(f"/flow/process-groups/{pg_id}")["processGroupFlow"]["flow"]
+            for proc in flow.get("processors", []):
+                yield prefix, pg_id, proc["component"]
+            for child in flow.get("processGroups", []):
+                comp = child["component"]
+                path = f"{prefix}/{comp['name']}" if prefix else comp["name"]
+                yield from visit(comp["id"], path)
+
+        yield from visit(self.resolve_group(group), "")
+
+    def find_processors(self, type_contains: str = "", group: str = "root") -> List[dict]:
+        """Processors under ``group`` whose type contains ``type_contains``.
+
+        Returns flat dicts (``id``/``name``/``type``/``state``/``path``) in
+        depth-first order — handy for pickers that need a label per processor.
+        """
+        needle = type_contains.lower()
+        return [
+            {
+                "id": comp["id"],
+                "name": comp.get("name", ""),
+                "type": comp.get("type", ""),
+                "state": comp.get("state", ""),
+                "path": path,
+                "group_id": group_id,
+            }
+            for path, group_id, comp in self.walk_processors(group)
+            if needle in comp.get("type", "").lower()
+        ]
+
+    def validation_errors(self, group: str = "root") -> List[dict]:
+        """Processors under ``group`` with validation errors (yellow triangles).
+
+        Each entry carries ``id``/``name``/``path`` plus the ``errors`` list
+        NiFi shows in the component tooltip.
+        """
+        return [
+            {
+                "id": comp["id"],
+                "name": comp.get("name", ""),
+                "path": path,
+                "group_id": group_id,
+                "errors": list(comp.get("validationErrors") or []),
+            }
+            for path, group_id, comp in self.walk_processors(group)
+            if comp.get("validationErrors")
+        ]
+
+    # -------------------------------------------------------------- bulletins
+
+    def bulletins(self, limit: int = 100) -> List[dict]:
+        """Recent bulletins across the instance, newest first, as flat dicts.
+
+        Bulletins the user lacks permission to read come back without a
+        payload; those are skipped.
+        """
+        board = self._request(
+            "GET", "/flow/bulletin-board", params={"limit": limit}
+        ).json()["bulletinBoard"]
+        out = []
+        for entity in board.get("bulletins", []):
+            b = entity.get("bulletin")
+            if not b:
+                continue
+            out.append(
+                {
+                    "id": entity.get("id"),
+                    "time": b.get("timestamp", ""),
+                    "level": b.get("level", ""),
+                    "source": b.get("sourceName", ""),
+                    "source_id": b.get("sourceId", ""),
+                    "group_id": b.get("groupId", ""),
+                    "message": b.get("message", ""),
+                }
+            )
+        out.reverse()  # the board lists oldest first
+        return out
+
+    def _set_processor_state(self, proc_id: str, state: str) -> None:
+        # Revision is re-fetched per call: every state change bumps the version.
+        revision = self._get_json(f"/processors/{proc_id}")["revision"]
+        self._request(
+            "PUT",
+            f"/processors/{proc_id}/run-status",
+            json={"revision": revision, "state": state, "disconnectedNodeAcknowledged": False},
+        )
+
+    def stop_processor(self, proc_id: str) -> None:
+        self._set_processor_state(proc_id, "STOPPED")
+
+    def start_processor(self, proc_id: str) -> None:
+        self._set_processor_state(proc_id, "RUNNING")
+
+    def run_processor_once(self, proc_id: str) -> None:
+        """Stop a processor, then trigger exactly one scheduling pass.
+
+        Uses NiFi's ``RUN_ONCE`` run-status (1.13+ and 2.x). The stop first
+        makes this idempotent whether the processor was running or not.
+        """
+        self.stop_processor(proc_id)
+        self._set_processor_state(proc_id, "RUN_ONCE")
+
+    # -------------------------------------------------------- flowfile inspect
+
+    def list_queues(self, group: str = "root") -> List[dict]:
+        """Every connection (queue) under ``group``, with its queued counts.
+
+        Each dict carries ``id`` (the connection id, used to list contents),
+        ``source``/``destination`` names, the group ``path``, and ``queued``
+        (FlowFile count) / ``queued_label`` (NiFi's "n / size" string).
+        """
+        out: List[dict] = []
+
+        def visit(pg_id: str, prefix: str) -> None:
+            flow = self._get_json(f"/flow/process-groups/{pg_id}")["processGroupFlow"]["flow"]
+            for entity in flow.get("connections", []):
+                comp = entity.get("component", {})
+                snap = (entity.get("status") or {}).get("aggregateSnapshot") or {}
+                out.append({
+                    "id": entity["id"],
+                    "source": (comp.get("source") or {}).get("name", ""),
+                    "destination": (comp.get("destination") or {}).get("name", ""),
+                    "path": prefix,
+                    "queued": snap.get("flowFilesQueued", 0),
+                    "queued_label": snap.get("queued", ""),
+                })
+            for child in flow.get("processGroups", []):
+                c = child["component"]
+                path = f"{prefix}/{c['name']}" if prefix else c["name"]
+                visit(c["id"], path)
+
+        visit(self.resolve_group(group), "")
+        return out
+
+    def list_sinks(self, group: str = "root") -> List[dict]:
+        """Terminal processors under ``group`` — those that feed no connection.
+
+        These are the end-of-line components (PutFile, PublishKafka, ...) that
+        have no downstream queue to inspect; use :meth:`recent_events` to see
+        what actually passed through them.
+        """
+        procs: List[Tuple[str, dict]] = []
+        sources: set = set()
+
+        def visit(pg_id: str, prefix: str) -> None:
+            flow = self._get_json(f"/flow/process-groups/{pg_id}")["processGroupFlow"]["flow"]
+            for p in flow.get("processors", []):
+                procs.append((prefix, p["component"]))
+            for entity in flow.get("connections", []):
+                src = (entity.get("component", {}).get("source") or {})
+                if src.get("id"):
+                    sources.add(src["id"])
+            for child in flow.get("processGroups", []):
+                c = child["component"]
+                path = f"{prefix}/{c['name']}" if prefix else c["name"]
+                visit(c["id"], path)
+
+        visit(self.resolve_group(group), "")
+        return [
+            {"id": c["id"], "name": c.get("name", ""), "type": c.get("type", ""), "path": path}
+            for path, c in procs
+            if c["id"] not in sources
+        ]
+
+    def list_flowfiles(self, connection_id: str, max_results: int = 100) -> List[dict]:
+        """Snapshot of the FlowFiles currently queued in a connection.
+
+        Drives NiFi's async listing-request (create → poll → delete). Each dict
+        has ``uuid`` (to fetch detail), ``filename``, ``size`` (bytes), and
+        ``position`` in the queue.
+        """
+        base = f"/flowfile-queues/{connection_id}/listing-requests"
+        req = self._request("POST", base).json()["listingRequest"]
+        req_id = req["id"]
+        try:
+            deadline = time.monotonic() + _POLL_TIMEOUT_S
+            while not req.get("finished"):
+                if time.monotonic() > deadline:
+                    raise NiFiApiError(408, f"listing queue {connection_id} timed out")
+                time.sleep(_POLL_INTERVAL_S)
+                req = self._get_json(f"{base}/{req_id}")["listingRequest"]
+            summaries = req.get("flowFileSummaries") or []
+        finally:
+            self._request("DELETE", f"{base}/{req_id}")
+        return [
+            {
+                "uuid": s["uuid"],
+                "filename": s.get("filename", ""),
+                "size": s.get("size", 0),
+                "position": s.get("position", 0),
+            }
+            for s in summaries[:max_results]
+        ]
+
+    def flowfile_detail(self, connection_id: str, uuid: str) -> dict:
+        """A queued FlowFile's attributes *and* content payload, in one call."""
+        ff = self._get_json(
+            f"/flowfile-queues/{connection_id}/flowfiles/{uuid}"
+        )["flowFile"]
+        size = ff.get("size", 0)
+        return {
+            "uuid": uuid,
+            "filename": ff.get("filename", ""),
+            "size": size,
+            "attributes": dict(ff.get("attributes") or {}),
+            "content": self._content(
+                f"/flowfile-queues/{connection_id}/flowfiles/{uuid}/content", size
+            ),
+        }
+
+    def _content(self, path: str, size: int) -> str:
+        """Fetch a content payload, tolerating empty/unavailable content.
+
+        NiFi returns 409 when asked for the content of a zero-byte FlowFile
+        ("FlowFile Size is not set" — it can't write a provenance record for it),
+        so skip the call when ``size`` is 0, and degrade any other content error
+        to a note rather than losing the attributes view that came with it.
+        """
+        if not size:
+            return ""
+        try:
+            resp = self._request("GET", path)
+        except NiFiApiError as exc:
+            return f"(content unavailable: {exc})"
+        return getattr(resp, "text", "") or ""
+
+    def recent_events(self, component_id: str, max_results: int = 25) -> List[dict]:
+        """Recent provenance events for a component, newest first.
+
+        Mirrors "View data provenance" on a processor — the click-path this is
+        meant to replace — scoped to one component via a provenance query
+        (create → poll → delete).
+        """
+        body = {"provenance": {"request": {
+            "searchTerms": {"ProcessorID": {"value": component_id, "inverse": False}},
+            "maxResults": max_results,
+            "summarize": True,
+        }}}
+        prov = self._request("POST", "/provenance", json=body).json()["provenance"]
+        prov_id = prov["id"]
+        try:
+            deadline = time.monotonic() + _POLL_TIMEOUT_S
+            while not prov.get("finished"):
+                if time.monotonic() > deadline:
+                    raise NiFiApiError(408, f"provenance query for {component_id} timed out")
+                time.sleep(_POLL_INTERVAL_S)
+                prov = self._get_json(f"/provenance/{prov_id}")["provenance"]
+            events = ((prov.get("results") or {}).get("provenanceEvents")) or []
+        finally:
+            self._request("DELETE", f"/provenance/{prov_id}")
+        return [
+            {
+                "event_id": e["eventId"],
+                "event_type": e.get("eventType", ""),
+                "time": e.get("eventTime", ""),
+                "component": e.get("componentName", ""),
+                "uuid": e.get("flowFileUuid", ""),
+            }
+            for e in events
+        ]
+
+    def event_detail(self, event_id: str) -> dict:
+        """A provenance event's attributes and (output) content payload."""
+        ev = self._get_json(f"/provenance-events/{event_id}")["provenanceEvent"]
+        attributes = {
+            a["name"]: a.get("value", "") for a in ev.get("attributes") or []
+        }
+        # fileSize is a human string ("0 bytes"); fileSizeBytes is the number we
+        # need for the zero-content guard.
+        size = ev.get("fileSizeBytes", 0) or 0
+        return {
+            "event_type": ev.get("eventType", ""),
+            "filename": attributes.get("filename", ""),
+            "size": size,
+            "attributes": attributes,
+            "content": self._content(
+                f"/provenance-events/{event_id}/content/output", size
+            ),
+        }
+
     # ------------------------------------------------------------------ pull
 
     def download_snapshot(self, pg_id: str) -> dict:
@@ -206,6 +530,9 @@ class NiFiClient:
         # contexts may also exist with values only NiFi knows. Pull live
         # non-sensitive values so the Python file reflects reality.
         self._refresh_parameter_values(flow)
+
+        for warning in flow.pull_warnings:
+            logger.warning("Pull of %r is lossy: %s", flow.name, warning)
         return flow
 
     def _refresh_parameter_values(self, flow: Flow) -> None:
@@ -240,22 +567,33 @@ class NiFiClient:
         start: bool = False,
         secrets: Union[None, dict, str, Path] = None,
     ) -> str:
-        """Delete-and-recreate ``flow`` under its ``parent_pg``; returns the new id.
+        """Apply ``flow`` under its ``parent_pg``; returns the group id.
 
-        Order: resolve parent → remember the old group's canvas position →
-        tear the old group down → create from snapshot → push parameter values
-        (model values + secrets) → optionally enable services and start.
+        Two strategies, chosen automatically:
+
+        * **In-place rebuild** when the target group already exists *and is
+          under NiFi Registry version control*. The group id and its registry
+          linkage are preserved — only the contents are swapped — so the push
+          shows up as *local changes* you can review and commit, instead of
+          orphaning a brand-new group that has to be re-added to version
+          control by hand.
+        * **Delete-and-recreate** otherwise (a fresh group, or one not under
+          version control). Simpler, and there's nothing to lose.
         """
         parent_id = self.resolve_group(flow.parent_pg or "root")
 
         position = {"x": 0.0, "y": 0.0}
         existing = [c for c in self._child_groups(parent_id) if c["name"] == flow.name]
         if existing:
+            pg_id = existing[0]["id"]
             position = existing[0].get("position") or position
-            logger.info("Replacing existing group %r (%s)", flow.name, existing[0]["id"])
-            self._teardown(existing[0]["id"])
+            if self._under_version_control(pg_id):
+                return self._push_in_place(pg_id, flow, start=start, secrets=secrets)
+            logger.info("Replacing existing group %r (%s)", flow.name, pg_id)
+            self._teardown(pg_id)
 
         snapshot = json.loads(flow.to_json())
+        self._align_bundles(snapshot)
         new_id = self._create_from_snapshot(parent_id, flow.name, snapshot, position)
         flow.nifi_id = new_id
         logger.info("Created group %r (%s) on NiFi %s", flow.name, new_id, self.version())
@@ -266,6 +604,336 @@ class NiFiClient:
             self.enable_services(new_id)
             self.start_group(new_id)
         return new_id
+
+    # ------------------------------------------------------ incremental push
+
+    def plan_flow(self, flow: Flow) -> Tuple[Optional[str], Flow, List[Any]]:
+        """Diff ``flow`` against its live group.
+
+        Returns ``(pg_id, live, changes)``. ``pg_id`` is ``None`` when the
+        group doesn't exist yet — the plan is then "everything is an add".
+        """
+        from niflow.formats.json_format import from_json
+        from niflow.layout import apply_layout
+        from niflow.plan import diff_flows
+
+        # Materialise auto-layout coordinates so planned adds carry positions.
+        apply_layout(flow)
+        parent_id = self.resolve_group(flow.parent_pg or "root")
+        existing = [c for c in self._child_groups(parent_id) if c["name"] == flow.name]
+        if not existing:
+            live = Flow(name=flow.name)
+            return None, live, diff_flows(live, flow)
+        pg_id = existing[0]["id"]
+        live = from_json(self.download_snapshot(pg_id))
+        live.nifi_id = pg_id
+        return pg_id, live, diff_flows(live, flow)
+
+    def push_update(
+        self,
+        flow: Flow,
+        *,
+        start: bool = False,
+        secrets: Union[None, dict, str, Path] = None,
+    ) -> List[Any]:
+        """Incrementally reconcile the live group with ``flow``.
+
+        Unlike :meth:`push_flow` this never rebuilds: it computes the change
+        plan and applies each change with a targeted call, so untouched
+        components keep their state and queues. Returns the applied plan
+        (empty list = live already matched). Creating a missing group falls
+        back to a full :meth:`push_flow`.
+        """
+        from niflow.apply import PlanApplier
+
+        pg_id, live, changes = self.plan_flow(flow)
+        if pg_id is None:
+            logger.info("Group %r not found — creating it in full", flow.name)
+            self.push_flow(flow, start=start, secrets=secrets)
+            return changes
+
+        # Contexts first: a plan may bind a group to a brand-new context, and
+        # value updates (incl. secrets) are independent of the tree diff.
+        self.ensure_parameter_contexts(flow)
+        self.apply_parameters(flow, secrets)
+
+        if changes:
+            PlanApplier(self, pg_id, live, flow).apply(changes)
+            logger.info("Applied %d change(s) to group %r (%s)", len(changes), flow.name, pg_id)
+        else:
+            logger.info("No changes for group %r (%s)", flow.name, pg_id)
+        flow.nifi_id = pg_id
+
+        if start:
+            self.enable_services(pg_id)
+            self.start_group(pg_id)
+        return changes
+
+    def ensure_parameter_contexts(self, flow: Flow) -> None:
+        """Create any parameter context the flow references that NiFi lacks."""
+        for ctx in _iter_contexts(flow):
+            if self._find_context_entity(ctx.name) is not None:
+                continue
+            component: Dict[str, Any] = {
+                "name": ctx.name,
+                "description": ctx.description or "",
+                "parameters": [],
+            }
+            if ctx.inherited_contexts:
+                inherited = []
+                for name in ctx.inherited_contexts:
+                    entity = self._find_context_entity(name)
+                    if entity is None:
+                        logger.warning(
+                            "Inherited parameter context %r not found; skipping link", name
+                        )
+                        continue
+                    inherited.append({"id": entity["id"], "component": {"id": entity["id"]}})
+                component["inheritedParameterContexts"] = inherited
+            self._request(
+                "POST",
+                "/parameter-contexts",
+                json={"revision": {"version": 0, "clientId": "niflow"}, "component": component},
+            )
+            logger.info("Created parameter context %r", ctx.name)
+
+    # ----------------------------------------------------- in-place rebuild
+
+    def _under_version_control(self, pg_id: str) -> bool:
+        """Is ``pg_id`` tracked by a NiFi Registry flow?"""
+        component = self._pg_entity(pg_id).get("component", {})
+        return bool(component.get("versionControlInformation"))
+
+    def _major_version(self) -> int:
+        """Leading integer of the server version (``1`` for ``"1.24.0"``)."""
+        try:
+            return int(self.version().split(".", 1)[0])
+        except (ValueError, AttributeError):
+            return 0
+
+    def _push_in_place(
+        self,
+        pg_id: str,
+        flow: Flow,
+        *,
+        start: bool,
+        secrets: Union[None, dict, str, Path],
+    ) -> str:
+        """Swap a versioned group's contents *without* deleting the group.
+
+        The vehicle that drops a flow's components (services + wiring) straight
+        *into* an existing group differs by line: NiFi 1.x uses templates
+        (removed in 2.x); NiFi 2.x uses copy/paste (``PUT .../paste``), which is
+        the supported template replacement. Either way the group id and its
+        ``versionControlInformation`` are preserved, so the push shows up as
+        *local changes* to review and commit.
+        """
+        logger.info("In-place rebuild of versioned group %r (%s)", flow.name, pg_id)
+        self._set_group_state(pg_id, "STOPPED")
+        self._empty_queues(pg_id)
+        self._empty_group_contents(pg_id)
+        if self._major_version() >= 2:
+            self._paste_into_group(pg_id, flow)
+        else:
+            self._instantiate_template(pg_id, flow)
+        flow.nifi_id = pg_id
+
+        self.apply_parameters(flow, secrets)
+
+        if start:
+            self.enable_services(pg_id)
+            self.start_group(pg_id)
+        logger.info(
+            "Rebuilt %r in place; group id and version control preserved "
+            "(commit the local changes in the Registry to save a version)",
+            flow.name,
+        )
+        return pg_id
+
+    def _empty_group_contents(self, pg_id: str) -> None:
+        """Delete everything *inside* ``pg_id`` but keep the group itself.
+
+        Order matters: connections reference their endpoints, so they go first;
+        then the canvas components; then child groups (recursively); finally the
+        group-scoped controller services (disabled first). The group and its
+        ``versionControlInformation`` are left untouched.
+        """
+        flow = self._get_json(f"/flow/process-groups/{pg_id}")["processGroupFlow"]["flow"]
+        for conn in flow.get("connections", []):
+            self._delete_component("connections", conn["id"])
+        for proc in flow.get("processors", []):
+            self._delete_component("processors", proc["id"])
+        for port in flow.get("inputPorts", []):
+            self._delete_component("input-ports", port["id"])
+        for port in flow.get("outputPorts", []):
+            self._delete_component("output-ports", port["id"])
+        for funnel in flow.get("funnels", []):
+            self._delete_component("funnels", funnel["id"])
+        for label in flow.get("labels", []):
+            self._delete_component("labels", label["id"])
+        for child in flow.get("processGroups", []):
+            self._teardown(child["component"]["id"])
+
+        self._disable_services(pg_id)
+        for svc in self._group_owned_services(pg_id):
+            self._delete_component("controller-services", svc["id"])
+
+    def _group_owned_services(self, pg_id: str) -> List[dict]:
+        """Controller services defined *on* ``pg_id`` (not inherited from above)."""
+        services = self._get_json(
+            f"/flow/process-groups/{pg_id}/controller-services"
+        ).get("controllerServices", [])
+        return [
+            s["component"]
+            for s in services
+            if s.get("component", {}).get("parentGroupId") == pg_id
+        ]
+
+    def _delete_component(self, kind: str, comp_id: str) -> None:
+        """Delete a single component, fetching its current revision first."""
+        version = self._get_json(f"/{kind}/{comp_id}")["revision"]["version"]
+        self._request(
+            "DELETE",
+            f"/{kind}/{comp_id}",
+            params={
+                "version": version,
+                "clientId": "niflow",
+                "disconnectedNodeAcknowledged": "false",
+            },
+        )
+
+    def _instantiate_template(self, pg_id: str, flow: Flow) -> None:
+        """Upload ``flow`` as a template and drop its contents into ``pg_id``.
+
+        NiFi 1.x only. The components land directly inside ``pg_id`` (no extra
+        nesting), services and connections included. The temporary template is
+        deleted afterwards so it doesn't linger in the template registry.
+        """
+        # Templates are instance-global and keyed by name, so an earlier
+        # interrupted push can leave one behind and 409 the upload (and even
+        # block deleting the group). Clear any same-named template first.
+        self._delete_templates_named(flow.name)
+        # NiFi 1.x returns the template-upload result as XML (a <templateEntity>),
+        # not JSON — parse the id out of it rather than calling .json().
+        upload = self._request(
+            "POST",
+            f"/process-groups/{pg_id}/templates/upload",
+            files={"template": (f"{flow.name}.xml", flow.to_xml(), "application/xml")},
+        )
+        template_id = ElementTree.fromstring(upload.text).findtext("template/id")
+        try:
+            self._request(
+                "POST",
+                f"/process-groups/{pg_id}/template-instance",
+                json={
+                    "templateId": template_id,
+                    "originX": 0.0,
+                    "originY": 0.0,
+                    "disconnectedNodeAcknowledged": False,
+                },
+            )
+        finally:
+            self._request("DELETE", f"/templates/{template_id}")
+
+    def _delete_templates_named(self, name: str) -> None:
+        """Delete every instance-global template whose name is ``name`` (1.x)."""
+        templates = self._get_json("/flow/templates").get("templates", [])
+        for entity in templates:
+            if entity.get("template", {}).get("name") == name:
+                self._request("DELETE", f"/templates/{entity['id']}")
+
+    def _paste_into_group(self, pg_id: str, flow: Flow) -> None:
+        """Inject ``flow``'s components into ``pg_id`` via NiFi 2.x copy/paste.
+
+        Paste (``PUT /process-groups/{id}/paste``) is the 2.x replacement for
+        templates, but it carries only *references* to a group's own controller
+        services, not their definitions. So we recreate the group-level services
+        first, remap every reference (processor properties and inter-service
+        properties) to the new ids, and hand paste those ids as
+        ``externalControllerServiceReferences`` so it wires them back up.
+        Components nested in child groups bring their own services along.
+        """
+        snapshot = json.loads(flow.to_json())
+        self._align_bundles(snapshot)
+        contents = snapshot["flowContents"]
+
+        id_map, ext_refs = self._recreate_group_services(
+            pg_id, contents.get("controllerServices") or []
+        )
+        self._remap_service_refs(contents, id_map)
+
+        copy_response = {
+            key: contents.get(key) or []
+            for key in (
+                "processGroups", "processors", "inputPorts",
+                "outputPorts", "connections", "labels", "funnels",
+            )
+        }
+        copy_response["externalControllerServiceReferences"] = ext_refs
+        revision = self._pg_entity(pg_id)["revision"]
+        self._request(
+            "PUT",
+            f"/process-groups/{pg_id}/paste",
+            json={
+                "copyResponse": copy_response,
+                "revision": {"version": revision["version"], "clientId": "niflow"},
+            },
+        )
+
+    def _recreate_group_services(
+        self, pg_id: str, service_dtos: List[dict]
+    ) -> Tuple[Dict[str, str], Dict[str, dict]]:
+        """Create ``pg_id``'s group-level controller services from the snapshot.
+
+        Returns ``(versioned_id -> new_id, externalControllerServiceReferences)``.
+        Done in two passes: create the bare services first (their properties may
+        reference each other, and those ids don't exist until all are created),
+        then set properties with inter-service references remapped.
+        """
+        id_map: Dict[str, str] = {}
+        ext_refs: Dict[str, dict] = {}
+        for svc in service_dtos:
+            component = {"name": svc["name"], "type": svc["type"]}
+            if svc.get("bundle"):
+                component["bundle"] = svc["bundle"]
+            created = self._request(
+                "POST",
+                f"/process-groups/{pg_id}/controller-services",
+                json={"revision": {"version": 0, "clientId": "niflow"}, "component": component},
+            ).json()
+            new_id = created["component"]["id"]
+            id_map[svc["identifier"]] = new_id
+            ext_refs[new_id] = {"identifier": new_id, "name": svc["name"]}
+
+        for svc in service_dtos:
+            props = svc.get("properties") or {}
+            if not props:
+                continue
+            new_id = id_map[svc["identifier"]]
+            remapped = {k: id_map.get(v, v) for k, v in props.items()}
+            revision = self._get_json(f"/controller-services/{new_id}")["revision"]
+            self._request(
+                "PUT",
+                f"/controller-services/{new_id}",
+                json={"revision": revision, "component": {"id": new_id, "properties": remapped}},
+            )
+        return id_map, ext_refs
+
+    def _remap_service_refs(self, group: dict, id_map: Dict[str, str]) -> None:
+        """Rewrite processor service-ref property values (versioned id -> new id),
+        recursing into child groups. Only values matching a recreated group-level
+        service are touched; services owned by nested groups are left for paste."""
+        if not id_map:
+            return
+        for proc in group.get("processors") or []:
+            props = proc.get("properties")
+            if not props:
+                continue
+            for key, value in list(props.items()):
+                if value in id_map:
+                    props[key] = id_map[value]
+        for child in group.get("processGroups") or []:
+            self._remap_service_refs(child, id_map)
 
     def _create_from_snapshot(
         self, parent_id: str, name: str, snapshot: dict, position: dict
@@ -305,6 +973,63 @@ class NiFiClient:
             },
         )
         return resp.json()["id"]
+
+    # --------------------------------------------------------------- bundles
+
+    def bundle_index(self) -> Dict[str, dict]:
+        """Map every installed ``type`` to its real NAR bundle on this instance.
+
+        Built from ``/flow/processor-types`` + ``/flow/controller-service-types``
+        (version-agnostic, so it works on 1.x and 2.x). Cached for the client's
+        lifetime — the installed NAR set doesn't change mid-session.
+        """
+        if self._bundle_index is None:
+            index: Dict[str, dict] = {}
+            for endpoint, key in (
+                ("/flow/processor-types", "processorTypes"),
+                ("/flow/controller-service-types", "controllerServiceTypes"),
+            ):
+                for dto in self._get_json(endpoint).get(key, []):
+                    bundle, type_str = dto.get("bundle"), dto.get("type")
+                    if type_str and bundle:
+                        index.setdefault(type_str, {
+                            "group": bundle.get("group", ""),
+                            "artifact": bundle.get("artifact", ""),
+                            "version": bundle.get("version", ""),
+                        })
+            self._bundle_index = index
+        return self._bundle_index
+
+    def _align_bundles(self, snapshot: dict) -> None:
+        """Rewrite every component's bundle to the target instance's real NAR.
+
+        The offline emitter guesses bundle coordinates (and a placeholder
+        version); the *target* is authoritative. Matching each type to the
+        instance's installed NAR is what lets a flow import cleanly across NiFi
+        1.x/2.x — a wrong artifact or version is exactly what yields the
+        "is not a valid processor type" rejection. Types the instance doesn't
+        know are left untouched (let NiFi report them honestly).
+        """
+        index = self.bundle_index()
+        if not index:
+            return
+
+        def stamp(component: dict) -> None:
+            target = index.get(component.get("type"))
+            if target:
+                component["bundle"] = dict(target)
+
+        def walk(group: dict) -> None:
+            for comp in group.get("processors") or []:
+                stamp(comp)
+            for comp in group.get("controllerServices") or []:
+                stamp(comp)
+            for child in group.get("processGroups") or []:
+                walk(child)
+
+        contents = snapshot.get("flowContents")
+        if isinstance(contents, dict):
+            walk(contents)
 
     # ------------------------------------------------------------ parameters
 
@@ -383,6 +1108,96 @@ class NiFiClient:
             )
         logger.info("Updated %d parameter(s) in context %r", len(parameter_updates), name)
 
+    # ------------------------------------------------- registry / versioning
+
+    def create_registry_client(
+        self, name: str, url: str, description: str = ""
+    ) -> str:
+        """Register a NiFi Registry with this NiFi; returns the registry-client id.
+
+        The request body differs across lines: NiFi 1.x takes a flat ``uri``;
+        NiFi 2.x turned registry clients into extensions, so it wants a ``type``
+        plus a ``url`` *property*. If a client for ``url`` already exists we
+        reuse it rather than erroring on a duplicate.
+        """
+        for existing in self._get_json("/controller/registry-clients").get(
+            "registries", []
+        ):
+            comp = existing.get("component", {})
+            if comp.get("uri") == url or (comp.get("properties") or {}).get("url") == url:
+                return comp["id"]
+
+        if self._major_version() >= 2:
+            component = {
+                "name": name,
+                "type": "org.apache.nifi.registry.flow.NifiRegistryFlowRegistryClient",
+                "properties": {"url": url},
+                "description": description,
+            }
+        else:
+            component = {"name": name, "uri": url, "description": description}
+        resp = self._request(
+            "POST",
+            "/controller/registry-clients",
+            json={"revision": {"version": 0, "clientId": "niflow"}, "component": component},
+        )
+        return resp.json()["component"]["id"]
+
+    def list_registry_buckets(self, registry_id: str) -> List[dict]:
+        """Buckets visible through ``registry_id``, as ``{id, name}`` dicts.
+
+        NiFi proxies this to the registry, so it works without talking to the
+        registry's own API. (Creating a bucket is *not* proxied — do that
+        against the registry directly.)
+        """
+        entity = self._get_json(f"/flow/registries/{registry_id}/buckets")
+        out = []
+        for b in entity.get("buckets", []):
+            bucket = b.get("bucket") or b.get("component") or b
+            out.append({"id": bucket.get("id") or b.get("id"), "name": bucket.get("name", "")})
+        return out
+
+    def start_version_control(
+        self,
+        pg_id: str,
+        registry_id: str,
+        bucket_id: str,
+        flow_name: str,
+        comment: str = "",
+    ) -> dict:
+        """Place ``pg_id`` under version control in the given bucket.
+
+        Returns the resulting ``versionControlInformation``. Use this to put a
+        group under control from code (the integration tests need a versioned
+        group to push against).
+        """
+        revision = self._pg_entity(pg_id)["revision"]
+        body = {
+            "processGroupRevision": {
+                "version": revision["version"],
+                "clientId": "niflow",
+            },
+            "versionedFlow": {
+                "registryId": registry_id,
+                "bucketId": bucket_id,
+                "flowName": flow_name,
+                "comments": comment,
+                "description": "",
+                # Required on both lines ("Action is required" 400 without it).
+                "action": "COMMIT",
+            },
+        }
+        resp = self._request("POST", f"/versions/process-groups/{pg_id}", json=body)
+        return resp.json().get("versionControlInformation", {})
+
+    def version_control_state(self, pg_id: str) -> Optional[str]:
+        """The registry sync state of ``pg_id`` (``UP_TO_DATE``,
+        ``LOCALLY_MODIFIED``, ``STALE``, …), or ``None`` if not versioned."""
+        info = self._get_json(f"/versions/process-groups/{pg_id}").get(
+            "versionControlInformation"
+        )
+        return info.get("state") if info else None
+
     # ---------------------------------------------------------------- copy
 
     def copy_group(
@@ -422,6 +1237,20 @@ class NiFiClient:
     def stop_group(self, group: str) -> None:
         self._set_group_state(self.resolve_group(group), "STOPPED")
 
+    def quiesce_group(self, group: str = "root") -> str:
+        """Fully quiesce ``group``: stop processors, disable services, drain queues.
+
+        Leaves the group in the exact state NiFi requires before it can be
+        deleted (nothing running, no enabled services, no queued FlowFiles) —
+        without deleting it. Returns NiFi's drop summary, e.g. ``"12 / 4.2 KB"``.
+        """
+        pg_id = self.resolve_group(group)
+        self._set_group_state(pg_id, "STOPPED")
+        self._disable_services(pg_id)
+        dropped = self._empty_queues(pg_id)
+        logger.info("Quiesced group %r (%s dropped)", group, dropped)
+        return dropped
+
     def enable_services(self, group: str) -> None:
         pg_id = self.resolve_group(group)
         self._request(
@@ -437,7 +1266,30 @@ class NiFiClient:
             json={"id": pg_id, "state": "DISABLED"},
         )
 
-    def _empty_queues(self, pg_id: str) -> None:
+    def purge_queues(self, group: str = "root") -> str:
+        """Drop the contents of every queue under ``group`` (recursive).
+
+        Returns NiFi's summary of what was dropped, e.g. ``"12 / 4.2 KB"``.
+        """
+        dropped = self._empty_queues(self.resolve_group(group))
+        logger.info("Purged queues under %r: %s dropped", group, dropped)
+        return dropped
+
+    def _has_connections(self, pg_id: str) -> bool:
+        """Whether any connection exists under ``pg_id`` (recursive)."""
+        flow = self._get_json(f"/flow/process-groups/{pg_id}")["processGroupFlow"]["flow"]
+        if flow.get("connections"):
+            return True
+        return any(
+            self._has_connections(child["component"]["id"])
+            for child in flow.get("processGroups", [])
+        )
+
+    def _empty_queues(self, pg_id: str) -> str:
+        # NiFi 1.x returns 500 from empty-all-connections-requests when the group
+        # has no connections at all; skip the request rather than trip on it.
+        if not self._has_connections(pg_id):
+            return ""
         req = self._request(
             "POST", f"/process-groups/{pg_id}/empty-all-connections-requests"
         ).json()["dropRequest"]
@@ -455,6 +1307,7 @@ class NiFiClient:
             self._request(
                 "DELETE", f"/process-groups/{pg_id}/empty-all-connections-requests/{req_id}"
             )
+        return req.get("dropped", "")
 
     def delete_group(self, group: str) -> None:
         """Stop, disable, drain, and delete a process group."""

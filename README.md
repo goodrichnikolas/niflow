@@ -11,8 +11,10 @@ niflow list                                  # see the canvas tree + ids
 niflow copy "Prod Flow"                      # safe, detached working copy
 niflow pull "Prod Flow (copy)" -o flows/prod_flow.py
 # ...edit flows/prod_flow.py: tweak a SQL query, add a processor, rewire...
-niflow diff flows/prod_flow.py               # what changed vs the live canvas?
-niflow push flows/prod_flow.py --start       # replace the live group and start it
+niflow plan flows/prod_flow.py               # semantic "what will change"
+niflow push flows/prod_flow.py --update      # apply just that delta in place
+niflow diff flows/prod_flow.py               # raw JSON diff vs the live canvas
+niflow push flows/prod_flow.py --start       # or: full replace and start
 ```
 
 …or define a flow from scratch:
@@ -36,8 +38,18 @@ flow.push(start=True)
 
 `pull` downloads the group as a NiFi *flow definition* (`GET
 /process-groups/{id}/download`, available since NiFi 1.11) and generates a
-runnable Python module. `push` re-serialises the model to a flow definition and
-creates the group in one POST — **delete-and-recreate**: the old group is
+runnable Python module. Pulls that hit something the model can't represent
+(remote process groups, services defined above the pulled group) say so loudly
+instead of dropping components silently.
+
+`plan` diffs your `.py` against the live group into a terraform-style change
+plan — adds, removes, and field-level updates by component. `push --update`
+applies exactly that plan with targeted REST calls: only changed processors
+are stopped/updated/restarted, removed connections are drained first, and
+everything untouched keeps its id, state, and **queued FlowFiles**. The loop
+converges: a pull followed by a plan reports zero changes.
+
+Plain `push` remains the full **delete-and-recreate**: the old group is
 stopped, drained, and replaced, keeping its canvas position. Parameter contexts
 survive replacement (they live outside the group), so sensitive values stored
 in NiFi are not lost.
@@ -60,6 +72,10 @@ structurally identical flows produce identical bytes.
 - **Connections** — `a >> b` or `a.to(b, relationships=["failure"], back_pressure_object_threshold=0)`.
   Queue settings (back pressure, expiration, prioritizers, load balancing) round-trip.
 - **Process groups** — nestable (`with flow.process_group("X") as x:`), variables included.
+- **Auto-layout** — components without an explicit `position` are placed along
+  the connection graph; `Flow("X", layout="horizontal")` chains left-to-right
+  (the default), `layout="vertical"` top-to-bottom. Parallel branches fan out
+  on the cross axis. Explicit positions always win.
 - **Ports, funnels, labels** — `InputPort`/`OutputPort`, `Funnel()`, `Label("note")`.
 - **Controller services** — pass an instance as a processor property value; the
   UUID is wired up automatically.
@@ -78,24 +94,43 @@ The CLI and `Flow.push()/Flow.pull()` use a small direct REST client
 username/password login covers single-user *and* LDAP. The legacy
 `Flow.deploy()` (component-by-component via nipyapi) remains for 2.x only.
 
-Local test instances:
+Pushing to a group already under **NiFi Registry version control** rebuilds it
+*in place* — same group id, registry link intact, surfaced as *local changes*
+you commit in the Registry — instead of delete-and-recreate. The in-place
+vehicle differs by line (NiFi 1.x templates, NiFi 2.x copy/paste, since
+templates were removed in 2.x) but the behaviour is identical. Local registries
+for testing come up with `docker compose up` (2.7.2, `:18080`) and the `v1`
+profile (1.24.0, `:18081`).
+
+Local test instances (Docker is only ever used to host these disposable
+NiFis — niflow's runtime is pure Python):
 
 ```bash
-make nifi-up   && make nifi-wait    # NiFi 2.7.2  -> https://localhost:8443/nifi
-make nifi1-up  && make nifi1-wait   # NiFi 1.24.0 -> https://localhost:8444/nifi
+make nifi-up      && make nifi-wait       # NiFi 2.7.2  -> https://localhost:8443/nifi
+make nifi1-up     && make nifi1-wait      # NiFi 1.24.0 -> https://localhost:8444/nifi
+make nifi-mtls-up && make nifi-mtls-wait  # NiFi 1.24.0 secured by CLIENT CERTS -> :8445
 ```
 
-Both log in as **admin** / **adminpassword123**. Point the CLI at either (or at
-a real instance) with env vars:
+The first two log in as **admin** / **adminpassword123**; the mTLS one
+authenticates with the generated `certs/mtls/client.pem`.
 
-| Env var | Default |
+Connection settings resolve **defaults < `.niflow.env` config file < real
+environment**. Copy `.niflow.env.example` to `.niflow.env` (git-ignored; also
+searched at `$NIFLOW_CONFIG` and `~/.niflow.env`), fill it out once, and every
+command — CLI, both GUIs, library — connects the same way:
+
+| Key | Meaning |
 | --- | --- |
-| `NIFLOW_NIFI_HOST` | `https://localhost:8443/nifi-api` |
-| `NIFLOW_NIFI_USER` | `admin` |
-| `NIFLOW_NIFI_PASSWORD` | `adminpassword123` |
-| `NIFLOW_NIFI_VERIFY_SSL` | `false` |
+| `NIFLOW_NIFI_HOST` | REST base, must end in `/nifi-api` |
+| `NIFLOW_NIFI_USER` / `NIFLOW_NIFI_PASSWORD` | token login (single-user or LDAP); empty password = anonymous |
+| `NIFLOW_NIFI_CLIENT_CERT` / `NIFLOW_NIFI_CLIENT_KEY` | PEM client certificate -> mTLS (token login skipped) |
+| `NIFLOW_NIFI_CA_BUNDLE` | CA/server PEM to trust (beats `VERIFY_SSL`) |
+| `NIFLOW_NIFI_VERIFY_SSL` | `false` for self-signed dev certs |
 
-> The host URL must include the `/nifi-api` base path.
+**`niflow doctor`** diagnoses an unknown server step by step — reachability,
+TLS trust, which auth mode the server wants, whether your credentials work —
+and each failure names the `.niflow.env` key to fix. Full playbook for a work
+instance (Podman, unknown auth): [docs/work-nifi-setup.md](docs/work-nifi-setup.md).
 
 ## Secrets / sensitive parameters
 
@@ -135,6 +170,16 @@ make push FILE=flows/my_flow.py
 make test                            # unit tests (no NiFi needed)
 make test-integration-v1             # integration tests against 1.24
 ```
+
+## GUIs (both optional)
+
+- **`niflow-web`** (`make webgui`) — browser-based helper on
+  `http://127.0.0.1:7777`, zero extra dependencies: processor list with
+  run-once/start/stop, queue browser with FlowFile attribute+content
+  inspection, bulletins/error panels, and plan-preview + incremental push for
+  `flows/*.py`. Under WSL it opens the *Windows* default browser.
+- **`niflow-gui`** (`make gui`) — the PyQt6 desktop helper (`pip install -e
+  ".[gui]"`), same capabilities as a native window.
 
 ## Convert flows
 
@@ -197,7 +242,7 @@ for the legacy 2.x deploy path and codegen). Docker for local NiFi.
 
 ## Out of scope (for now)
 
-Remote Process Groups, NiFi Registry *sync* (copy detaches from it instead),
-mTLS/token-file auth, and incremental in-place updates (push is
-delete-and-recreate by design — simple and predictable; contexts and their
-sensitive values survive).
+Remote Process Groups (pull warns when it drops one), NiFi Registry *sync*
+(copy detaches from it instead), and mTLS/token-file auth. NiFi 1.x variable
+registry edits are reported by `plan` but not applied incrementally — use
+parameter contexts.

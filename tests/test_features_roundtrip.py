@@ -16,6 +16,7 @@ from niflow import (
     Processor,
 )
 from niflow.formats import from_json, to_json, to_python
+from niflow.layout import apply_layout
 
 DUMP_EXCLUDE = {"nifi_id", "nifi_entity"}
 
@@ -77,8 +78,12 @@ def _rich_flow() -> Flow:
 
 
 def _dump(flow: Flow) -> dict:
-    """Model dump with positions normalised (None == NiFi's (0,0) default)."""
-    dump = flow.model_dump(exclude=DUMP_EXCLUDE)
+    """Model dump with positions normalised.
+
+    Serialisation materialises auto-layout coordinates for components without
+    a position, so resolve them on the model first; the group itself still
+    defaults to NiFi's (0,0)."""
+    dump = apply_layout(flow).model_dump(exclude=DUMP_EXCLUDE)
 
     def normalise(node):
         if isinstance(node, dict):

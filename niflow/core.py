@@ -262,6 +262,9 @@ class ProcessGroup(NiFiComponent):
 
     comment: str = ""
     position: Optional[Tuple[float, float]] = None
+    # Direction for auto-placing components that have no explicit position:
+    # connected chains march right ("horizontal") or down ("vertical").
+    layout: Literal["horizontal", "vertical"] = "horizontal"
     processors: List[Processor] = Field(default_factory=list)
     controller_services: List[ControllerService] = Field(default_factory=list)
     input_ports: List[InputPort] = Field(default_factory=list)
@@ -356,6 +359,11 @@ class Flow(ProcessGroup):
     """
 
     parent_pg: str = "root"
+    # Filled by from_json when a live snapshot contained things the model
+    # cannot represent (remote process groups, external service references).
+    # Never serialised; surfaced by `niflow pull` and the GUI so a lossy pull
+    # is loud instead of silent.
+    pull_warnings: List[str] = Field(default_factory=list, exclude=True)
 
     def deploy(self, config: Any = None, start: bool = False, auto_terminate_unused: bool = True) -> "Flow":
         """Deploy this flow to NiFi component-by-component via nipyapi (legacy, 2.x only).
@@ -408,6 +416,12 @@ class Flow(ProcessGroup):
         from niflow.formats import to_python as _to_python
 
         return _to_python(self, module_docstring=module_docstring)
+
+    def validate(self) -> List[dict]:
+        """Static pre-push checks; ``[]`` if clean. See :mod:`niflow.validate`."""
+        from niflow.validate import validate_flow
+
+        return validate_flow(self)
 
     @classmethod
     def from_xml(cls, source: Any) -> "Flow":
