@@ -71,6 +71,10 @@ class FakeNiFi:
                                   "flowId": "f1", "version": 3}},
             })
 
+        # Automatic pre-push backup snapshots the group first.
+        if (method, path) == ("GET", "/process-groups/vc-id/download"):
+            return FakeResponse(200, {"flowContents": {"name": "Versioned"}})
+
         # Contents to be emptied before the template is instantiated.
         if (method, path) == ("GET", "/flow/process-groups/vc-id"):
             return FakeResponse(200, {"processGroupFlow": {"id": "vc-id", "flow": {

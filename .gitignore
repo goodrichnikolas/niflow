@@ -13,6 +13,9 @@ __pycache__/
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
 
+# Automatic pre-push snapshots (niflow rollback restores from here)
+.niflow-backups/
+
 # Per-environment connection config (may hold a work password) + TLS material
 .niflow.env
 *.p12

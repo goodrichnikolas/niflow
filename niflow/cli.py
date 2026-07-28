@@ -206,6 +206,43 @@ def cmd_diff(args: argparse.Namespace) -> int:
     return 1
 
 
+def cmd_backup(args: argparse.Namespace) -> int:
+    path = _client().backup_group(args.group)
+    print(f"Backed up {args.group!r} -> {path}")
+    return 0
+
+
+def cmd_rollback(args: argparse.Namespace) -> int:
+    from niflow.backup import backup_dir, list_backups
+
+    if args.list:
+        backups = list_backups(args.group)
+        if not backups:
+            print(f"No backups for {args.group!r} in {backup_dir()}/")
+            return 1
+        for path in backups:
+            print(path)
+        return 0
+
+    client = _client()
+    target = args.file
+    if target is None:
+        from niflow.backup import latest_backup
+
+        target = latest_backup(args.group)
+        if target is None:
+            print(f"error: no backups for {args.group!r} in {backup_dir()}/", file=sys.stderr)
+            return 2
+    if not args.yes:
+        answer = input(f"Replace live group {args.group!r} with {target}? [y/N] ")
+        if answer.strip().lower() not in ("y", "yes"):
+            print("Aborted.")
+            return 1
+    pg_id = client.rollback(args.group, target, start=args.start, secrets=args.secrets)
+    print(f"Rolled back {args.group!r} from {target} (id={pg_id}).")
+    return 0
+
+
 def cmd_delete(args: argparse.Namespace) -> int:
     client = _client()
     pg_id = client.resolve_group(args.group)
@@ -301,6 +338,22 @@ def main(argv: Optional[list] = None) -> int:
     p.add_argument("--group", help="Live group to compare against (default: the flow's name)")
     p.add_argument("--var", default="flow")
     p.set_defaults(func=cmd_diff)
+
+    p = sub.add_parser("backup", help="Snapshot a live group to .niflow-backups/")
+    p.add_argument("group", help="Group name, path, or id")
+    p.set_defaults(func=cmd_backup)
+
+    p = sub.add_parser(
+        "rollback",
+        help="Rebuild a group from its newest backup (mutating pushes back up automatically)",
+    )
+    p.add_argument("group", help="Group name (as used when it was backed up)")
+    p.add_argument("--file", help="Specific backup file (default: newest for the group)")
+    p.add_argument("--list", action="store_true", help="List backups for the group and exit")
+    p.add_argument("--start", action="store_true", help="Start the group after restoring")
+    p.add_argument("--secrets", help="Secrets file for sensitive parameters")
+    p.add_argument("-y", "--yes", action="store_true", help="Skip confirmation")
+    p.set_defaults(func=cmd_rollback)
 
     p = sub.add_parser("delete", help="Stop, drain, and delete a process group")
     p.add_argument("group", help="Group name, path, or id")

@@ -587,6 +587,7 @@ class NiFiClient:
         if existing:
             pg_id = existing[0]["id"]
             position = existing[0].get("position") or position
+            self._backup(pg_id, name=flow.name)
             if self._under_version_control(pg_id):
                 return self._push_in_place(pg_id, flow, start=start, secrets=secrets)
             logger.info("Replacing existing group %r (%s)", flow.name, pg_id)
@@ -658,6 +659,7 @@ class NiFiClient:
         self.apply_parameters(flow, secrets)
 
         if changes:
+            self._backup(pg_id, name=flow.name)
             PlanApplier(self, pg_id, live, flow).apply(changes)
             logger.info("Applied %d change(s) to group %r (%s)", len(changes), flow.name, pg_id)
         else:
@@ -668,6 +670,59 @@ class NiFiClient:
             self.enable_services(pg_id)
             self.start_group(pg_id)
         return changes
+
+    # ------------------------------------------------------ backup / rollback
+
+    def backup_group(self, group: str, name: Optional[str] = None) -> Path:
+        """Snapshot a live group to ``.niflow-backups/`` (see :mod:`niflow.backup`).
+
+        Called automatically before every mutating push; also available as
+        ``niflow backup`` for a manual save point.
+        """
+        return self._backup(self.resolve_group(group), name)
+
+    def _backup(self, pg_id: str, name: Optional[str] = None) -> Path:
+        from niflow.backup import save_backup
+
+        if name is None:
+            name = self._pg_entity(pg_id)["component"]["name"]
+        return save_backup(name, self.download_snapshot(pg_id))
+
+    def rollback(
+        self,
+        group: str,
+        backup: Union[None, str, Path] = None,
+        *,
+        start: bool = False,
+        secrets: Union[None, dict, str, Path] = None,
+    ) -> str:
+        """Rebuild ``group`` from a backup file (newest for the name if omitted).
+
+        The current live state is itself backed up first (by the push path),
+        so a rollback can be rolled back. Returns the group id.
+        """
+        from niflow.backup import backup_dir, latest_backup
+        from niflow.formats import from_json
+
+        if backup is None:
+            backup = latest_backup(group)
+            if backup is None:
+                raise ValueError(f"no backups found for {group!r} in {backup_dir()}")
+        snapshot = json.loads(Path(backup).read_text())
+        flow = from_json(snapshot)
+        if not re.fullmatch(r"[0-9a-f-]{36}", group):
+            flow.name = group.split("/")[-1]  # a name or a/b path: restore under it
+
+        # Land it back where the live group sits today (if it still exists).
+        try:
+            pg_id = self.resolve_group(flow.name)
+            parent_id = self._pg_entity(pg_id)["component"].get("parentGroupId")
+            if parent_id and parent_id != self.root_id():
+                flow.parent_pg = self._pg_entity(parent_id)["component"]["name"]
+        except ValueError:
+            pass  # group is gone entirely — restore under its recorded parent
+        logger.info("Rolling back %r from %s", flow.name, backup)
+        return self.push_flow(flow, start=start, secrets=secrets)
 
     def ensure_parameter_contexts(self, flow: Flow) -> None:
         """Create any parameter context the flow references that NiFi lacks."""
