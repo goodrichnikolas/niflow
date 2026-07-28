@@ -83,6 +83,7 @@ class Change:
     fields: Dict[str, Tuple[Any, Any]] = field(default_factory=dict)
     desired: Optional[Any] = None
     live: Optional[Any] = None
+    note: Optional[str] = None  # e.g. probable-rename warning
 
     @property
     def location(self) -> str:
@@ -93,6 +94,7 @@ def diff_flows(live: ProcessGroup, desired: ProcessGroup) -> List[Change]:
     """Return the ordered change plan turning ``live`` into ``desired``."""
     changes: List[Change] = []
     _diff_group(live, desired, (), changes)
+    _annotate_renames(changes)
     return changes
 
 
@@ -307,6 +309,47 @@ def _connection_name(conn: Connection) -> str:
     return f"{end(conn.source)}{arrow}{end(conn.target)}"
 
 
+# Kinds whose add/remove pairs may really be a rename. Identity is name-based,
+# so renaming a component turns into remove+add — which destroys processor
+# state and every FlowFile queued on the component's connections. The plan
+# can't know intent, but it can shout when the shape looks like a rename.
+_RENAMEABLE_KINDS = ("processor", "controller_service", "input_port", "output_port", "process_group")
+
+
+def _annotate_renames(changes: List[Change]) -> None:
+    """Flag add/remove pairs that look like renames (same group, same type).
+
+    Processors and services pair only when the component type matches (in
+    listed order for multiples). Ports and child groups carry no type, so
+    they pair only when the match is unambiguous: exactly one add and one
+    remove of that kind in the group.
+    """
+    by_bucket: Dict[Tuple, Dict[str, List[Change]]] = {}
+    for change in changes:
+        if change.kind not in _RENAMEABLE_KINDS or change.op not in ("add", "remove"):
+            continue
+        comp = change.desired if change.op == "add" else change.live
+        ctype = getattr(comp, "type", None)
+        bucket = by_bucket.setdefault((change.path, change.kind, ctype), {"add": [], "remove": []})
+        bucket[change.op].append(change)
+
+    for (path, kind, ctype), bucket in by_bucket.items():
+        adds, removes = bucket["add"], bucket["remove"]
+        if ctype is None and (len(adds) != 1 or len(removes) != 1):
+            continue  # untyped kinds: only flag the unambiguous 1:1 case
+        for add, remove in zip(adds, removes):
+            noun = kind.replace("_", " ")
+            add.note = (
+                f"looks like a RENAME of {noun} {remove.name!r} — identity is "
+                f"name-based, so this applies as remove+add: "
+                + ("everything inside the old group is destroyed, including queued data. "
+                   if kind == "process_group"
+                   else "component state and FlowFiles queued on its connections are LOST. ")
+                + "Keep the old name (or rename it on the NiFi canvas first) if that matters."
+            )
+            remove.note = f"may be a rename to {add.name!r} — see the matching add above/below"
+
+
 # ---------------------------------------------------------------- rendering
 
 
@@ -324,6 +367,8 @@ def format_plan(changes: List[Change]) -> str:
         if change.op == "add" and isinstance(change.desired, Processor):
             head += f" ({change.desired.type.rsplit('.', 1)[-1]})"
         lines.append(head)
+        if change.note:
+            lines.append(f"    ! {change.note}")
         for fname, (old, new) in change.fields.items():
             lines.append(f"    {fname}: {old!r} -> {new!r}")
     counts = {"add": 0, "remove": 0, "update": 0}
@@ -333,4 +378,10 @@ def format_plan(changes: List[Change]) -> str:
         f"Plan: {counts['add']} to add, {counts['update']} to change, "
         f"{counts['remove']} to remove."
     )
+    renames = sum(1 for c in changes if c.op == "add" and c.note)
+    if renames:
+        lines.append(
+            f"WARNING: {renames} probable rename(s) detected — renames apply as "
+            f"remove+add and destroy state/queued data (see ! lines above)."
+        )
     return "\n".join(lines)

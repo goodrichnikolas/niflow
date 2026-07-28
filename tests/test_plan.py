@@ -166,3 +166,44 @@ def test_format_plan_renders_summary():
     assert "properties[File Size]: '0B' -> '1KB'" in text
     assert "Plan: 0 to add, 1 to change, 0 to remove." in text
     assert "No changes" in format_plan([])
+
+
+def test_rename_detected_for_same_type_processor():
+    live, desired = _base_flow(), _base_flow()
+    desired.processors[0].name = "Generate"  # Gen -> Generate, same type
+    plan = diff_flows(live, desired)
+    add = next(c for c in plan if c.op == "add" and c.kind == "processor")
+    remove = next(c for c in plan if c.op == "remove" and c.kind == "processor")
+    assert add.name == "Generate" and "RENAME" in add.note and "'Gen'" in add.note
+    assert remove.name == "Gen" and "rename" in remove.note
+    text = format_plan(plan)
+    assert "probable rename" in text and "! looks like a RENAME" in text
+
+
+def test_no_rename_flag_for_different_types():
+    live, desired = _base_flow(), _base_flow()
+    extra = Processor(name="Extra", type="org.x.CompletelyDifferent")
+    desired.add_processor(extra)
+    del desired.processors[1]
+    del desired.connections[0]
+    plan = diff_flows(live, desired)
+    assert all(c.note is None for c in plan)
+    assert "probable rename" not in format_plan(plan)
+
+
+def test_rename_detected_for_child_group():
+    live, desired = _base_flow(), _base_flow()
+    desired.process_groups[0].name = "Child2"
+    # keep connections consistent: base flow has none crossing into Child
+    plan = diff_flows(live, desired)
+    add = next(c for c in plan if c.op == "add" and c.kind == "process_group")
+    assert add.note and "destroyed" in add.note
+
+
+def test_port_rename_flagged_only_when_unambiguous():
+    live, desired = _base_flow(), _base_flow()
+    child = desired.process_groups[0]
+    child.input_ports[0].name = "input"
+    plan = diff_flows(live, desired)
+    add = next(c for c in plan if c.op == "add" and c.kind == "input_port")
+    assert add.note and "RENAME" in add.note
