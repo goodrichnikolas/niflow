@@ -49,6 +49,13 @@ are stopped/updated/restarted, removed connections are drained first, and
 everything untouched keeps its id, state, and **queued FlowFiles**. The loop
 converges: a pull followed by a plan reports zero changes.
 
+Identity is name-based, so renaming a component is really remove+add — the
+plan detects that shape (same type, same group) and **warns before you lose
+state or queued data**. And every mutating push first snapshots the live group
+to `.niflow-backups/`; `niflow rollback <group>` rebuilds it from the newest
+backup (`--list` to browse, `niflow backup` for a manual save point), so a bad
+apply is one command away from undone.
+
 Plain `push` remains the full **delete-and-recreate**: the old group is
 stopped, drained, and replaced, keeping its canvas position. Parameter contexts
 survive replacement (they live outside the group), so sensitive values stored
@@ -113,6 +120,14 @@ make nifi-mtls-up && make nifi-mtls-wait  # NiFi 1.24.0 secured by CLIENT CERTS 
 
 The first two log in as **admin** / **adminpassword123**; the mTLS one
 authenticates with the generated `certs/mtls/client.pem`.
+
+Every claim above is tested against real servers, two ways. CI boots
+dockerized NiFi 2.7.2 **and** 1.24.0 and runs the integration suite against
+both on every push. And the unit suite parses **golden fixtures captured from
+live servers** (`tests/fixtures/real/`, refreshed with `make fixtures`) — real
+server output, not hand-built dicts, which is where version quirks actually
+show up (e.g. 2.x silently migrates ConvertRecord's property keys from 1.x
+`record-reader` to `Record Reader`).
 
 Connection settings resolve **defaults < `.niflow.env` config file < real
 environment**. Copy `.niflow.env.example` to `.niflow.env` (git-ignored; also

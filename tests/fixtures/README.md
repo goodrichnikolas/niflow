@@ -14,3 +14,11 @@ Pulled from the NiFi wiki's example dataflow templates page:
 https://cwiki.apache.org/confluence/download/attachments/57904847/simple-httpget-route.template.xml
 Format: NiFi 1.x `<template><snippet>...</snippet></template>` XML. Covers
 processors + connections only (4 procs, 3 conns, no services/ports/groups).
+
+## `real/nifi-*.snapshot.json`
+**Golden captures from real servers** — the raw `VersionedFlowSnapshot` each
+NiFi (1.24.0 and 2.7.2) returned for the kitchen-sink flow
+(`examples/kitchen_sink.py`). Refresh with `make fixtures` against a running
+container. `tests/test_real_snapshots.py` parses these, so the emitter/parser
+is checked against genuine server output on both major lines without a live
+NiFi. Do not hand-edit: the point is that the server wrote them.

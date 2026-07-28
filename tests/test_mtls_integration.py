@@ -2,6 +2,7 @@
 
 Marked integration; skipped unless the generated cert config exists.
 """
+import os
 from pathlib import Path
 
 import pytest
@@ -21,7 +22,17 @@ pytestmark = [
 
 @pytest.fixture(scope="module")
 def config() -> NiFiConfig:
-    return NiFiConfig.from_env(str(CONFIG))
+    # Env normally overrides the config file (that's the layering users
+    # want), but THIS test targets its own dedicated server: shed any
+    # ambient NIFLOW_NIFI_* (e.g. from `make test-integration-v1`) first.
+    mp = pytest.MonkeyPatch()
+    for key in list(os.environ):
+        if key.startswith("NIFLOW_NIFI_"):
+            mp.delenv(key)
+    try:
+        return NiFiConfig.from_env(str(CONFIG))
+    finally:
+        mp.undo()
 
 
 @pytest.fixture(scope="module", autouse=True)

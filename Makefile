@@ -146,6 +146,13 @@ test-integration-v1:
 catalog:
 	python -m niflow.codegen
 
+# Refresh the real-server golden fixtures (tests/fixtures/real/) from the
+# NiFi in NIFLOW_NIFI_HOST. Run once per NiFi line:
+#   make fixtures
+#   NIFLOW_NIFI_HOST=https://localhost:8444/nifi-api make fixtures
+fixtures:
+	python scripts/capture_fixtures.py
+
 convert:
 	@if [ -z "$(IN)" ] || [ -z "$(OUT)" ]; then \
 		echo "Usage: make convert IN=<input> OUT=<output> [FLAGS='--from xml --to py']"; exit 2; \

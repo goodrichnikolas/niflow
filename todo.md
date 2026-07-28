@@ -106,3 +106,41 @@ Steps (do registry/test infra FIRST so we can probe the schema live before commi
       trust, policies gotcha (initial admin lacks root PG policies).
 - [x] Browser GUI `niflow-web` (stdlib-only) alongside the PyQt helper.
 - [ ] OIDC/SSO login is unsupported by design — use a service account or cert.
+
+## Trust & real-world testing (2026-07-27) — SHIPPED
+Implements the top of the "how would you make this better" critique.
+- [x] **Golden fixtures from real servers**: `make fixtures` pushes the kitchen-sink
+      flow (examples/kitchen_sink.py — 3 nesting levels, services + cross-group refs,
+      ports/funnels/labels, param context w/ sensitive param, tuned queues) to a live
+      NiFi and commits the server's own snapshot (tests/fixtures/real/). Unit suite
+      parses REAL 1.24.0 + 2.7.2 output (tests/test_real_snapshots.py). Immediately
+      caught a live quirk: 2.x migrates ConvertRecord property keys
+      (`record-reader` → `Record Reader`) — pull-based workflows are immune, hand-written
+      flows using 1.x keys will show plan drift on a 2.x server.
+- [x] **CI with real NiFi** (.github/workflows/ci.yml): unit matrix (3.9/3.13) + live
+      integration against dockerized 2.7.2 AND 1.24.0 on every push. Catalog sweep and
+      mTLS stay local-only (runtime / OpenSSL 3.2 constraints).
+- [x] **Rename detection**: name-based identity means rename = remove+add; the plan
+      now pairs same-type add/remove in a group and warns loudly (state/queue loss)
+      before you find out the hard way.
+- [x] **Backup + rollback**: every mutating push snapshots the live group to
+      .niflow-backups/ first; `niflow rollback <group>` (and `niflow backup`) restore.
+      Half-applied plan or bad edit is one command from undone.
+- [x] **Live E2E proof** (tests/test_incremental_live.py): push → queue real
+      FlowFiles → debugging edit → push --update → ids + queues survive, plan
+      converges, rollback restores. Green on 1.24.0 and 2.7.2.
+
+## Remaining critique items (in priority order)
+- [ ] `niflow test` flow-testing harness: push to sandbox, inject FlowFile at a port,
+      run, assert attributes/content at sinks — attacks the debugging pain directly.
+- [ ] Multi-group repo sync: `pull --all` / manifest mirroring an instance into
+      flows/ ("point at the top, the repo is the instance").
+- [ ] Split client.py (~1.6k lines: transport / pull-push / ops) before it doubles.
+- [ ] Stamp catalogs with source NiFi version; doctor/validate warn on mismatch
+      (the rulebook silently went stale once already).
+- [ ] Environment overlays for parameter values (dev/test/prod, `--env`).
+- [ ] `niflow drift` (plan, exit non-zero) for cron/CI drift detection.
+- [ ] Recursive REST endpoints for walk_groups/list_queues (N+1 calls per group
+      is slow on a big work tree).
+- [ ] Two GUIs duplicate operation surfaces — extract shared ops layer or bless one.
+- [ ] Mermaid flow-diagram generation for PR review.
