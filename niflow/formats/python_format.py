@@ -455,9 +455,12 @@ def _emit_group_body(
         _emit_register_calls(pg_var, list(pg.funnels), "add_funnel", varnames, indent, out)
         _emit_register_calls(pg_var, list(pg.labels), "add_label", varnames, indent, out)
 
-    # Group-level settings: variables and the bound parameter context.
-    if pg.variables or pg.parameter_context is not None:
+    # Group-level settings: comment (children get theirs as a process_group
+    # kwarg), variables, and the bound parameter context.
+    if (is_top_level and pg.comment) or pg.variables or pg.parameter_context is not None:
         sep()
+        if is_top_level and pg.comment:
+            out.write(f"{indent}{pg_var}.comment = {pg.comment!r}\n")
         if pg.variables:
             out.write(f"{indent}{pg_var}.variables = {pg.variables!r}\n")
         if pg.parameter_context is not None:

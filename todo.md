@@ -130,11 +130,24 @@ Implements the top of the "how would you make this better" critique.
       FlowFiles → debugging edit → push --update → ids + queues survive, plan
       converges, rollback restores. Green on 1.24.0 and 2.7.2.
 
+## Flow testing + whole-instance sync (2026-07-27) — SHIPPED
+- [x] **`niflow test`** (niflow/testing.py): sandbox push, FlowFile injection via a
+      temporary run-once GenerateFlowFile (dynamic props = attributes), selective
+      start (sources & the collector stay stopped), queue collection + attribute/
+      content assertions, `--keep` for autopsy. Cases live next to the flow
+      (`tests = [TestCase(...)]`). Verified live on 1.24 + 2.7.2 — CSV in at a
+      mid-flow processor AND a nested input port, JSON out at the audit tap.
+      Found live: (a) start-group-then-stop-sources races the flow's own data —
+      must start selectively; (b) 2.x renamed GenerateFlowFile's custom-text
+      property AND direct REST creates are NOT config-migrated (snapshot imports
+      are) — per-version property names required.
+- [x] **Multi-instance sync** (niflow/sync.py): `pull --all -o flows/ [--parent G]`,
+      `plan --all`, `push --all --update`, and `niflow drift` (ok/DRIFT per flow,
+      exit 1) for cron/CI. Mirror→drift→reconcile loop verified live on both lines.
+      Found live: to_python dropped the ROOT group's comment → permanent phantom
+      drift on any commented group (fixed + regression test).
+
 ## Remaining critique items (in priority order)
-- [ ] `niflow test` flow-testing harness: push to sandbox, inject FlowFile at a port,
-      run, assert attributes/content at sinks — attacks the debugging pain directly.
-- [ ] Multi-group repo sync: `pull --all` / manifest mirroring an instance into
-      flows/ ("point at the top, the repo is the instance").
 - [ ] Split client.py (~1.6k lines: transport / pull-push / ops) before it doubles.
 - [ ] Stamp catalogs with source NiFi version; doctor/validate warn on mismatch
       (the rulebook silently went stale once already).

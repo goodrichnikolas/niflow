@@ -485,21 +485,7 @@ class PlanApplier:
         self.client._delete_component("connections", conn_id)
 
     def _drain_connection(self, conn_id: str) -> None:
-        req = self.client._request(
-            "POST", f"/flowfile-queues/{conn_id}/drop-requests"
-        ).json()["dropRequest"]
-        req_id = req["id"]
-        try:
-            deadline = time.monotonic() + _POLL_TIMEOUT_S
-            while not req.get("finished"):
-                if time.monotonic() > deadline:
-                    raise TimeoutError(f"draining connection {conn_id} timed out")
-                time.sleep(_POLL_INTERVAL_S)
-                req = self._get(f"/flowfile-queues/{conn_id}/drop-requests/{req_id}")["dropRequest"]
-        finally:
-            self.client._request(
-                "DELETE", f"/flowfile-queues/{conn_id}/drop-requests/{req_id}"
-            )
+        self.client.drain_connection(conn_id)
 
     # --- processors
 

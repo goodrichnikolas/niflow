@@ -64,6 +64,20 @@ def cmd_list(args: argparse.Namespace) -> int:
 
 def cmd_pull(args: argparse.Namespace) -> int:
     client = _client()
+    if args.all:
+        from niflow.sync import pull_all
+
+        reports = pull_all(client, args.output or "flows", parent=args.parent)
+        for r in reports:
+            note = f"  ({len(r['warnings'])} pull warning(s))" if r["warnings"] else ""
+            print(f"Pulled {r['name']!r} -> {r['file']}{note}")
+            for warning in r["warnings"]:
+                print(f"    ! {warning}", file=sys.stderr)
+        print(f"{len(reports)} group(s) mirrored.")
+        return 0
+    if not args.group:
+        print("error: give a group name, or use --all", file=sys.stderr)
+        return 2
     flow = client.pull_flow(args.group)
     if args.format == "json":
         text = flow.to_json()
@@ -110,8 +124,23 @@ def cmd_validate(args: argparse.Namespace) -> int:
 
 
 def cmd_push(args: argparse.Namespace) -> int:
-    flow = _load_flow_py(args.file, args.var)
     client = _client()
+    if args.all:
+        from niflow.sync import push_all
+
+        reports = push_all(
+            client, args.file, update=args.update, start=args.start,
+            secrets=args.secrets, var=args.var,
+        )
+        for r in reports:
+            if r["changes"] is None:
+                print(f"{r['name']!r}: rebuilt in full (id={r['id']}).")
+            elif r["changes"]:
+                print(f"{r['name']!r}: applied {len(r['changes'])} change(s).")
+            else:
+                print(f"{r['name']!r}: already in sync.")
+        return 0
+    flow = _load_flow_py(args.file, args.var)
     if args.update:
         changes = client.push_update(flow, start=args.start, secrets=args.secrets)
         if changes:
@@ -141,13 +170,52 @@ def cmd_plan(args: argparse.Namespace) -> int:
     """Show what `push --update` would change, without touching NiFi."""
     from niflow.plan import format_plan
 
-    flow = _load_flow_py(args.file, args.var)
     client = _client()
+    if args.all:
+        from niflow.sync import plan_all
+
+        drifted = 0
+        for r in plan_all(client, args.file, var=args.var):
+            if not r["exists"]:
+                print(f"== {r['name']} ({r['file']}): group does not exist yet")
+            elif not r["changes"]:
+                print(f"== {r['name']}: in sync")
+                continue
+            else:
+                print(f"== {r['name']} ({r['file']}):")
+            print(format_plan(r["changes"]))
+            drifted += 1
+        return 1 if drifted else 0
+    flow = _load_flow_py(args.file, args.var)
     pg_id, _live, changes = client.plan_flow(flow)
     if pg_id is None:
         print(f"Group {flow.name!r} does not exist yet — everything below is new.")
     print(format_plan(changes))
     return 1 if changes else 0
+
+
+def cmd_drift(args: argparse.Namespace) -> int:
+    """One line per flow module: in sync or drifted. Exit 1 on any drift."""
+    from niflow.sync import plan_all
+
+    client = _client()
+    drifted = 0
+    for r in plan_all(client, args.dir, var=args.var):
+        if not r["exists"]:
+            print(f"DRIFT  {r['name']}: group missing from NiFi")
+            drifted += 1
+        elif r["changes"]:
+            counts = {"add": 0, "remove": 0, "update": 0}
+            for c in r["changes"]:
+                counts[c.op] += 1
+            print(
+                f"DRIFT  {r['name']}: +{counts['add']} ~{counts['update']} -{counts['remove']}"
+                f"  (niflow plan {r['file']})"
+            )
+            drifted += 1
+        else:
+            print(f"ok     {r['name']}")
+    return 1 if drifted else 0
 
 
 def cmd_copy(args: argparse.Namespace) -> int:
@@ -204,6 +272,40 @@ def cmd_diff(args: argparse.Namespace) -> int:
         return 0
     sys.stdout.writelines(delta)
     return 1
+
+
+def cmd_test(args: argparse.Namespace) -> int:
+    """Run a flow module's `tests` cases against a live-NiFi sandbox."""
+    import importlib.util
+
+    from niflow.testing import FlowTester, as_cases, format_results
+
+    p = Path(args.file).resolve()
+    spec = importlib.util.spec_from_file_location(p.stem, p)
+    if spec is None or spec.loader is None:
+        raise SystemExit(f"Cannot import {args.file!r} as a Python module")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    flow = getattr(module, args.var, None)
+    if not isinstance(flow, Flow):
+        raise SystemExit(f"Expected a niflow.Flow at {args.var!r} in {args.file!r}")
+    raw_cases = getattr(module, args.tests_var, None)
+    if not raw_cases:
+        raise SystemExit(
+            f"No test cases: define `{args.tests_var} = [TestCase(...)]` in {args.file!r} "
+            "(from niflow.testing import TestCase)"
+        )
+    cases = as_cases(list(raw_cases))
+
+    client = _client()
+    with FlowTester(
+        client, flow, sandbox_name=args.sandbox, keep=args.keep, secrets=args.secrets
+    ) as tester:
+        results = tester.run(cases)
+        if args.keep:
+            print(f"Sandbox kept: {client.ui_url(tester.pg_id)}", file=sys.stderr)
+    print(format_results(results))
+    return 0 if all(r.passed for r in results) else 1
 
 
 def cmd_backup(args: argparse.Namespace) -> int:
@@ -289,13 +391,17 @@ def main(argv: Optional[list] = None) -> int:
     p.set_defaults(func=cmd_list)
 
     p = sub.add_parser("pull", help="Pull a process group into a Python module")
-    p.add_argument("group", help="Process group name, path (a/b), or id")
-    p.add_argument("-o", "--output", help="Output file (default: stdout)")
+    p.add_argument("group", nargs="?", help="Process group name, path (a/b), or id")
+    p.add_argument("-o", "--output", help="Output file (default: stdout); a directory with --all (default: flows/)")
     p.add_argument("--format", choices=("py", "json"), default="py")
+    p.add_argument("--all", action="store_true",
+                   help="Mirror EVERY child group of --parent into the output directory")
+    p.add_argument("--parent", default="root", help="Parent group to mirror with --all (default: root)")
     p.set_defaults(func=cmd_pull)
 
-    p = sub.add_parser("push", help="Push a flow .py to NiFi")
-    p.add_argument("file", help="Python module exposing a top-level Flow")
+    p = sub.add_parser("push", help="Push a flow .py (or, with --all, a directory of them) to NiFi")
+    p.add_argument("file", help="Python module exposing a top-level Flow; a directory with --all")
+    p.add_argument("--all", action="store_true", help="Push every flow module in the directory")
     p.add_argument("--var", default="flow", help="Flow variable name (default: flow)")
     p.add_argument("--start", action="store_true", help="Enable services and start after push")
     p.add_argument("--secrets", help="Secrets file for sensitive parameters (default: .niflow-secrets.env)")
@@ -316,9 +422,18 @@ def main(argv: Optional[list] = None) -> int:
     p = sub.add_parser(
         "plan", help="Show what `push --update` would change (read-only)"
     )
-    p.add_argument("file", help="Python module exposing a top-level Flow")
+    p.add_argument("file", help="Python module exposing a top-level Flow; a directory with --all")
+    p.add_argument("--all", action="store_true", help="Plan every flow module in the directory")
     p.add_argument("--var", default="flow")
     p.set_defaults(func=cmd_plan)
+
+    p = sub.add_parser(
+        "drift",
+        help="One line per flow module vs live NiFi; exit 1 on drift (cron/CI friendly)",
+    )
+    p.add_argument("dir", nargs="?", default="flows", help="Directory of flow modules (default: flows/)")
+    p.add_argument("--var", default="flow")
+    p.set_defaults(func=cmd_drift)
 
     p = sub.add_parser(
         "validate", help="Statically validate a flow .py (no NiFi connection needed)"
@@ -338,6 +453,18 @@ def main(argv: Optional[list] = None) -> int:
     p.add_argument("--group", help="Live group to compare against (default: the flow's name)")
     p.add_argument("--var", default="flow")
     p.set_defaults(func=cmd_diff)
+
+    p = sub.add_parser(
+        "test",
+        help="Push a sandbox copy, inject FlowFiles, assert what comes out",
+    )
+    p.add_argument("file", help="Flow module that also defines `tests = [TestCase(...)]`")
+    p.add_argument("--var", default="flow")
+    p.add_argument("--tests-var", default="tests", help="Variable holding the cases")
+    p.add_argument("--sandbox", help="Sandbox group name (default: '<flow> (niflow-test)')")
+    p.add_argument("--keep", action="store_true", help="Leave the sandbox group for debugging")
+    p.add_argument("--secrets", help="Secrets file for sensitive parameters")
+    p.set_defaults(func=cmd_test)
 
     p = sub.add_parser("backup", help="Snapshot a live group to .niflow-backups/")
     p.add_argument("group", help="Group name, path, or id")

@@ -14,7 +14,12 @@ niflow pull "Prod Flow (copy)" -o flows/prod_flow.py
 niflow plan flows/prod_flow.py               # semantic "what will change"
 niflow push flows/prod_flow.py --update      # apply just that delta in place
 niflow diff flows/prod_flow.py               # raw JSON diff vs the live canvas
+niflow test flows/prod_flow.py               # inject FlowFiles, assert what comes out
 niflow push flows/prod_flow.py --start       # or: full replace and start
+
+niflow pull --all -o flows/                  # mirror EVERY top-level group
+niflow drift                                 # exit 1 if code and canvas diverged
+niflow push --all flows/ --update            # reconcile the whole directory
 ```
 
 …or define a flow from scratch:
@@ -68,6 +73,43 @@ fully detached — edit and push at will, delete when done.
 `diff` compares your local `.py` against the live group using the
 deterministic JSON emission (UUID5 identifiers seeded on component paths), so
 structurally identical flows produce identical bytes.
+
+## Test flows with real data (`niflow test`)
+
+Declare cases next to the flow and `niflow test` answers "what does this flow
+actually DO to a file" without a single canvas click:
+
+```python
+from niflow.testing import TestCase
+
+tests = [
+    TestCase(
+        name="urgent CSV is routed, converted, and audited as JSON",
+        inject_at="Stamp",                       # any processor or input port; "Group/Name" paths work
+        content="id,priority\n1,urgent\n",
+        attributes={"origin": "unit-test"},      # extra FlowFile attributes
+        expect_at="Audit",                       # results are read from its input queue
+        expect_attributes={"mime.type": "application/json"},
+        expect_content_contains='"priority"',
+    ),
+]
+```
+
+The harness pushes a **sandbox copy** (the real group is untouched), starts
+everything *except* data sources (the test injects its own FlowFile via a
+temporary run-once generator) and the `expect_at` collector (so results queue
+up instead of being consumed), then checks every arriving FlowFile's
+attributes and content. `--keep` leaves the sandbox on the canvas for
+autopsy. Works identically on 1.x and 2.x; see `examples/kitchen_sink.py`
+for runnable cases.
+
+## Mirror the whole instance (`--all`, `drift`)
+
+`niflow pull --all -o flows/` writes every child group of `--parent`
+(default: the root canvas) to `flows/<slug>.py` — the repo becomes the
+instance. `niflow plan --all flows/` and `niflow push --all flows/ --update`
+iterate the directory; `niflow drift` prints one `ok`/`DRIFT` line per flow
+and exits non-zero on any divergence, made for cron or CI.
 
 ## What's supported
 

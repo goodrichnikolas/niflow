@@ -90,6 +90,10 @@ class FakeClient:
 
         return R(resp)
 
+    def drain_connection(self, conn_id: str) -> None:
+        self._request("POST", f"/flowfile-queues/{conn_id}/drop-requests")
+        self._request("DELETE", f"/flowfile-queues/{conn_id}/drop-requests/dr1")
+
     def stop_processor(self, proc_id: str) -> None:
         self.ops.append(f"stop {proc_id}")
         self.entities[f"/processors/{proc_id}"]["component"]["state"] = "STOPPED"

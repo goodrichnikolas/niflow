@@ -136,6 +136,33 @@ def build_flow(name: str = "NiflowKitchenSink") -> Flow:
 
 flow = build_flow()
 
+# Flow tests: `niflow test examples/kitchen_sink.py` pushes a sandbox copy,
+# injects these FlowFiles, and asserts what arrives at Audit's queue.
+from niflow.testing import TestCase  # noqa: E402
+
+tests = [
+    TestCase(
+        name="urgent CSV is stamped, routed, and lands at Audit as JSON",
+        inject_at="Stamp",
+        content="id,priority\n1,urgent\n",
+        expect_at="Audit",
+        expect_attributes={
+            "source": "kitchen-sink",
+            "priority": "urgent",
+            "mime.type": "application/json",
+        },
+        expect_content_contains='"priority"',
+    ),
+    TestCase(
+        name="CSV fed straight into the Enrichment port converts to JSON",
+        inject_at="Enrichment/in",
+        content="id,priority\n2,low\n",
+        expect_at="Audit",
+        expect_attributes={"mime.type": "application/json"},
+        expect_content_contains='"id"',
+    ),
+]
+
 if __name__ == "__main__":
     flow.deploy(start=False)
     print(f"Deployed {flow.name!r} (id={flow.nifi_id}).")

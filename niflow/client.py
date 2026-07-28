@@ -323,6 +323,70 @@ class NiFiClient:
         self.stop_processor(proc_id)
         self._set_processor_state(proc_id, "RUN_ONCE")
 
+    def set_port_state(self, kind: str, port_id: str, state: str) -> None:
+        """Start/stop one port. ``kind`` is ``input_port`` or ``output_port``."""
+        endpoint = "input-ports" if kind == "input_port" else "output-ports"
+        revision = self._get_json(f"/{endpoint}/{port_id}")["revision"]
+        self._request(
+            "PUT",
+            f"/{endpoint}/{port_id}/run-status",
+            json={"revision": revision, "state": state, "disconnectedNodeAcknowledged": False},
+        )
+
+    def create_processor(self, pg_id: str, component: dict) -> str:
+        """Create a single processor in a live group; returns its id.
+
+        ``component`` is the raw REST DTO (``type``/``name``/``position``/
+        ``config``). Used by the flow-test harness for its temporary
+        injector; ``push``/``apply`` remain the way to build real flows.
+        """
+        entity = self._request(
+            "POST",
+            f"/process-groups/{pg_id}/processors",
+            json={"revision": {"version": 0, "clientId": "niflow"}, "component": component},
+        ).json()
+        return entity["id"]
+
+    def create_connection(
+        self,
+        pg_id: str,
+        source: dict,
+        destination: dict,
+        relationships: Optional[List[str]] = None,
+    ) -> str:
+        """Create a connection between two live endpoint refs; returns its id.
+
+        ``source``/``destination`` are ``{"id", "groupId", "type"}`` refs
+        (type ``PROCESSOR``/``INPUT_PORT``/``OUTPUT_PORT``/``FUNNEL``).
+        """
+        component: dict = {"source": source, "destination": destination}
+        if relationships and source.get("type") == "PROCESSOR":
+            component["selectedRelationships"] = list(relationships)
+        entity = self._request(
+            "POST",
+            f"/process-groups/{pg_id}/connections",
+            json={"revision": {"version": 0, "clientId": "niflow"}, "component": component},
+        ).json()
+        return entity["id"]
+
+    def drain_connection(self, conn_id: str) -> None:
+        """Drop every FlowFile queued in one connection (async drop-request)."""
+        req = self._request(
+            "POST", f"/flowfile-queues/{conn_id}/drop-requests"
+        ).json()["dropRequest"]
+        req_id = req["id"]
+        try:
+            deadline = time.monotonic() + _POLL_TIMEOUT_S
+            while not req.get("finished"):
+                if time.monotonic() > deadline:
+                    raise NiFiApiError(408, f"draining connection {conn_id} timed out")
+                time.sleep(_POLL_INTERVAL_S)
+                req = self._get_json(
+                    f"/flowfile-queues/{conn_id}/drop-requests/{req_id}"
+                )["dropRequest"]
+        finally:
+            self._request("DELETE", f"/flowfile-queues/{conn_id}/drop-requests/{req_id}")
+
     # -------------------------------------------------------- flowfile inspect
 
     def list_queues(self, group: str = "root") -> List[dict]:
