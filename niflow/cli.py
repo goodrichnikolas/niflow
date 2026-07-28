@@ -128,6 +128,15 @@ def cmd_push(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Diagnose connectivity/auth against the configured NiFi."""
+    from niflow.doctor import FAIL, format_checks, run_checks
+
+    checks = run_checks(NiFiConfig.from_env(args.config))
+    print(format_checks(checks))
+    return 1 if any(c.status == FAIL for c in checks) else 0
+
+
 def cmd_plan(args: argparse.Namespace) -> int:
     """Show what `push --update` would change, without touching NiFi."""
     from niflow.plan import format_plan
@@ -260,6 +269,12 @@ def main(argv: Optional[list] = None) -> int:
         "instead of rebuilding the group",
     )
     p.set_defaults(func=cmd_push)
+
+    p = sub.add_parser(
+        "doctor", help="Diagnose connection/auth to the configured NiFi"
+    )
+    p.add_argument("--config", help="Config file to test (default: $NIFLOW_CONFIG / ./.niflow.env / ~/.niflow.env)")
+    p.set_defaults(func=cmd_doctor)
 
     p = sub.add_parser(
         "plan", help="Show what `push --update` would change (read-only)"

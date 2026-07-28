@@ -69,8 +69,17 @@ class NiFiClient:
             import requests
 
             session = requests.Session()
-            session.verify = self.config.verify_ssl
-            if not self.config.verify_ssl and self.config.suppress_ssl_warnings:
+            # A CA bundle path beats the verify boolean (work servers have
+            # real certs signed by an internal CA; export it and point
+            # NIFLOW_NIFI_CA_BUNDLE at the PEM).
+            session.verify = self.config.ca_bundle or self.config.verify_ssl
+            if self.config.client_cert:
+                session.cert = (
+                    (self.config.client_cert, self.config.client_key)
+                    if self.config.client_key
+                    else self.config.client_cert
+                )
+            if not session.verify and self.config.suppress_ssl_warnings:
                 import urllib3
 
                 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -84,8 +93,13 @@ class NiFiClient:
     def login(self) -> None:
         """Fetch a bearer token (single-user and LDAP both use /access/token).
 
-        Skipped for anonymous/plain-HTTP servers (no password configured).
+        Skipped under mTLS (the client certificate IS the identity — servers
+        configured for cert auth don't even expose /access/token) and for
+        anonymous/plain-HTTP servers (no password configured).
         """
+        if self.config.client_cert:
+            logger.info("Authenticating with client certificate %s", self.config.client_cert)
+            return
         if not self.config.password:
             logger.info("No password configured; using anonymous access")
             return
@@ -107,7 +121,7 @@ class NiFiClient:
         logger.info("Authenticated to %s as %r", self.base, self.config.username)
 
     def _request(self, method: str, path: str, **kwargs: Any) -> Any:
-        if self._token is None and self.config.password:
+        if self._token is None and self.config.password and not self.config.client_cert:
             self.login()
         headers = dict(kwargs.pop("headers", {}))
         if self._token:
