@@ -21,13 +21,9 @@ dependencies = [
 dev = [
     "pytest>=7.0",
 ]
-gui = [
-    "PyQt6>=6.5",
-]
 
 [project.scripts]
 niflow = "niflow.cli:main"
-niflow-gui = "niflow.gui:main"
 niflow-web = "niflow.webgui:main"
 
 [tool.hatch.build.targets.wheel]

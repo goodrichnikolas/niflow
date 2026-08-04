@@ -6,7 +6,7 @@ from NiFi, components carrying their canvas ids) against the desired model
 adds, removes, and field-level updates keyed by group path and component
 name. The plan drives two consumers:
 
-* ``format_plan`` renders it for humans (``niflow plan``, the GUI preview);
+* ``format_plan`` renders it for humans (``niflow plan``, the web helper preview);
 * ``NiFiClient.apply_plan`` executes it with targeted REST calls so a push
   touches only what changed.
 

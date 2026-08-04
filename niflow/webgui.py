@@ -1,13 +1,15 @@
-"""Browser-based NiFlow helper — the PyQt GUI's features over plain HTTP.
+"""Browser-based NiFlow helper — the click-reduction debug UI for nested flows.
+
+Deep flows make trivial actions expensive in the NiFi UI: re-triggering a
+GenerateFlowFile buried four groups down means drilling in, stopping it,
+running it, and drilling back out — every single iteration. This helper keeps
+those actions one click away, no matter how deep the component lives.
 
 Zero extra dependencies: a stdlib :mod:`http.server` serving a single
 embedded page plus a small JSON API bridging to :class:`NiFiClient`. Start
 with ``niflow-web`` (or ``make webgui``); it binds to 127.0.0.1 and opens
-your default browser (the *Windows* browser under WSL).
-
-Why both GUIs: this one needs no PyQt/display server and works anywhere a
-browser can reach ``localhost``; the desktop helper (``niflow-gui``)
-remains for those who prefer it. Feature set here:
+your default browser (the *Windows* browser under WSL). It needs no display
+server and works anywhere a browser can reach ``localhost``. Feature set:
 
 * processor list with filter, state, run-once / start / stop per row
 * queues with live counts -> click through to FlowFiles -> attributes+content

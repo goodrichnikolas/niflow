@@ -8,8 +8,7 @@ tells you what's wrong and which key to set next.
 
 **niflow itself is pure Python.** No Docker/Podman is needed to *run* it —
 containers appear in this repo only to host disposable NiFis for testing.
-At work: `pip install -e .` (plus `.[gui]` if you want the desktop helper),
-fill in `.niflow.env`, done.
+At work: `pip install -e .`, fill in `.niflow.env`, done.
 
 ---
 
@@ -24,7 +23,7 @@ NIFLOW_NIFI_HOST=https://<host>:8443/nifi-api niflow doctor
 The doctor runs six checks (config sanity → TLS → server auth mode → your
 credentials → identity → canvas access) and each failure names the exact
 `.niflow.env` key to fix. When it prints `All good`, every niflow command —
-CLI, GUI, web GUI, library — connects the same way from then on.
+CLI, web GUI, library — connects the same way from then on.
 
 ## 1. Find the server
 

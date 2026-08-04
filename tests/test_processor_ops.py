@@ -203,11 +203,3 @@ def test_ui_url_builds_deep_link_into_the_canvas(client):
     )
     # No ids -> just the bare UI root (still a valid link to open).
     assert client.ui_url() == "https://nifi.test/nifi"
-
-
-def test_processor_label_shows_nested_path():
-    pytest.importorskip("PyQt6")
-    from niflow.gui import processor_label
-
-    assert processor_label({"path": "Child/Grand", "name": "Gen3"}) == "Child / Grand / Gen3"
-    assert processor_label({"path": "", "name": "Gen1"}) == "Gen1"

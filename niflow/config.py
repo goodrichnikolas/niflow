@@ -7,7 +7,7 @@ Configuration is resolved in three layers, weakest first:
    at the path in ``$NIFLOW_CONFIG``, else ``./.niflow.env``, else
    ``~/.niflow.env``. Fill this out once per environment (see
    ``docs/work-nifi-setup.md``) and every niflow command connects the same
-   way — CLI, GUI, and library alike.
+   way — CLI, web helper, and library alike.
 3. Real environment variables, which always win.
 
 Recognised keys (file or environment):

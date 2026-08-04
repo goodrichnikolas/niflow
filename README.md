@@ -238,15 +238,13 @@ make test                            # unit tests (no NiFi needed)
 make test-integration-v1             # integration tests against 1.24
 ```
 
-## GUIs (both optional)
+## Debug helper (optional)
 
 - **`niflow-web`** (`make webgui`) — browser-based helper on
   `http://127.0.0.1:7777`, zero extra dependencies: processor list with
   run-once/start/stop, queue browser with FlowFile attribute+content
   inspection, bulletins/error panels, and plan-preview + incremental push for
   `flows/*.py`. Under WSL it opens the *Windows* default browser.
-- **`niflow-gui`** (`make gui`) — the PyQt6 desktop helper (`pip install -e
-  ".[gui]"`), same capabilities as a native window.
 
 ## Convert flows
 

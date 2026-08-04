@@ -171,7 +171,7 @@ settings:
 ### Process Groups
 A **process group** is a folder/sub-flow — a box you put processors in to organize
 and nest flows. Groups can be **nested arbitrarily deep** (which is exactly the
-pain niflow's GUI helper targets). Data crosses a group boundary through **input
+pain niflow's web helper targets). Data crosses a group boundary through **input
 ports** and **output ports**. A group can also be **versioned** against NiFi
 Registry as a unit.
 
@@ -211,8 +211,8 @@ history. This is one of NiFi's superpowers for debugging "where did this data go
 Transient **notifications** a component posts (the little messages that flash on a
 processor, and the Bulletin Board). They're how you see runtime errors/warnings —
 distinct from **validation errors** (the ⚠ triangle), which are *config* problems
-that stop a processor from even starting. niflow's GUI surfaces both in separate
-panels.
+that stop a processor from even starting. niflow's web helper surfaces both in
+separate panels.
 
 ### State
 Some processors remember things between runs (e.g. `ListFile` tracks which files

@@ -1,6 +1,6 @@
 .PHONY: help install nifi-up nifi-down nifi-logs nifi-wait nifi1-up nifi1-down nifi1-wait \
 	test test-integration test-integration-v1 catalog convert example clean \
-	list pull push copy diff validate gui
+	list pull push copy diff validate webgui
 
 help:
 	@echo "NiFlow make targets:"
@@ -12,7 +12,7 @@ help:
 	@echo "    validate FILE=flow.py        Statically check a flow before pushing"
 	@echo "    diff FILE=flow.py            Diff local Python vs the live group"
 	@echo "    push FILE=flow.py [START=1]  Replace the live group from Python"
-	@echo "    gui / webgui                 Desktop helper / browser helper"
+	@echo "    webgui                       Browser helper on http://127.0.0.1:7777"
 	@echo ""
 	@echo "  More CLI (run 'niflow <cmd> -h'): plan, test, drift, diagram, backup,"
 	@echo "    rollback, commit, doctor, pull --all, push --all --update, --env overlays"
@@ -64,9 +64,6 @@ validate:
 push:
 	@if [ -z "$(FILE)" ]; then echo "Usage: make push FILE=flows/my_flow.py [START=1]"; exit 2; fi
 	python -m niflow push "$(FILE)" $(if $(START),--start)
-
-gui:
-	python -m niflow.gui
 
 webgui:
 	python -m niflow.webgui

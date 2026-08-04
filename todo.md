@@ -1,5 +1,12 @@
 # niflow — TODO / future work
 
+## Debugging (2026-08-04)
+- [x] **Removed the PyQt desktop helper** (`niflow/gui.py`, `niflow-gui`, `make gui`,
+      the `gui` extra). `niflow-web` is the one debug UI: stdlib-only, no display
+      server, works over SSH/WSL. Nothing else imported it — `NiFiClient` already
+      held every operation both views called (`processor_label` was its only
+      gui-local helper, and the web page builds that label client-side).
+
 ## Push & version control
 ### 2.x in-place push (replace templates with copy/paste)
 The in-place rebuild (preserve group id + registry linkage) currently relies on NiFi 1.x
@@ -106,7 +113,8 @@ Steps (do registry/test infra FIRST so we can probe the schema live before commi
       trip over cert auth (tests/test_mtls_integration.py).
 - [x] docs/work-nifi-setup.md — determine an unknown server's auth, p12→PEM,
       trust, policies gotcha (initial admin lacks root PG policies).
-- [x] Browser GUI `niflow-web` (stdlib-only) alongside the PyQt helper.
+- [x] Browser GUI `niflow-web` (stdlib-only) alongside the PyQt helper (which was
+      later removed — see "Debugging (2026-08-04)").
 - [ ] OIDC/SSO login is unsupported by design — use a service account or cert.
 
 ## Trust & real-world testing (2026-07-27) — SHIPPED
@@ -160,8 +168,8 @@ Implements the top of the "how would you make this better" critique.
 - [x] `niflow drift` shipped with the multi-group sync work.
 - [x] walk_groups/list_queues fast path: ONE recursive /status call for the whole
       tree (per-group walk kept as fallback); verified live on both lines.
-- [x] Decision: NiFiClient IS the shared ops layer — both GUIs are thin views over
-      it (verified: neither holds flow logic of its own). Web GUI is primary
-      (stdlib, remote-friendly); the Qt helper stays as the desktop fallback.
+- [x] Decision: NiFiClient IS the shared ops layer — the web GUI is a thin view over
+      it (verified: it holds no flow logic of its own). Superseded 2026-08-04: the
+      Qt desktop helper was dropped, leaving the web GUI as the only view.
 - [x] `niflow diagram` renders flows as Mermaid flowcharts (subgraphs per group,
       relationship-labelled edges, `--all` for a directory) — GitHub draws them inline.
