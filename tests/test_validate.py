@@ -203,3 +203,40 @@ def test_zero_concurrent_tasks_is_flagged():
     flow.add_processor(p)
     assert any("concurrent tasks must be at least 1" in i["message"]
                for i in validate_flow(flow))
+
+
+def test_primary_node_with_incoming_connection_is_flagged():
+    # NiFi rejects Primary Node Only on non-source processors — the torture
+    # flow's Cron 'audit' repro (funnel -> PRIMARY-scheduled logger).
+    flow = Flow("f")
+    gen = _proc("Gen")
+    audit = Processor(name="Audit", type=UNKNOWN, execution_node="PRIMARY",
+                      auto_terminate=["success"])
+    flow.add_processor(gen, audit)
+    flow.add_connection(gen >> audit)
+    issues = [i for i in validate_flow(flow) if "PRIMARY" in i["message"]]
+    assert [i["component"] for i in issues] == ["f/Audit"]
+    assert "incoming connections" in issues[0]["message"]
+
+
+def test_primary_node_on_source_processor_is_fine():
+    flow = Flow("f")
+    p = Processor(name="Gen", type=UNKNOWN, execution_node="PRIMARY",
+                  auto_terminate=["success"])
+    flow.add_processor(p)
+    assert not any("PRIMARY" in i["message"] for i in validate_flow(flow))
+
+
+def test_primary_node_incoming_from_funnel_counts():
+    from niflow.core import Funnel
+
+    flow = Flow("f")
+    gen = _proc("Gen")
+    audit = Processor(name="Audit", type=UNKNOWN, execution_node="PRIMARY",
+                      auto_terminate=["success"])
+    fun = Funnel()
+    flow.add_processor(gen, audit)
+    flow.add_funnel(fun)
+    flow.add_connection(gen >> fun, fun >> audit)
+    assert any("PRIMARY" in i["message"] and i["component"] == "f/Audit"
+               for i in validate_flow(flow))
