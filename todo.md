@@ -200,14 +200,25 @@ relationships and no occurrence index; processors/groups seed on name alone.
       connections are paired arbitrarily, so plans "rotate" them (cold path →
       hot path clone → cold to second worker → …) and re-apply forever. Second
       consecutive plan still showed 33 ops.
-- [ ] **P1 — property-name aliasing causes phantom drift:** hand-written flows
-      using display names ("Custom Text", "Regular Expression"/1.x names) vs the
-      server's canonical keys diff forever. Known for ConvertRecord (see fixtures
-      note); generalize: normalize via propertyDescriptors on both sides.
-- [ ] **P1 — NiFi-populated defaults show as drift:** live side carries
-      "Store State", "Routing Strategy", "Character Set" etc.; plan proposes
-      `'…' -> None` unsets for every processor. Strip descriptor defaults when
-      canonicalizing (or merge into the local side).
+- [x] **P1 — property-name aliasing causes phantom drift.** *(fixed 2026-08-15)*
+      `rules.canonical_properties(type, props)` rewrites display-name keys
+      (harvested: descriptors now carry `display`, catalog gained a
+      `PROPERTY_NAMES` table) and curated 1.x→2.x legacy keys
+      (`LEGACY_PROPERTY_ALIASES`: record-reader/writer, generate-ff-custom-text,
+      "Regular Expression"→"Search Value", …) to the server's canonical names.
+      Guards: ambiguous display names (CopyS3Object's two "Bucket"s) untouched,
+      legacy alias only when the type lacks the old key AND has the new one (so
+      1.x catalogs are safe), never clobbers an explicitly-set canonical key,
+      unharvested types pass through. Applied in the differ, the JSON emitter,
+      the incremental applier, and validate. Tests:
+      tests/test_property_canonicalization.py.
+- [x] **P1 — NiFi-populated defaults show as drift.** *(fixed 2026-08-15)*
+      `plan._diff_properties` now compares *effective* values: an unset side
+      takes the harvested descriptor default, so live-materialised defaults no
+      longer plan as `'…' -> None` (a genuinely non-default live value still
+      unsets). Live proof: `niflow plan flows/torture.py` against the running
+      group dropped from property drift on every processor to ZERO
+      `properties[…]` lines — remaining ops are the parallel-edge P1 above.
 - [ ] **P2 — `niflow validate` false-positives on dynamic relationships:**
       RouteOnAttribute dynamic properties ARE relationships; 27 bogus errors on a
       valid flow. (Bonus done 2026-08-15: validate now flags PRIMARY-node +

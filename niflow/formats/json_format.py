@@ -41,6 +41,7 @@ from niflow.core import (
 )
 from niflow.layout import compute_layout
 from niflow.processors.bundles import default_bundle
+from niflow.processors.rules import canonical_properties
 
 # Standard UUID DNS namespace — used as the root for deterministic UUID5s so
 # generated identifiers don't collide with random NiFi-assigned ones.
@@ -732,8 +733,15 @@ def _emit_processor(
         "type": processor.type,
         "bundle": _emit_bundle(processor.bundle, processor.type),
         "position": _emit_position(processor.position or auto_position),
-        "properties": _emit_properties(processor.properties, identifiers),
-        "propertyDescriptors": _emit_service_ref_descriptors(processor.properties),
+        # Canonicalize display-name keys ("Custom Text") to server keys
+        # ("generate-ff-custom-text") — NiFi would otherwise store the display
+        # name as a dynamic property and leave the real one unset.
+        "properties": _emit_properties(
+            canonical_properties(processor.type, processor.properties), identifiers
+        ),
+        "propertyDescriptors": _emit_service_ref_descriptors(
+            canonical_properties(processor.type, processor.properties)
+        ),
         "schedulingPeriod": processor.scheduling_period,
         "schedulingStrategy": processor.scheduling_strategy,
         "concurrentlySchedulableTaskCount": processor.concurrent_tasks,

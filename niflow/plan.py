@@ -211,7 +211,7 @@ def _diff_keyed(live_items, desired_items, key_fn, kind, path, changes,
 
 
 def _diff_processor_fields(live: Processor, desired: Processor) -> Dict[str, Tuple[Any, Any]]:
-    fields = _diff_properties(live.properties, desired.properties)
+    fields = _diff_properties(live.properties, desired.properties, desired.type)
     for name in _PROCESSOR_FIELDS:
         a, b = getattr(live, name), getattr(desired, name)
         if _normalise_field(name, a) != _normalise_field(name, b):
@@ -222,7 +222,7 @@ def _diff_processor_fields(live: Processor, desired: Processor) -> Dict[str, Tup
 def _diff_service_fields(
     live: ControllerService, desired: ControllerService
 ) -> Dict[str, Tuple[Any, Any]]:
-    fields = _diff_properties(live.properties, desired.properties)
+    fields = _diff_properties(live.properties, desired.properties, desired.type)
     for name in _SERVICE_FIELDS:
         a, b = getattr(live, name), getattr(desired, name)
         if a != b:
@@ -245,11 +245,28 @@ def _diff_connection_fields(live: Connection, desired: Connection) -> Dict[str, 
     return fields
 
 
-def _diff_properties(live: Dict[str, Any], desired: Dict[str, Any]) -> Dict[str, Tuple[Any, Any]]:
+def _diff_properties(
+    live: Dict[str, Any], desired: Dict[str, Any], type_str: str = ""
+) -> Dict[str, Tuple[Any, Any]]:
+    """Property drift, judged on *effective* values.
+
+    Both sides are canonicalized first (display-name keys -> server keys), and
+    a side that leaves a property unset effectively holds the descriptor
+    default — NiFi materialises defaults on the live side, so comparing raw
+    dicts would propose unsetting every default back to ``None`` forever.
+    """
+    from niflow.processors.rules import canonical_properties, descriptors_for
+
+    live = canonical_properties(type_str, live)
+    desired = canonical_properties(type_str, desired)
+    descriptors = descriptors_for(type_str) or {}
     fields: Dict[str, Tuple[Any, Any]] = {}
     for key in sorted(set(live) | set(desired)):
         a, b = live.get(key), desired.get(key)
-        if _normalise_prop(a) != _normalise_prop(b):
+        default = (descriptors.get(key) or {}).get("default")
+        a_eff = default if a is None else _normalise_prop(a)
+        b_eff = default if b is None else _normalise_prop(b)
+        if a_eff != b_eff:
             fields[f"properties[{key}]"] = (_display_prop(a), _display_prop(b))
     return fields
 

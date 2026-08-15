@@ -225,6 +225,20 @@ def _emit_descriptors(rules: dict) -> str:
     return "DESCRIPTORS = {\n" + "\n".join(lines) + ("\n" if lines else "") + "}\n"
 
 
+def _emit_property_names(rules: dict) -> str:
+    """Produce the ``PROPERTY_NAMES`` map: ``type -> (canonical prop names)``.
+
+    Unlike ``DESCRIPTORS`` this is exhaustive — the differ and emitter use it
+    to tell real properties from dynamic ones when canonicalizing keys.
+    """
+    lines = []
+    for type_str, rule in sorted(rules.items()):
+        names = rule.get("properties") or []
+        if names:
+            lines.append(f"    {type_str!r}: {tuple(names)!r},")
+    return "PROPERTY_NAMES = {\n" + "\n".join(lines) + ("\n" if lines else "") + "}\n"
+
+
 def _render(
     kind: str,
     curated_mod: str,
@@ -280,18 +294,23 @@ def _to_documented_type(dto: dict) -> SimpleNamespace:
 
 
 def _trim_descriptors(descriptors: Optional[dict]) -> dict:
-    """Keep only the descriptor facts the validator can act on.
+    """Keep only the descriptor facts the validator and differ can act on.
 
     A property is worth recording if it's required, constrains values (an enum),
-    is conditionally required (dependencies), or references a controller service.
-    Plain optional free-text properties carry no validation signal, so we drop
-    them to keep the emitted catalog small.
+    is conditionally required (dependencies), references a controller service,
+    has a server-populated default, or has a display name that differs from its
+    canonical name (so property keys can be canonicalized). Plain optional
+    free-text properties carry none of those signals, so we drop them to keep
+    the emitted catalog small.
     """
     out: dict = {}
     for name, d in (descriptors or {}).items():
         entry: dict = {}
         if d.get("required"):
             entry["required"] = True
+        display = d.get("displayName")
+        if display and display != name:
+            entry["display"] = display
         default = d.get("defaultValue")
         if default not in (None, ""):
             entry["default"] = default
@@ -352,11 +371,14 @@ def _harvest_rules(client: Any, proc_types: List[Any]) -> dict:
                               "position": {"x": 0.0, "y": float(i)}}},
                 ).json()
                 component = resp.get("component", {})
+                descriptors = (component.get("config") or {}).get("descriptors") or {}
                 rules[dt.type] = {
                     "relationships": [r["name"] for r in component.get("relationships", [])],
-                    "descriptors": _trim_descriptors(
-                        (component.get("config") or {}).get("descriptors")
-                    ),
+                    "descriptors": _trim_descriptors(descriptors),
+                    # Full canonical key list — the differ/emitter needs to know
+                    # whether a key is a real property or a dynamic one, even
+                    # for properties the trimmed descriptors drop.
+                    "properties": sorted(descriptors),
                 }
             except Exception as exc:  # restricted / un-instantiable type — skip it
                 logger.warning("Skipped %s while harvesting: %s", dt.type, exc)
@@ -424,7 +446,8 @@ def generate(
             component_cls="Processor",
             named=proc_named,
             emit_factory=_emit_processor_factory,
-            extra=_emit_relationships(rules) + "\n" + _emit_descriptors(rules),
+            extra=_emit_relationships(rules) + "\n" + _emit_descriptors(rules)
+            + "\n" + _emit_property_names(rules),
             meta=meta,
         )
     )

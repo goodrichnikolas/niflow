@@ -601,9 +601,11 @@ class PlanApplier:
     # --- processors
 
     def _processor_config(self, proc: Processor) -> dict:
+        from niflow.processors.rules import canonical_properties
+
         properties = {
             k: (self._service_id(v) if isinstance(v, ControllerService) else v)
-            for k, v in proc.properties.items()
+            for k, v in canonical_properties(proc.type, proc.properties).items()
         }
         return {
             "properties": properties,

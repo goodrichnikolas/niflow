@@ -27,7 +27,11 @@ import re
 from typing import Dict, List, Set
 
 from niflow.core import Flow, ProcessGroup, find_identity_collisions
-from niflow.processors.rules import descriptors_for, relationships_for
+from niflow.processors.rules import (
+    canonical_properties,
+    descriptors_for,
+    relationships_for,
+)
 
 # Time-duration units NiFi accepts (FormatUtils). Generous on spelling so we
 # never flag a *valid* duration — the goal is catching obvious typos like
@@ -118,7 +122,9 @@ def _property_issues(proc, label: str) -> List[dict]:
     descriptors = descriptors_for(proc.type)
     if not descriptors:
         return []
-    props = proc.properties or {}
+    # Display-name keys ("Custom Text") count as setting the canonical
+    # property — the emitter rewrites them the same way at push time.
+    props = canonical_properties(proc.type, proc.properties or {})
     out: List[dict] = []
     for name, entry in descriptors.items():
         if not _dependency_active(entry, props):

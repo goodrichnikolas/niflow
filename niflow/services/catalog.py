@@ -17,7 +17,7 @@ from niflow.core import ControllerService
 
 CATALOG_META = {
     'nifi_version': '2.7.2',
-    'generated': '2026-07-28',
+    'generated': '2026-08-15',
 }
 
 def ApicurioSchemaRegistry(name: str = 'ApicurioSchemaRegistry', properties: Optional[Dict[str, Any]] = None) -> ControllerService:
