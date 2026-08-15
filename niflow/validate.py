@@ -26,7 +26,7 @@ from __future__ import annotations
 import re
 from typing import Dict, List, Set
 
-from niflow.core import Flow, ProcessGroup
+from niflow.core import Flow, ProcessGroup, find_identity_collisions
 from niflow.processors.rules import descriptors_for, relationships_for
 
 # Time-duration units NiFi accepts (FormatUtils). Generous on spelling so we
@@ -140,7 +140,12 @@ def _property_issues(proc, label: str) -> List[dict]:
 
 def validate_flow(flow: Flow) -> List[dict]:
     """Return a list of ``{"component", "message"}`` issues, empty if clean."""
-    issues: List[dict] = []
+    issues: List[dict] = [
+        # Name-based identity means same-kind duplicates in one group would
+        # silently merge or clobber each other on push — always an error.
+        {"component": where, "message": message}
+        for where, message in find_identity_collisions(flow)
+    ]
 
     def visit(group: ProcessGroup, prefix: str) -> None:
         path = f"{prefix}/{group.name}" if prefix else group.name

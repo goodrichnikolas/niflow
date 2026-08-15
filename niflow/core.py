@@ -440,3 +440,42 @@ class Flow(ProcessGroup):
 # Resolve the forward reference in ProcessGroup.process_groups.
 ProcessGroup.model_rebuild()
 Flow.model_rebuild()
+
+
+def find_identity_collisions(group: ProcessGroup) -> List[Tuple[str, str]]:
+    """Same-kind name duplicates that break niflow's name-based identity.
+
+    niflow identifies components by name within their group (deterministic
+    UUID5 seeds on push, name matching in plans), so two processors named
+    "Worker" in one group — or two sibling groups both called "Stage" — are
+    indistinguishable and would silently merge or clobber each other.
+    Returns ``(group_path, message)`` pairs; empty list means safe.
+    NiFi itself allows duplicate names; niflow requires them unique per
+    (group, kind). Duplicate connections and funnels are fine.
+    """
+    collisions: List[Tuple[str, str]] = []
+
+    def visit(g: ProcessGroup, path: str) -> None:
+        kinds = (
+            ("processor", g.processors),
+            ("input port", g.input_ports),
+            ("output port", g.output_ports),
+            ("controller service", g.controller_services),
+            ("child group", g.process_groups),
+        )
+        for kind, members in kinds:
+            seen: Dict[str, int] = {}
+            for m in members:
+                seen[m.name] = seen.get(m.name, 0) + 1
+            for name, count in seen.items():
+                if count > 1:
+                    collisions.append((
+                        path,
+                        f"{count} {kind}s named {name!r} — rename all but one "
+                        f"(niflow identity is name-based per group)",
+                    ))
+        for child in g.process_groups:
+            visit(child, f"{path}/{child.name}")
+
+    visit(group, group.name or ".")
+    return collisions

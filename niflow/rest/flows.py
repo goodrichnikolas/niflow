@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 from xml.etree import ElementTree
 
-from niflow.core import Flow
+from niflow.core import Flow, find_identity_collisions
 from niflow.rest.common import (
     _POLL_INTERVAL_S,
     _POLL_TIMEOUT_S,
@@ -17,6 +17,23 @@ from niflow.rest.common import (
     _load_secrets,
     logger,
 )
+
+
+def _assert_identity_safe(flow: Flow) -> None:
+    """Refuse to touch NiFi when the model has name-identity collisions.
+
+    Must run before *any* live mutation: push_flow tears the old group down
+    before recreating it, so an emit-time failure after teardown would lose
+    the live flow outright.
+    """
+    collisions = find_identity_collisions(flow)
+    if collisions:
+        lines = "\n".join(f"  - {where}: {message}" for where, message in collisions)
+        raise ValueError(
+            "flow has duplicate names that break niflow's name-based identity; "
+            "pushing would silently merge or drop components, so nothing was "
+            f"changed:\n{lines}"
+        )
 
 
 class FlowsMixin:
@@ -122,6 +139,7 @@ class FlowsMixin:
         * **Delete-and-recreate** otherwise (a fresh group, or one not under
           version control). Simpler, and there's nothing to lose.
         """
+        _assert_identity_safe(flow)
         parent_id = self.resolve_group(flow.parent_pg or "root")
 
         position = {"x": 0.0, "y": 0.0}
@@ -158,6 +176,11 @@ class FlowsMixin:
         from niflow.layout import apply_layout
         from niflow.plan import diff_flows
 
+        # Duplicate names make name-based plan matching meaningless (and the
+        # apply that consumes the plan dangerous) — reject up front. Only the
+        # *desired* side is checked; a live group someone built with
+        # duplicates still pulls and diffs (pairing them in listed order).
+        _assert_identity_safe(flow)
         # Materialise auto-layout coordinates so planned adds carry positions.
         apply_layout(flow)
         parent_id = self.resolve_group(flow.parent_pg or "root")
@@ -186,7 +209,7 @@ class FlowsMixin:
         (empty list = live already matched). Creating a missing group falls
         back to a full :meth:`push_flow`.
         """
-        from niflow.apply import PlanApplier
+        from niflow.apply import ApplyError, PlanApplier
 
         pg_id, live, changes = self.plan_flow(flow)
         if pg_id is None:
@@ -200,8 +223,15 @@ class FlowsMixin:
         self.apply_parameters(flow, secrets, env=env)
 
         if changes:
-            self._backup(pg_id, name=flow.name)
-            PlanApplier(self, pg_id, live, flow).apply(changes)
+            backup_path = self._backup(pg_id, name=flow.name)
+            try:
+                PlanApplier(self, pg_id, live, flow).apply(changes)
+            except ApplyError as exc:
+                exc.hint = (
+                    f"Restore the pre-push state with 'niflow rollback "
+                    f"{flow.name}' (backup: {backup_path})."
+                )
+                raise
             logger.info("Applied %d change(s) to group %r (%s)", len(changes), flow.name, pg_id)
         else:
             logger.info("No changes for group %r (%s)", flow.name, pg_id)
