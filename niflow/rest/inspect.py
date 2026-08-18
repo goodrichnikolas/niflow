@@ -121,16 +121,25 @@ class InspectMixin:
         self.stop_processor(proc_id)
         self._set_processor_state(proc_id, "RUN_ONCE")
 
+    def connection_end(self, conn_id: str, which: str) -> dict:
+        """One end of a connection: the raw ``source``/``destination`` ref.
+
+        ``which`` is ``"source"`` or ``"destination"``; the ref carries
+        ``id``/``name``/``type`` (``PROCESSOR``/``OUTPUT_PORT``/``FUNNEL``/…).
+        Resolved per call because queue listings come from the status
+        snapshot, which carries endpoint names but not ids.
+        """
+        return self._get_json(f"/connections/{conn_id}")["component"].get(which) or {}
+
     def run_queue_endpoint_once(self, conn_id: str, which: str) -> str:
         """Run-once the processor at one end of a queue; returns its name.
 
         ``which`` is ``"source"`` (feeds the queue) or ``"destination"``
         (consumes it) — the queue-centric view of :meth:`run_processor_once`.
-        Resolved per call because queue listings come from the status
-        snapshot, which carries endpoint names but not ids. Raises when that
-        end isn't a processor (funnels and ports have no run-once).
+        Raises when that end isn't a processor (funnels and ports have no
+        run-once).
         """
-        end = self._get_json(f"/connections/{conn_id}")["component"].get(which) or {}
+        end = self.connection_end(conn_id, which)
         if end.get("type") != "PROCESSOR":
             kind = (end.get("type") or "unknown").replace("_", " ").lower()
             raise NiFiApiError(400, f"the queue's {which} is a {kind}, not a processor")
@@ -422,38 +431,62 @@ class InspectMixin:
         untouched ones), the ``relationship`` taken, and whether each payload
         side is still fetchable via :meth:`event_content`.
         """
+        return {"uuid": uuid,
+                "hops": self.flowfile_events_since(uuid, -1, max_events)}
+
+    @staticmethod
+    def _hop_from_event(ev: dict) -> dict:
+        """A provenance-event DTO as the flat "hop" dict trace/follow render."""
+        attrs = ev.get("attributes") or []
+        return {
+            "event_id": ev.get("eventId"),
+            "event_type": ev.get("eventType", ""),
+            "time": ev.get("eventTime", ""),
+            "component": ev.get("componentName", ""),
+            "component_id": ev.get("componentId", ""),
+            "component_type": ev.get("componentType", ""),
+            "relationship": ev.get("relationship") or "",
+            "size": ev.get("fileSizeBytes", 0) or 0,
+            "attributes": {a["name"]: a.get("value") for a in attrs},
+            "changes": [
+                {"name": a["name"], "before": a.get("previousValue"),
+                 "after": a.get("value")}
+                for a in attrs if a.get("previousValue") != a.get("value")
+            ],
+            "input_available": bool(ev.get("inputContentAvailable")),
+            "output_available": bool(ev.get("outputContentAvailable")),
+            "content_equal": ev.get("contentEqual"),
+            "parents": list(ev.get("parentUuids") or []),
+            "children": list(ev.get("childUuids") or []),
+        }
+
+    def flowfile_events_since(
+        self, uuid: str, after_event_id: int = -1, max_events: int = 100
+    ) -> List[dict]:
+        """Hops for ``uuid`` whose event id is above ``after_event_id``,
+        oldest first (event ids are monotonic; event *times* are lossy
+        strings).
+
+        With the default ``-1`` this is the FlowFile's whole recorded journey
+        (what :meth:`trace_flowfile` wraps). The live stepper calls it with
+        the last event id it has already rendered: run-once a processor, then
+        ask what just happened — provenance indexing is effectively instant
+        (<0.2s live on 1.24 and 2.7.2), so new events show up on the first or
+        second poll.
+        """
         events = self._provenance_query(
             {"FlowFileUUID": {"value": uuid, "inverse": False}}, max_events, uuid
         )
         events.sort(key=lambda e: int(e["eventId"]))
-        hops = []
-        for summary in events[:max_events]:
-            ev = self._get_json(
-                f"/provenance-events/{summary['eventId']}"
-            )["provenanceEvent"]
-            attrs = ev.get("attributes") or []
-            hops.append({
-                "event_id": ev.get("eventId"),
-                "event_type": ev.get("eventType", ""),
-                "time": ev.get("eventTime", ""),
-                "component": ev.get("componentName", ""),
-                "component_id": ev.get("componentId", ""),
-                "component_type": ev.get("componentType", ""),
-                "relationship": ev.get("relationship") or "",
-                "size": ev.get("fileSizeBytes", 0) or 0,
-                "attributes": {a["name"]: a.get("value") for a in attrs},
-                "changes": [
-                    {"name": a["name"], "before": a.get("previousValue"),
-                     "after": a.get("value")}
-                    for a in attrs if a.get("previousValue") != a.get("value")
-                ],
-                "input_available": bool(ev.get("inputContentAvailable")),
-                "output_available": bool(ev.get("outputContentAvailable")),
-                "content_equal": ev.get("contentEqual"),
-                "parents": list(ev.get("parentUuids") or []),
-                "children": list(ev.get("childUuids") or []),
-            })
-        return {"uuid": uuid, "hops": hops}
+        return [
+            self._hop_from_event(
+                self._get_json(
+                    f"/provenance-events/{summary['eventId']}"
+                )["provenanceEvent"]
+            )
+            for summary in events[:max_events]
+            if int(summary["eventId"]) > after_event_id
+        ]
 
     def event_content(self, event_id, direction: str = "output") -> str:
         """One side of a provenance event's payload; ``input`` or ``output``.

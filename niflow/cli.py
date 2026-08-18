@@ -9,7 +9,8 @@ The day-to-day loop against a live NiFi (1.x or 2.x)::
     niflow validate flows/my_flow.py [--live]  # rulebook check (+ NiFi's own, sandboxed)
     niflow plan flows/my_flow.py               # semantic "what will change"
     niflow test flows/my_flow.py               # inject FlowFiles, assert what comes out
-    niflow trace <flowfile-uuid>               # follow one file hop by hop (attr diffs)
+    niflow trace <flowfile-uuid>               # replay one file's journey (attr diffs)
+    niflow follow "My Flow (copy)"             # live-step a file, one run-once per hop
     niflow push flows/my_flow.py --update      # apply only the delta in place
     niflow rollback "My Flow (copy)"           # undo from the automatic backup
     niflow diff flows/my_flow.py               # raw JSON diff vs the live group
@@ -439,6 +440,8 @@ def cmd_explain(args: argparse.Namespace) -> int:
 
 def cmd_trace(args: argparse.Namespace) -> int:
     """Print one FlowFile's provenance journey, hop by hop."""
+    from niflow.follow import format_hop
+
     trace = _client().trace_flowfile(args.uuid)
     hops = trace["hops"]
     if not hops:
@@ -446,18 +449,20 @@ def cmd_trace(args: argparse.Namespace) -> int:
               "events have aged out of the provenance repository.")
         return 1
     for i, hop in enumerate(hops, 1):
-        rel = f" -> {hop['relationship']}" if hop["relationship"] else ""
-        print(f"{i:>3}. {hop['component'] or '(flow)'}  "
-              f"[{hop['event_type']}{rel}]  {hop['time']}  {hop['size']} B")
-        for change in hop["changes"]:
-            before = "(new)" if change["before"] is None else change["before"]
-            print(f"       {change['name']}: {before} -> {change['after']}")
-        if args.full:
-            for name, value in sorted(hop["attributes"].items()):
-                print(f"       = {name}: {value}")
-        for child in hop["children"]:
-            print(f"       spawned {child}  (niflow trace {child})")
+        print(format_hop(i, hop, full=args.full))
     return 0
+
+
+def cmd_follow(args: argparse.Namespace) -> int:
+    """Quiesce a group and live-step one FlowFile through it via run-once."""
+    from niflow.follow import follow_command
+
+    return follow_command(
+        _client(), args.group,
+        uuid=args.uuid, queue=args.queue, source=args.source,
+        auto=args.auto, max_hops=args.max_hops,
+        restore=args.restore, full=args.full,
+    )
 
 
 def cmd_tidy(args: argparse.Namespace) -> int:
@@ -654,6 +659,29 @@ def main(argv: Optional[list] = None) -> int:
     p.add_argument("--full", action="store_true",
                    help="Show every attribute at every hop, not just what changed")
     p.set_defaults(func=cmd_trace)
+
+    p = sub.add_parser(
+        "follow",
+        help="Quiesce a group and step one FlowFile through it live, "
+        "one run-once at a time",
+    )
+    p.add_argument("group", help="Group name, a/b path, id, or 'root'")
+    p.add_argument("--uuid", help="Follow this queued FlowFile "
+                   "(default: the front of the first non-empty queue)")
+    p.add_argument("--queue", help="Connection id to take the FlowFile from")
+    p.add_argument("--source", help="Run this source processor once first "
+                   "to mint the FlowFile to follow")
+    p.add_argument("--auto", action="store_true",
+                   help="Step without prompting until the file reaches a "
+                   "terminal state (dropped/sent/port)")
+    p.add_argument("--max-hops", type=int, default=50,
+                   help="Safety cap on run-once steps (default: 50)")
+    p.add_argument("--restore", action="store_true",
+                   help="Afterwards restart the processors that were "
+                   "running before the quiesce")
+    p.add_argument("--full", action="store_true",
+                   help="Show every attribute at every hop, not just what changed")
+    p.set_defaults(func=cmd_follow)
 
     args = parser.parse_args(argv)
     try:
