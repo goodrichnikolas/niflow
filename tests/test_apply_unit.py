@@ -303,6 +303,48 @@ def test_variable_registry_update_is_applied_on_1x():
     ) or any("update-requests/vr1" in op for op in client.ops)
 
 
+def test_connection_to_reordered_funnel_resolves_matching_live_id():
+    """The live pull lists funnels in the opposite order to the model; a new
+    connection from the GenB-fed funnel must wire to *that* funnel's live id
+    (topology pairing), not to whatever sits at the same list position."""
+    from niflow.core import Funnel
+
+    def build(reversed_order: bool, wire_log: bool) -> Flow:
+        flow = Flow("F")
+        gen_a = Processor(name="GenA", type="org.x.G")
+        gen_b = Processor(name="GenB", type="org.x.G")
+        fa, fb = Funnel(), Funnel()
+        flow.add(gen_a, gen_b)
+        flow.add_funnel(*((fb, fa) if reversed_order else (fa, fb)))
+        flow.add_connection(gen_a >> fa, gen_b >> fb)
+        if wire_log:
+            log = Processor(name="Log", type="org.x.L")
+            flow.add(log)
+            flow.add_connection(fb >> log)
+        return flow
+
+    live = build(False, wire_log=False)
+    desired = build(True, wire_log=True)
+    live.nifi_id = "root-pg"
+    for proc, pid in zip(live.processors, ("p-a", "p-b")):
+        proc.nifi_id = pid
+    live.funnels[0].nifi_id = "f-a"  # fed by GenA
+    live.funnels[1].nifi_id = "f-b"  # fed by GenB
+    for conn, cid in zip(live.connections, ("c-a", "c-b")):
+        conn.nifi_id = cid
+
+    client = FakeClient()
+    changes = diff_flows(live, desired)
+    # No funnel or existing-connection churn — just the new Log and its feed.
+    assert {(c.op, c.kind) for c in changes} == {("add", "processor"), ("add", "connection")}
+    PlanApplier(client, "root-pg", live, desired).apply(changes)
+    post_conn = next(
+        op for op in client.ops if op.startswith("POST /process-groups/root-pg/connections")
+    )
+    body = json.loads(post_conn.split(" ", 2)[2])
+    assert body["source"]["id"] == "f-b"
+
+
 # --- failure containment (torture-flow round one, P0) ------------------------
 
 

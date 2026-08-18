@@ -207,3 +207,107 @@ def test_port_rename_flagged_only_when_unambiguous():
     plan = diff_flows(live, desired)
     add = next(c for c in plan if c.op == "add" and c.kind == "input_port")
     assert add.note and "RENAME" in add.note
+
+
+# --- parallel edges pair by similarity (torture-flow P1: plans "rotated"
+# --- same-endpoint clones and re-applied forever) -----------------------------
+
+
+def _parallel_flow(order=(0, 1, 2)) -> Flow:
+    """Three connections between the same endpoints, declared in ``order``."""
+    flow = Flow("P")
+    route = Processor(name="Route", type="org.x.Route")
+    work = Processor(name="Work", type="org.x.Work")
+    flow.add(route, work)
+    conns = [
+        route.to(work, relationships=["hot"], name="hot"),
+        route.to(work, relationships=["cold"], name="cold",
+                 back_pressure_object_threshold=500),
+        route.to(work, relationships=["audit"], name="audit",
+                 flowfile_expiration="60 sec"),
+    ]
+    flow.add_connection(*(conns[i] for i in order))
+    return flow
+
+
+def test_parallel_edges_pair_by_similarity_not_listing_order():
+    # The server lists the clones in a different order than the model declares.
+    assert diff_flows(_parallel_flow((2, 0, 1)), _parallel_flow()) == []
+
+
+def test_parallel_edge_update_targets_its_twin():
+    live, desired = _parallel_flow((2, 0, 1)), _parallel_flow()
+    desired.connections[1].back_pressure_object_threshold = 100  # the cold path
+    (change,) = diff_flows(live, desired)
+    assert change.op == "update" and change.kind == "connection"
+    assert change.live.name == "cold"
+    assert change.fields["back_pressure_object_threshold"] == (500, 100)
+
+
+def test_parallel_edges_plan_apply_plan_converges():
+    """Simulate an apply (copy planned values onto the paired live twins):
+    the follow-up plan must be empty — no more perpetual rotation."""
+    live, desired = _parallel_flow((2, 0, 1)), _parallel_flow()
+    for conn in desired.connections:  # rewire every clone at once
+        conn.relationships = ["retry"]
+    plan = diff_flows(live, desired)
+    assert plan and all(c.op == "update" for c in plan)
+    for change in plan:
+        for fname, (_, new) in change.fields.items():
+            setattr(change.live, fname, new)
+    assert diff_flows(live, desired) == []
+
+
+# --- funnels match by topology (torture-flow P2: ordinal identity churned
+# --- funnel connections when server order != declaration order) ---------------
+
+
+def _funnel_chains(reversed_funnels: bool) -> Flow:
+    """GenA -> funnel -> LogA and GenB -> funnel -> LogB; funnel list order varies."""
+    flow = Flow("FN")
+    gen_a, gen_b = (Processor(name=n, type="org.x.G") for n in ("GenA", "GenB"))
+    log_a, log_b = (Processor(name=n, type="org.x.L") for n in ("LogA", "LogB"))
+    fa, fb = Funnel(), Funnel()
+    flow.add(gen_a, gen_b, log_a, log_b)
+    flow.add_funnel(*((fb, fa) if reversed_funnels else (fa, fb)))
+    flow.add_connection(gen_a >> fa, fa >> log_a, gen_b >> fb, fb >> log_b)
+    return flow
+
+
+def test_funnels_match_by_topology_not_listing_order():
+    assert diff_flows(_funnel_chains(True), _funnel_chains(False)) == []
+
+
+def test_funnel_remove_targets_the_topological_orphan():
+    def build(with_a: bool) -> Flow:
+        flow = Flow("FN")
+        gen_b = Processor(name="GenB", type="org.x.G")
+        log_b = Processor(name="LogB", type="org.x.L")
+        fb = Funnel()
+        flow.add(gen_b, log_b)
+        if with_a:
+            gen_a = Processor(name="GenA", type="org.x.G")
+            fa = Funnel()
+            flow.add(gen_a)
+            flow.add_funnel(fa)  # the orphan-to-be is listed FIRST
+            flow.add_connection(gen_a >> fa)
+        flow.add_funnel(fb)
+        flow.add_connection(gen_b >> fb, fb >> log_b)
+        return flow
+
+    live, desired = build(True), build(False)
+    funnel_changes = [c for c in diff_flows(live, desired) if c.kind == "funnel"]
+    assert [c.op for c in funnel_changes] == ["remove"]
+    # Ordinal matching would have removed the still-wired second funnel.
+    assert funnel_changes[0].live is live.funnels[0]
+
+
+# --- autoTerminatedRelationships compare as a set (torture-flow P2) -----------
+
+
+def test_auto_terminate_order_is_ignored():
+    live, desired = _base_flow(), _base_flow()
+    # Assign post-construction so the model normaliser can't tidy them first.
+    live.processors[1].auto_terminate = ["success", "failure"]
+    desired.processors[1].auto_terminate = ["failure", "success"]
+    assert diff_flows(live, desired) == []

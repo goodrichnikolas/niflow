@@ -175,6 +175,14 @@ class Processor(NiFiComponent):
     max_backoff_period: str = "10 mins"
     bundle: Optional[Bundle] = None
 
+    @model_validator(mode="after")
+    def _sorted_relationship_sets(self) -> "Processor":
+        # These lists are *sets* to NiFi; keeping them sorted means declaration
+        # order can never masquerade as drift (in plans or emitted JSON).
+        self.auto_terminate = sorted(self.auto_terminate)
+        self.retried_relationships = sorted(self.retried_relationships)
+        return self
+
 
 class Funnel(NiFiComponent):
     """A canvas funnel — merges any number of connections into one stream.

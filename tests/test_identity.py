@@ -135,6 +135,52 @@ def test_exact_duplicate_connections_pair_by_occurrence():
     assert flow.to_json() == flow.to_json()
 
 
+# --- order-insensitive emission (torture-flow P2 findings) ---------------------
+
+
+def _funnel_chain_flow(reversed_funnels: bool) -> Flow:
+    """Two independent Gen -> funnel chains; funnel declaration order varies."""
+    flow = Flow("F")
+    gen_a, gen_b = _proc("GenA"), _proc("GenB")
+    fa, fb = Funnel(), Funnel()
+    flow.add_processor(gen_a, gen_b)
+    flow.add_funnel(*((fb, fa) if reversed_funnels else (fa, fb)))
+    flow.add_connection(gen_a >> fa, gen_b >> fb)
+    return flow
+
+
+def test_funnel_identifiers_follow_topology_not_declaration_order():
+    """The server lists funnels in arbitrary order; seeds keyed on raw list
+    position made a pulled flow serialise different connection endpoints than
+    the local model — phantom churn in `niflow diff` after a clean push."""
+
+    def destinations(flow: Flow) -> dict:
+        contents = json.loads(flow.to_json())["flowContents"]
+        return {c["source"]["name"]: c["destination"]["id"]
+                for c in contents["connections"]}
+
+    ids_a = destinations(_funnel_chain_flow(False))
+    ids_b = destinations(_funnel_chain_flow(True))
+    assert ids_a["GenA"] == ids_b["GenA"]
+    assert ids_a["GenB"] == ids_b["GenB"]
+    assert ids_a["GenA"] != ids_a["GenB"]
+
+
+def test_auto_terminated_relationships_emit_sorted():
+    def build(order: list) -> Flow:
+        flow = Flow("F")
+        flow.add_processor(
+            Processor(name="P", type=UPDATE_ATTR, auto_terminate=list(order))
+        )
+        return flow
+
+    # Same set, different declaration order: byte-identical snapshots.
+    assert build(["success", "failure"]).to_json() == build(["failure", "success"]).to_json()
+    dto = json.loads(build(["success", "failure"]).to_json())
+    (proc,) = dto["flowContents"]["processors"]
+    assert proc["autoTerminatedRelationships"] == ["failure", "success"]
+
+
 def test_cross_group_connections_use_real_endpoint_ids():
     """Two child-group out ports wired to one funnel used to collide: the
     child ports had no identifier yet when root connections were seeded."""

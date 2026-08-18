@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import json
 import time
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from niflow.core import (
     Connection,
@@ -35,7 +35,7 @@ from niflow.core import (
     ProcessGroup,
     Processor,
 )
-from niflow.plan import Change
+from niflow.plan import Change, match_funnels
 from niflow.utils import get_logger
 
 logger = get_logger()
@@ -112,6 +112,9 @@ class PlanApplier:
         self.desired_service_paths: Dict[int, Tuple[Tuple[str, ...], str]] = {}
         # Processors/ports stopped by us that were running: (kind, id).
         self.to_restart: List[Tuple[str, str]] = []
+        # path -> desired-funnel-ordinal -> live-funnel-ordinal, lazily
+        # computed with the same topology pairing the plan used.
+        self._funnel_pair_cache: Dict[Tuple[str, ...], Dict[int, int]] = {}
 
         # Target major version, resolved on first use (properties are keyed
         # differently on the 1.x line — see niflow.processors.rules).
@@ -360,16 +363,34 @@ class PlanApplier:
             group = next(g for g in group.process_groups if g.name == name)
         return group
 
+    def _live_group(self, path: Tuple[str, ...]) -> Optional[ProcessGroup]:
+        group: Optional[ProcessGroup] = self.live
+        for name in path:
+            group = next((g for g in group.process_groups if g.name == name), None)
+            if group is None:
+                break
+        return group
+
+    def _funnel_pairs(self, path: Tuple[str, ...]) -> Dict[int, int]:
+        """desired-ordinal -> live-ordinal funnel pairing for one group."""
+        if path not in self._funnel_pair_cache:
+            live = self._live_group(path)
+            self._funnel_pair_cache[path] = (
+                match_funnels(live, self._desired_group(path)) if live is not None else {}
+            )
+        return self._funnel_pair_cache[path]
+
     def _live_component_id(
         self, component: NiFiComponent, owner_path: Tuple[str, ...], kind: str, gid: str
     ) -> str:
         if component.nifi_id:
             return component.nifi_id
         # Live twin recorded from the pulled model (matched the same way the
-        # plan matched: by name within the group, funnels by ordinal).
+        # plan matched: by name within the group, funnels by topology pairing).
         if kind == "funnel":
             owner = self._desired_group(owner_path)
             ordinal: Any = next(i for i, f in enumerate(owner.funnels) if f is component)
+            ordinal = self._funnel_pairs(owner_path).get(ordinal, ordinal)
             key = (owner_path, "funnel", ordinal)
         else:
             key = (owner_path, kind, getattr(component, "name", ""))
