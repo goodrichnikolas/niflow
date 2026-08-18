@@ -13,6 +13,8 @@ remains for those who prefer it. Feature set here:
   a top-level-flow dropdown and starred rows pinned to the top (both
   remembered per browser via localStorage)
 * queues with live counts -> click through to FlowFiles -> attributes+content
+* Trace tab: one FlowFile's provenance journey hop by hop — attribute
+  diffs, relationship taken, payload per processor (``niflow trace``)
 * group-wide start / stop / stop+drain / purge
 * one-click "Tidy canvas": auto-arrange the selected flow (or everything)
   along its connections, left-to-right or top-to-bottom (``niflow tidy``)
@@ -103,6 +105,11 @@ def dispatch(
                 return 200, client.list_flowfiles(q("connection_id"))
             if method == "GET" and path == "/api/flowfile":
                 return 200, client.flowfile_detail(q("connection_id"), q("uuid"))
+            if method == "GET" and path == "/api/trace":
+                return 200, client.trace_flowfile(q("uuid"))
+            if method == "GET" and path == "/api/trace/content":
+                return 200, {"content": client.event_content(
+                    q("event_id"), q("direction") or "output")}
 
             if method == "POST" and path.startswith("/api/processors/"):
                 _, _, _, proc_id, action = path.split("/", 4)
@@ -380,6 +387,11 @@ PAGE = r"""<!doctype html>
   article.doc h2 { border-bottom:1px solid var(--line); padding-bottom:.2rem; }
   article.doc code { background:var(--chip); padding:.05rem .3rem; border-radius:.25rem; }
   .pill { background:var(--chip); border-radius:1rem; padding:.1rem .6rem; font-size:.8rem; }
+  .hop { border:1px solid var(--line); border-radius:.5rem; padding:.6rem .8rem;
+         margin-bottom:.7rem; }
+  .hop .hophead { display:flex; gap:.6rem; align-items:center; flex-wrap:wrap;
+                  margin-bottom:.4rem; }
+  .hop table { width:auto; min-width:50%; }
 </style>
 </head>
 <body>
@@ -432,11 +444,12 @@ function bindFlowSelect() {
 
 const TABS = [
   ["processors", "Processors"], ["queues", "Queues & FlowFiles"],
-  ["bulletins", "Bulletins"], ["errors", "Errors"], ["explain", "Explain"],
-  ["flows", "Flows"],
+  ["trace", "Trace"], ["bulletins", "Bulletins"], ["errors", "Errors"],
+  ["explain", "Explain"], ["flows", "Flows"],
 ];
 let active = "processors";
 let inspector = null;   // {connId, label, uuid} drill-down state on the queues tab
+let traceUuid = null;   // FlowFile the Trace tab is following (survives tab hops)
 
 function nav() {
   $("#tabs").innerHTML = TABS.map(([k, label]) =>
@@ -499,7 +512,9 @@ async function render() {
       if (inspector && inspector.uuid) {
         const d = await api(`/api/flowfile?connection_id=${inspector.connId}&uuid=${inspector.uuid}`);
         view.innerHTML = `
-          <div class="bar"><button class="op" onclick="inspector.uuid=null;render()">← back to ${esc(inspector.label)}</button></div>
+          <div class="bar"><button class="op" onclick="inspector.uuid=null;render()">← back to ${esc(inspector.label)}</button>
+            <button class="op" title="how did this file get here? provenance journey with attribute diffs"
+                onclick="traceJump('${inspector.uuid}')">Trace journey</button></div>
           <div class="split">
             <div><h3>Attributes</h3><pre>${esc(JSON.stringify(d.attributes ?? d, null, 2))}</pre></div>
             <div><h3>Content</h3><pre>${esc(d.content ?? "(no content view)")}</pre></div>
@@ -551,6 +566,48 @@ async function render() {
         bindFlowSelect();
         $("#qf").onchange = e => { localStorage.setItem("niflow.qfilter", e.target.value); render(); };
       }
+    }
+
+    if (active === "trace") {
+      // Post-hoc debugger: replay one FlowFile's provenance journey. Each hop
+      // shows what that processor did to the file — attribute before/after,
+      // relationship taken, payload on demand — so "where did it go wrong"
+      // is a read, not a log hunt.
+      const t = traceUuid
+        ? await api(`/api/trace?uuid=${encodeURIComponent(traceUuid)}`) : null;
+      window._hops = t ? t.hops : [];
+      const changes = h => h.changes.length ? `
+        <table><tr><th>Attribute</th><th>Before</th><th>After</th></tr>
+        ${h.changes.map(c => `<tr><td>${esc(c.name)}</td>
+          <td class="muted">${c.before === null ? "<i>(new)</i>" : esc(c.before)}</td>
+          <td><b>${esc(c.after ?? "")}</b></td></tr>`).join("")}
+        </table>` : `<span class="muted">no attribute changes</span>`;
+      const kin = (label, uuids) => uuids.map(u => `<div class="muted">${label}
+          ${esc(u)} <button class="op" onclick="traceJump('${esc(u)}')">trace</button></div>`).join("");
+      view.innerHTML = `
+        <div class="bar">
+          <input type="text" id="tu" placeholder="FlowFile UUID" value="${esc(traceUuid || "")}">
+          <button class="op" onclick="traceGo()">Trace</button>
+          <span class="muted">paste a UUID, or open a FlowFile under Queues → “Trace journey”</span>
+        </div>` + (!t ? "" : !t.hops.length
+        ? `<p class="muted">No provenance events for this UUID — wrong id, or the
+             events have aged out of the provenance repository.</p>`
+        : t.hops.map((h, i) => `
+          <div class="hop">
+            <div class="hophead"><b>#${i + 1} ${esc(h.component || "(flow)")}</b>
+              <span class="pill">${esc(h.event_type)}${h.relationship ? " → " + esc(h.relationship) : ""}</span>
+              <span class="muted">${esc(h.time)} · ${esc(h.size)} B${h.content_equal === false ? " · content changed" : ""}</span>
+              <span style="flex:1"></span>
+              <button class="op" onclick="hopAttrs(${i})">Attributes</button>
+              ${h.input_available ? `<button class="op" onclick="hopContent(${i},'input')">Content in</button>` : ""}
+              ${h.output_available ? `<button class="op" onclick="hopContent(${i},'output')">Content out</button>` : ""}
+            </div>
+            ${changes(h)}
+            ${kin("joined from", h.parents)}${kin("spawned", h.children)}
+            <pre id="hopx${i}" style="display:none"></pre>
+          </div>`).join(""));
+      const tu = $("#tu");
+      tu.onkeydown = e => { if (e.key === "Enter") traceGo(); };
     }
 
     if (active === "bulletins") {
@@ -642,6 +699,29 @@ async function queueOp(connId, which) {
         status(`ran ${r.ran || which} once ✓`); }
   catch (e) { status(`run ${which} once failed: ${e.message}`); }
   render();
+}
+function traceGo() { traceUuid = $("#tu").value.trim() || null; render(); }
+function traceJump(u) { traceUuid = u; active = "trace"; inspector = null; nav(); render(); }
+function hopAttrs(i) {
+  // Toggle the hop's full attribute map (the table above shows only changes).
+  const pre = $(`#hopx${i}`);
+  if (pre.dataset.kind === "attrs" && pre.style.display !== "none") {
+    pre.style.display = "none"; return;
+  }
+  pre.dataset.kind = "attrs";
+  pre.textContent = JSON.stringify(window._hops[i].attributes, null, 2);
+  pre.style.display = "block";
+}
+async function hopContent(i, dir) {
+  status(`${dir} content…`);
+  try {
+    const r = await api(`/api/trace/content?event_id=${window._hops[i].event_id}&direction=${dir}`);
+    const pre = $(`#hopx${i}`);
+    pre.dataset.kind = dir;
+    pre.textContent = r.content || "(empty)";
+    pre.style.display = "block";
+    status("");
+  } catch (e) { status(`content failed: ${e.message}`); }
 }
 function tidyDir() { return localStorage.getItem("niflow.tidydir") || "horizontal"; }
 async function tidyCanvas() {

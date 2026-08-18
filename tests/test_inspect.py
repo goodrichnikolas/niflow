@@ -91,8 +91,11 @@ class FakeNiFi:
 
         # --- provenance query lifecycle ---
         if (method, path) == ("POST", "/provenance"):
-            assert kw["json"]["provenance"]["request"]["searchTerms"][
-                "ProcessorID"]["value"] == "p1"
+            terms = kw["json"]["provenance"]["request"]["searchTerms"]
+            if "FlowFileUUID" in terms:
+                assert terms["FlowFileUUID"]["value"] == "ff-1"
+                return FakeResponse(200, {"provenance": {"id": "pq-2", "finished": False}})
+            assert terms["ProcessorID"]["value"] == "p1"
             return FakeResponse(200, {"provenance": {"id": "pq-1", "finished": False}})
         if (method, path) == ("GET", "/provenance/pq-1"):
             return FakeResponse(200, {"provenance": {"id": "pq-1", "finished": True,
@@ -103,6 +106,43 @@ class FakeNiFi:
         if (method, path) == ("DELETE", "/provenance/pq-1"):
             self.deleted.append("pq-1")
             return FakeResponse(200, {})
+
+        # --- FlowFile trace: the query returns summaries newest first ---
+        if (method, path) == ("GET", "/provenance/pq-2"):
+            return FakeResponse(200, {"provenance": {"id": "pq-2", "finished": True,
+                "results": {"provenanceEvents": [
+                    {"eventId": 11, "eventType": "ROUTE"},
+                    {"eventId": 10, "eventType": "ATTRIBUTES_MODIFIED"},
+                ]}}})
+        if (method, path) == ("DELETE", "/provenance/pq-2"):
+            self.deleted.append("pq-2")
+            return FakeResponse(200, {})
+        if (method, path) == ("GET", "/provenance-events/10"):
+            return FakeResponse(200, {"provenanceEvent": {
+                "eventId": 10, "eventType": "ATTRIBUTES_MODIFIED",
+                "eventTime": "12:00:01", "componentName": "Update",
+                "componentId": "u1", "componentType": "UpdateAttribute",
+                "fileSizeBytes": 9, "inputContentAvailable": True,
+                "outputContentAvailable": True, "contentEqual": True,
+                "attributes": [
+                    # changed / untouched (previousValue == value) / born here
+                    {"name": "a", "value": "2", "previousValue": "1"},
+                    {"name": "filename", "value": "a.json", "previousValue": "a.json"},
+                    {"name": "fresh", "value": "x"},
+                ]}})
+        if (method, path) == ("GET", "/provenance-events/11"):
+            return FakeResponse(200, {"provenanceEvent": {
+                "eventId": 11, "eventType": "ROUTE", "eventTime": "12:00:02",
+                "componentName": "Router", "componentId": "r1",
+                "componentType": "RouteOnAttribute", "relationship": "unmatched",
+                "fileSizeBytes": 9, "inputContentAvailable": True,
+                "outputContentAvailable": False, "contentEqual": True,
+                "childUuids": ["ff-9"],
+                "attributes": [{"name": "a", "value": "2", "previousValue": "2"}]}})
+        if (method, path) == ("GET", "/provenance-events/11/content/input"):
+            return FakeResponse(200, text="payload-in")
+        if path == "/provenance-events/11/content/output":
+            raise AssertionError("must not fetch content NiFi says is unavailable")
 
         # --- provenance event detail + content ---
         if (method, path) == ("GET", "/provenance-events/ev-1"):
@@ -169,3 +209,27 @@ def test_event_detail_flattens_attributes_and_fetches_content(client):
     assert detail["attributes"] == {"filename": "a.json", "a": "1"}
     assert detail["content"] == '{"a":"1"}'
     assert detail["event_type"] == "SEND"
+
+
+def test_trace_orders_hops_and_diffs_attributes(client):
+    trace = client.trace_flowfile("ff-1")
+    hops = trace["hops"]
+    # Query answered newest first; the trace reads oldest first.
+    assert [h["event_id"] for h in hops] == [10, 11]
+    # Only what the event changed — untouched attributes stay out of the diff.
+    assert hops[0]["changes"] == [
+        {"name": "a", "before": "1", "after": "2"},
+        {"name": "fresh", "before": None, "after": "x"},
+    ]
+    assert hops[0]["attributes"] == {"a": "2", "filename": "a.json", "fresh": "x"}
+    assert hops[1]["relationship"] == "unmatched"
+    assert hops[1]["children"] == ["ff-9"]
+    assert not hops[1]["output_available"]
+    assert "pq-2" in client.session.deleted
+
+
+def test_event_content_fetches_only_available_sides(client):
+    assert client.event_content(11, "input") == "payload-in"
+    # The fake asserts the output endpoint is never hit: NiFi already said
+    # the claim is gone, so the client returns "" without asking.
+    assert client.event_content(11, "output") == ""
