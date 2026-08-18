@@ -11,7 +11,10 @@ When the processor type's rulebook has been harvested into the catalog
 (``make catalog``, see :mod:`niflow.processors.rules`), this checks:
 
 * **relationships**, precisely — catching ``failure`` left dangling even while
-  ``success`` is wired, and relationships you didn't know existed; and
+  ``success`` is wired, and relationships you didn't know existed. Types whose
+  dynamic properties create relationships (RouteOnAttribute and friends, see
+  ``rules.DYNAMIC_RELATIONSHIP_TYPES``) have those counted as real
+  relationships — valid to connect, and flagged when left unhandled; and
 * **properties** — required properties left unset (honouring defaults and
   ``dependencies``), and values outside a property's allowable set.
 
@@ -30,7 +33,9 @@ from niflow.core import Flow, ProcessGroup, find_identity_collisions
 from niflow.processors.rules import (
     canonical_properties,
     descriptors_for,
+    dynamic_relationships_for,
     relationships_for,
+    supports_dynamic_relationships,
 )
 
 # Time-duration units NiFi accepts (FormatUtils). Generous on spelling so we
@@ -192,27 +197,36 @@ def validate_flow(flow: Flow) -> List[dict]:
             known = relationships_for(proc.type)
             if known is not None:
                 # Precise: we know the full relationship set for this type.
+                # Dynamic-relationship types (RouteOnAttribute, ...) extend it
+                # with one relationship per dynamic property; those must be
+                # handled just like the static ones.
+                dynamic = dynamic_relationships_for(proc.type, proc.properties or {})
+                known_set = set(known) | set(dynamic or ())
                 handled = connected | auto
-                for rel in known:
+                for rel in list(known) + sorted(set(dynamic or ()) - set(known)):
                     if rel not in handled:
                         issues.append({
                             "component": label,
                             "message": f"relationship '{rel}' is not connected "
                                        f"or auto-terminated",
                         })
-                known_set = set(known)
-                for rel in sorted(auto - known_set):
-                    issues.append({
-                        "component": label,
-                        "message": f"auto-terminated relationship '{rel}' does "
-                                   f"not exist on this processor type",
-                    })
-                for rel in sorted(connected - known_set):
-                    issues.append({
-                        "component": label,
-                        "message": f"a connection uses relationship '{rel}' that "
-                                   f"does not exist on this processor type",
-                    })
+                # A dynamic-relationship type whose per-property routing can't
+                # be confirmed active (strategy switched or set via EL) has an
+                # unknowable relationship set — skip existence checks rather
+                # than risk false positives.
+                if dynamic is not None or not supports_dynamic_relationships(proc.type):
+                    for rel in sorted(auto - known_set):
+                        issues.append({
+                            "component": label,
+                            "message": f"auto-terminated relationship '{rel}' does "
+                                       f"not exist on this processor type",
+                        })
+                    for rel in sorted(connected - known_set):
+                        issues.append({
+                            "component": label,
+                            "message": f"a connection uses relationship '{rel}' that "
+                                       f"does not exist on this processor type",
+                        })
             elif not connected and not auto:
                 # Heuristic fallback for un-harvested types.
                 issues.append({
