@@ -121,6 +121,22 @@ class InspectMixin:
         self.stop_processor(proc_id)
         self._set_processor_state(proc_id, "RUN_ONCE")
 
+    def run_queue_endpoint_once(self, conn_id: str, which: str) -> str:
+        """Run-once the processor at one end of a queue; returns its name.
+
+        ``which`` is ``"source"`` (feeds the queue) or ``"destination"``
+        (consumes it) — the queue-centric view of :meth:`run_processor_once`.
+        Resolved per call because queue listings come from the status
+        snapshot, which carries endpoint names but not ids. Raises when that
+        end isn't a processor (funnels and ports have no run-once).
+        """
+        end = self._get_json(f"/connections/{conn_id}")["component"].get(which) or {}
+        if end.get("type") != "PROCESSOR":
+            kind = (end.get("type") or "unknown").replace("_", " ").lower()
+            raise NiFiApiError(400, f"the queue's {which} is a {kind}, not a processor")
+        self.run_processor_once(end["id"])
+        return end.get("name", "")
+
     def set_port_state(self, kind: str, port_id: str, state: str) -> None:
         """Start/stop one port. ``kind`` is ``input_port`` or ``output_port``."""
         endpoint = "input-ports" if kind == "input_port" else "output-ports"

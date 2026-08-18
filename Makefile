@@ -1,5 +1,5 @@
 .PHONY: help install nifi-up nifi-down nifi-logs nifi-wait nifi1-up nifi1-down nifi1-wait \
-	test test-integration test-integration-v1 catalog convert example clean \
+	test test-integration test-integration-v1 catalog catalog-v1 convert example clean \
 	list pull push copy diff validate gui
 
 help:
@@ -14,8 +14,8 @@ help:
 	@echo "    push FILE=flow.py [START=1]  Replace the live group from Python"
 	@echo "    gui / webgui                 Desktop helper / browser helper"
 	@echo ""
-	@echo "  More CLI (run 'niflow <cmd> -h'): plan, test, drift, diagram, backup,"
-	@echo "    rollback, commit, doctor, pull --all, push --all --update, --env overlays"
+	@echo "  More CLI (run 'niflow <cmd> -h'): plan, test, drift, diagram, tidy,"
+	@echo "    explain, backup, rollback, commit, doctor, pull/push --all"
 	@echo ""
 	@echo "  Environment:"
 	@echo "    install          Install niflow + dev deps (editable)"
@@ -30,6 +30,7 @@ help:
 	@echo "    test-integration     Integration tests against NiFi 2.x (localhost:8443)"
 	@echo "    test-integration-v1  Integration tests against NiFi 1.24 (localhost:8444)"
 	@echo "    catalog              Regenerate processor/service catalogs from NiFi"
+	@echo "    catalog-v1           Regenerate the 1.x property compat table (localhost:8444)"
 	@echo "    fixtures             Refresh real-server golden snapshots (tests/fixtures/real/)"
 	@echo "    convert              make convert IN=flow.json OUT=flow.py [FLAGS=...]"
 	@echo "    example              Deploy examples/simple_etl.py"
@@ -69,7 +70,7 @@ gui:
 	python -m niflow.gui
 
 webgui:
-	python -m niflow.webgui
+	python -m niflow.webgui --reload
 
 # --- local NiFi containers ----------------------------------------------------
 
@@ -149,6 +150,9 @@ test-integration-v1:
 
 catalog:
 	python -m niflow.codegen
+
+catalog-v1:
+	NIFLOW_NIFI_HOST=https://localhost:8444/nifi-api python -m niflow.codegen --compat
 
 # Refresh the real-server golden fixtures (tests/fixtures/real/) from the
 # NiFi in NIFLOW_NIFI_HOST. Run once per NiFi line:

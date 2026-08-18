@@ -20,6 +20,8 @@ __pycache__/
 
 # Per-environment connection config (may hold a work password) + TLS material
 .niflow.env
+# API keys (GOOGLE_API_KEY etc. — niflow.llm reads this)
+.env
 *.p12
 *.pfx
 certs/

@@ -16,7 +16,126 @@ from niflow.rest.common import (
 )
 
 
+# Canvas component kinds tidy_group re-positions: flow-listing key ->
+# (REST endpoint, canvas box size in px — how the NiFi UI draws them).
+# Listed in the lane tie-break order place() should prefer.
+_CANVAS_KINDS = (
+    ("inputPorts", ("input-ports", (240.0, 48.0))),
+    ("processors", ("processors", (352.0, 128.0))),
+    ("funnels", ("funnels", (48.0, 48.0))),
+    ("processGroups", ("process-groups", (384.0, 176.0))),
+    ("remoteProcessGroups", ("remote-process-groups", (384.0, 176.0))),
+    ("outputPorts", ("output-ports", (240.0, 48.0))),
+)
+
+
 class OpsMixin:
+    def tidy_group(
+        self, group: str, layout: str = "horizontal", recurse: bool = True
+    ) -> int:
+        """Auto-arrange a live group's canvas along its connection graph.
+
+        One-click de-spaghettifier: every component is re-ranked by longest
+        path from the sources and rewritten over REST — ``"horizontal"``
+        marches left-to-right, ``"vertical"`` top-to-bottom — and connection
+        bend points are cleared so the lines re-route straight. Hand-placed
+        positions are deliberately overridden; that is the point. Returns the
+        number of components moved.
+        """
+        from niflow.layout import place
+
+        moved = 0
+        todo = [self.resolve_group(group)]
+        while todo:
+            gid = todo.pop()
+            flow = self._get_json(f"/flow/process-groups/{gid}")[
+                "processGroupFlow"
+            ]["flow"]
+
+            entities = {}  # component id -> (REST endpoint, entity)
+            nodes = []
+            sizes = {}
+            for key, (endpoint, size) in _CANVAS_KINDS:
+                for ent in flow.get(key, []):
+                    entities[ent["id"]] = (endpoint, ent)
+                    nodes.append(ent["id"])
+                    sizes[ent["id"]] = size
+            loose = []
+            for ent in flow.get("labels", []):
+                entities[ent["id"]] = ("labels", ent)
+                loose.append(ent["id"])
+                comp = ent.get("component") or {}
+                sizes[ent["id"]] = (comp.get("width") or 352.0,
+                                    comp.get("height") or 128.0)
+
+            def end_node(end: dict) -> str:
+                # A nested (or remote) group's port stands in for the group
+                # itself: its owning groupId is a node here, its port id isn't.
+                owner = end.get("groupId")
+                return end.get("id", "") if owner in (gid, None) else owner
+
+            edges = []
+            for conn in flow.get("connections", []):
+                comp = conn.get("component") or {}
+                edges.append(
+                    (end_node(comp.get("source") or {}),
+                     end_node(comp.get("destination") or {}))
+                )
+
+            for nid, (x, y) in place(nodes, edges, layout, loose, sizes).items():
+                endpoint, ent = entities[nid]
+                current = ent.get("position") or {}
+                if current.get("x") == x and current.get("y") == y:
+                    continue
+                self._request(
+                    "PUT",
+                    f"/{endpoint}/{ent['id']}",
+                    json={
+                        "revision": ent["revision"],
+                        "component": {"id": ent["id"],
+                                      "position": {"x": x, "y": y}},
+                        "disconnectedNodeAcknowledged": False,
+                    },
+                )
+                moved += 1
+
+            for conn in flow.get("connections", []):
+                if (conn.get("component") or {}).get("bends"):
+                    self._request(
+                        "PUT",
+                        f"/connections/{conn['id']}",
+                        json={
+                            "revision": conn["revision"],
+                            "component": {"id": conn["id"], "bends": []},
+                        },
+                    )
+
+            if recurse:
+                todo.extend(ent["id"] for ent in flow.get("processGroups", []))
+        return moved
+
+    def explain_status(self, group: str = "root",
+                       docs_dir: str = "docs/explanations") -> dict:
+        """Is the group's plain-English doc missing, current, or outdated?
+
+        See :mod:`niflow.explain`; no LLM needed for the check itself.
+        """
+        from niflow.explain import explanation_status
+
+        return explanation_status(self, group, docs_dir=docs_dir)
+
+    def explain_group(self, group: str = "root",
+                      docs_dir: str = "docs/explanations",
+                      recurse: bool = True, force: bool = False) -> List[dict]:
+        """Write plain-English walkthrough docs for a live group's subtree.
+
+        See :mod:`niflow.explain`; needs an LLM (``NIFLOW_LLM_URL``).
+        """
+        from niflow.explain import explain_group
+
+        return explain_group(self, group, docs_dir=docs_dir,
+                             recurse=recurse, force=force)
+
     def backup_group(self, group: str, name: Optional[str] = None) -> Path:
         """Snapshot a live group to ``.niflow-backups/`` (see :mod:`niflow.backup`).
 

@@ -423,6 +423,28 @@ def cmd_stop(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_explain(args: argparse.Namespace) -> int:
+    """Write plain-English walkthrough docs for a live group (needs an LLM)."""
+    results = _client().explain_group(
+        args.group, docs_dir=args.docs_dir,
+        recurse=not args.no_recurse, force=args.force,
+    )
+    for r in results:
+        print(f"{r['status']:>9}  {r['group']}  ({r['path']})")
+    written = sum(r["status"] == "generated" for r in results)
+    print(f"{written} document(s) written, {len(results) - written} untouched.")
+    return 0
+
+
+def cmd_tidy(args: argparse.Namespace) -> int:
+    layout = "vertical" if args.vertical else "horizontal"
+    moved = _client().tidy_group(
+        args.group, layout=layout, recurse=not args.no_recurse
+    )
+    print(f"Tidied {args.group!r} ({layout}): moved {moved} component(s).")
+    return 0
+
+
 # --------------------------------------------------------------------- main
 
 
@@ -565,6 +587,36 @@ def main(argv: Optional[list] = None) -> int:
     p = sub.add_parser("start", help="Enable services and start a process group")
     p.add_argument("group")
     p.set_defaults(func=cmd_start)
+
+    p = sub.add_parser(
+        "explain",
+        help="Write a plain-English walkthrough of a live group to "
+        "docs/explanations/ (needs an LLM — set NIFLOW_LLM_URL + _MODEL)",
+    )
+    p.add_argument("group", nargs="?", default="root",
+                   help="Group name, a/b path, id, or 'root' (default: root)")
+    p.add_argument("--docs-dir", default="docs/explanations",
+                   help="Where the .md documents live (default: docs/explanations)")
+    p.add_argument("--force", action="store_true",
+                   help="Regenerate even when the doc is up to date")
+    p.add_argument("--no-recurse", action="store_true",
+                   help="Only this group's document, not nested groups'")
+    p.set_defaults(func=cmd_explain)
+
+    p = sub.add_parser(
+        "tidy",
+        help="Auto-arrange a live group's canvas along its connections",
+    )
+    p.add_argument("group", help="Group name, a/b path, id, or 'root'")
+    p.add_argument(
+        "--vertical", action="store_true",
+        help="Flow top-to-bottom instead of left-to-right",
+    )
+    p.add_argument(
+        "--no-recurse", action="store_true",
+        help="Only this group's canvas, not nested groups",
+    )
+    p.set_defaults(func=cmd_tidy)
 
     p = sub.add_parser("stop", help="Stop a process group")
     p.add_argument("group")

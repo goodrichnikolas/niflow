@@ -8,11 +8,22 @@
 # NiFi logs in as admin / adminpassword123. The registries are unsecured HTTP
 # (local dev only) and are reached from the NiFi containers by service name
 # (http://registry:18080 / http://registry1:18080) when you add a registry client.
+# NiFi logs stdout very chattily (a failing processor can loop at ERROR level),
+# and Docker's json-file driver does not rotate by default — cap every service
+# so a bad night can't fill the disk again.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "3"
+    compress: "true"
+
 services:
   # NiFi 1.24.0 — mirrors the work environment (1.24/1.28 line). Opt-in via
   # the "v1" profile so the default `docker compose up` stays 2.x-only.
   nifi1:
     image: apache/nifi:1.24.0
+    logging: *default-logging
     container_name: niflow-nifi1
     profiles: ["v1"]
     ports:
@@ -37,6 +48,7 @@ services:
   # version-line sensitive, so each NiFi talks to a registry on its own version.
   registry1:
     image: apache/nifi-registry:1.24.0
+    logging: *default-logging
     container_name: niflow-registry1
     profiles: ["v1"]
     ports:
@@ -54,6 +66,7 @@ services:
   # Identity: CN=niflow-client (the generated client cert) is initial admin.
   nifi-mtls:
     image: apache/nifi:1.24.0
+    logging: *default-logging
     container_name: niflow-nifi-mtls
     profiles: ["mtls"]
     ports:
@@ -83,6 +96,7 @@ services:
 
   nifi:
     image: apache/nifi:2.7.2
+    logging: *default-logging
     container_name: niflow-nifi
     ports:
       - "8443:8443"
@@ -109,6 +123,7 @@ services:
   # NiFi Registry paired with the default 2.7.2 line.
   registry:
     image: apache/nifi-registry:2.7.2
+    logging: *default-logging
     container_name: niflow-registry
     ports:
       - "18080:18080"

@@ -113,6 +113,10 @@ class PlanApplier:
         # Processors/ports stopped by us that were running: (kind, id).
         self.to_restart: List[Tuple[str, str]] = []
 
+        # Target major version, resolved on first use (properties are keyed
+        # differently on the 1.x line — see niflow.processors.rules).
+        self._target_major: int | None = None
+
         self._index_group(live, ())
         self._index_desired(desired, ())
 
@@ -601,11 +605,23 @@ class PlanApplier:
     # --- processors
 
     def _processor_config(self, proc: Processor) -> dict:
-        from niflow.processors.rules import canonical_properties
+        from niflow.processors.rules import canonical_properties, properties_for_target
 
+        if self._target_major is None:
+            self._target_major = self.client._major_version()
+        translated, unsupported = properties_for_target(
+            proc.type,
+            canonical_properties(proc.type, proc.properties),
+            self._target_major,
+        )
+        for key in unsupported:
+            logger.warning(
+                "%s: property %r does not exist on NiFi %d.x — unsetting it on the target",
+                proc.name, key, self._target_major,
+            )
         properties = {
             k: (self._service_id(v) if isinstance(v, ControllerService) else v)
-            for k, v in canonical_properties(proc.type, proc.properties).items()
+            for k, v in translated.items()
         }
         return {
             "properties": properties,
