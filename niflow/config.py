@@ -89,7 +89,10 @@ class NiFiConfig(BaseModel):
             for key, raw in _parse_env_file(path).items():
                 field = _KEYS.get(key)
                 if field is None:
-                    logger.warning("%s: unknown key %r ignored", path, key)
+                    # NIFLOW_LLM_* lives in the same file but belongs to
+                    # niflow.llm, which reads it itself.
+                    if not key.startswith("NIFLOW_LLM_"):
+                        logger.warning("%s: unknown key %r ignored", path, key)
                     continue
                 data[field] = _coerce(field, raw)
             logger.info("Loaded connection config from %s", path)

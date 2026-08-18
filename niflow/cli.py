@@ -9,6 +9,7 @@ The day-to-day loop against a live NiFi (1.x or 2.x)::
     niflow validate flows/my_flow.py [--live]  # rulebook check (+ NiFi's own, sandboxed)
     niflow plan flows/my_flow.py               # semantic "what will change"
     niflow test flows/my_flow.py               # inject FlowFiles, assert what comes out
+    niflow trace <flowfile-uuid>               # follow one file hop by hop (attr diffs)
     niflow push flows/my_flow.py --update      # apply only the delta in place
     niflow rollback "My Flow (copy)"           # undo from the automatic backup
     niflow diff flows/my_flow.py               # raw JSON diff vs the live group
@@ -423,6 +424,51 @@ def cmd_stop(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_explain(args: argparse.Namespace) -> int:
+    """Write plain-English walkthrough docs for a live group (needs an LLM)."""
+    results = _client().explain_group(
+        args.group, docs_dir=args.docs_dir,
+        recurse=not args.no_recurse, force=args.force,
+    )
+    for r in results:
+        print(f"{r['status']:>9}  {r['group']}  ({r['path']})")
+    written = sum(r["status"] == "generated" for r in results)
+    print(f"{written} document(s) written, {len(results) - written} untouched.")
+    return 0
+
+
+def cmd_trace(args: argparse.Namespace) -> int:
+    """Print one FlowFile's provenance journey, hop by hop."""
+    trace = _client().trace_flowfile(args.uuid)
+    hops = trace["hops"]
+    if not hops:
+        print(f"No provenance events for {args.uuid} — wrong UUID, or the "
+              "events have aged out of the provenance repository.")
+        return 1
+    for i, hop in enumerate(hops, 1):
+        rel = f" -> {hop['relationship']}" if hop["relationship"] else ""
+        print(f"{i:>3}. {hop['component'] or '(flow)'}  "
+              f"[{hop['event_type']}{rel}]  {hop['time']}  {hop['size']} B")
+        for change in hop["changes"]:
+            before = "(new)" if change["before"] is None else change["before"]
+            print(f"       {change['name']}: {before} -> {change['after']}")
+        if args.full:
+            for name, value in sorted(hop["attributes"].items()):
+                print(f"       = {name}: {value}")
+        for child in hop["children"]:
+            print(f"       spawned {child}  (niflow trace {child})")
+    return 0
+
+
+def cmd_tidy(args: argparse.Namespace) -> int:
+    layout = "vertical" if args.vertical else "horizontal"
+    moved = _client().tidy_group(
+        args.group, layout=layout, recurse=not args.no_recurse
+    )
+    print(f"Tidied {args.group!r} ({layout}): moved {moved} component(s).")
+    return 0
+
+
 # --------------------------------------------------------------------- main
 
 
@@ -566,9 +612,48 @@ def main(argv: Optional[list] = None) -> int:
     p.add_argument("group")
     p.set_defaults(func=cmd_start)
 
+    p = sub.add_parser(
+        "explain",
+        help="Write a plain-English walkthrough of a live group to "
+        "docs/explanations/ (needs an LLM — set NIFLOW_LLM_URL + _MODEL)",
+    )
+    p.add_argument("group", nargs="?", default="root",
+                   help="Group name, a/b path, id, or 'root' (default: root)")
+    p.add_argument("--docs-dir", default="docs/explanations",
+                   help="Where the .md documents live (default: docs/explanations)")
+    p.add_argument("--force", action="store_true",
+                   help="Regenerate even when the doc is up to date")
+    p.add_argument("--no-recurse", action="store_true",
+                   help="Only this group's document, not nested groups'")
+    p.set_defaults(func=cmd_explain)
+
+    p = sub.add_parser(
+        "tidy",
+        help="Auto-arrange a live group's canvas along its connections",
+    )
+    p.add_argument("group", help="Group name, a/b path, id, or 'root'")
+    p.add_argument(
+        "--vertical", action="store_true",
+        help="Flow top-to-bottom instead of left-to-right",
+    )
+    p.add_argument(
+        "--no-recurse", action="store_true",
+        help="Only this group's canvas, not nested groups",
+    )
+    p.set_defaults(func=cmd_tidy)
+
     p = sub.add_parser("stop", help="Stop a process group")
     p.add_argument("group")
     p.set_defaults(func=cmd_stop)
+
+    p = sub.add_parser(
+        "trace",
+        help="Follow one FlowFile's provenance journey with per-hop attribute diffs",
+    )
+    p.add_argument("uuid", help="FlowFile UUID (from a queue listing, bulletin, or log)")
+    p.add_argument("--full", action="store_true",
+                   help="Show every attribute at every hop, not just what changed")
+    p.set_defaults(func=cmd_trace)
 
     args = parser.parse_args(argv)
     try:

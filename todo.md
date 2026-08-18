@@ -165,3 +165,72 @@ Implements the top of the "how would you make this better" critique.
       (stdlib, remote-friendly); the Qt helper stays as the desktop fallback.
 - [x] `niflow diagram` renders flows as Mermaid flowcharts (subgraphs per group,
       relationship-labelled edges, `--all` for a directory) — GitHub draws them inline.
+
+## Torture-flow findings (2026-08-14) — flows/torture.py, round one
+Adversarial fixture pushed to 2.7.2; the pull side survived everything (hostile
+strings, retry config, DISABLED state, self-loops, cross-group wiring all
+round-trip, and pull→diff→plan converges to zero). The push/identity side did not.
+
+Root cause for most of it: UUID5 identity seeds (json_format._assign_identifiers)
+collapse distinct components — connection seed is (name, src, dst) with no
+relationships and no occurrence index; processors/groups seed on name alone.
+
+- [x] **P0 — silent data loss on push.** *(fixed 2026-08-14)* Same-named siblings
+      collapsed; 14 of 16 unnamed parallel Fanout→funnel edges dropped; cross-group
+      connection endpoints hashed as "" (assignment order). Fix: two-pass identifier
+      assignment (components across the whole tree, then connections); connection
+      seeds now include sorted relationships + an occurrence index for exact
+      duplicates; every named seed is claim-checked and same-kind name duplicates
+      raise IdentityCollisionError instead of merging. Duplicates are also caught
+      earlier: `find_identity_collisions` (core) runs in validate, plan_flow, and
+      push_flow *before any live mutation* (previously to_json ran after teardown —
+      an emit error would have destroyed the live group). Tests: tests/test_identity.py.
+      Note: connection UUID5s changed once (relationships joined the seed) — the
+      next VC push of an existing flow recreates its connections (queues were
+      emptied by in-place rebuild anyway); incremental push is unaffected (no UUID5s).
+- [x] **P0 — `push --update` crashed mid-apply, non-atomic.** *(fixed 2026-08-14)*
+      Actual trigger was duplicate sibling "Stage" groups (path resolution picked the
+      first), now rejected at plan time. Beyond that, PlanApplier now (a) preflights
+      every planned connection endpoint against the desired model before the first
+      REST mutation, (b) restarts whatever it stopped even when a change fails
+      (finally), and (c) raises ApplyError reporting exactly N-of-M applied, which
+      push_update enriches with the pre-push backup path + `niflow rollback` hint.
+      Tests: tests/test_apply_unit.py (failure-containment section).
+- [ ] **P1 — plan/apply never converges on parallel edges:** same-endpoint
+      connections are paired arbitrarily, so plans "rotate" them (cold path →
+      hot path clone → cold to second worker → …) and re-apply forever. Second
+      consecutive plan still showed 33 ops.
+- [x] **P1 — property-name aliasing causes phantom drift.** *(fixed 2026-08-15)*
+      `rules.canonical_properties(type, props)` rewrites display-name keys
+      (harvested: descriptors now carry `display`, catalog gained a
+      `PROPERTY_NAMES` table) and curated 1.x→2.x legacy keys
+      (`LEGACY_PROPERTY_ALIASES`: record-reader/writer, generate-ff-custom-text,
+      "Regular Expression"→"Search Value", …) to the server's canonical names.
+      Guards: ambiguous display names (CopyS3Object's two "Bucket"s) untouched,
+      legacy alias only when the type lacks the old key AND has the new one (so
+      1.x catalogs are safe), never clobbers an explicitly-set canonical key,
+      unharvested types pass through. Applied in the differ, the JSON emitter,
+      the incremental applier, and validate. Tests:
+      tests/test_property_canonicalization.py.
+- [x] **P1 — NiFi-populated defaults show as drift.** *(fixed 2026-08-15)*
+      `plan._diff_properties` now compares *effective* values: an unset side
+      takes the harvested descriptor default, so live-materialised defaults no
+      longer plan as `'…' -> None` (a genuinely non-default live value still
+      unsets). Live proof: `niflow plan flows/torture.py` against the running
+      group dropped from property drift on every processor to ZERO
+      `properties[…]` lines — remaining ops are the parallel-edge P1 above.
+- [ ] **P2 — `niflow validate` false-positives on dynamic relationships:**
+      RouteOnAttribute dynamic properties ARE relationships; 27 bogus errors on a
+      valid flow. (Bonus done 2026-08-15: validate now flags PRIMARY-node +
+      incoming connection, which NiFi rejects — torture flow's Cron 'audit' is
+      the live repro, kept invalid on purpose. Tests in test_validate.py.)
+- [ ] **P2 — funnel identity is ordinal** (was line 98's "fine for now"): local
+      declaration order vs server list order mismatch produced phantom funnel
+      connection churn in `diff` right after a clean push.
+- [ ] **P2 — autoTerminatedRelationships order-sensitive in diff** — sort both
+      sides before comparing.
+
+Repro state: flows/torture.py now uses unique names (duplicates are rejected by
+design; that behaviour is locked in tests/test_identity.py). The half-applied
+live NiflowTorture group from round one was deleted and re-pushed clean after
+the P0 fixes.

@@ -12,6 +12,8 @@ from niflow.client import NiFiClient
 from niflow.config import NiFiConfig
 from niflow.doctor import FAIL, run_checks
 
+from conftest import _nifi_reachable
+
 CONFIG = Path("certs/mtls/niflow.env")
 
 pytestmark = [
@@ -30,9 +32,14 @@ def config() -> NiFiConfig:
         if key.startswith("NIFLOW_NIFI_"):
             mp.delenv(key)
     try:
-        return NiFiConfig.from_env(str(CONFIG))
+        cfg = NiFiConfig.from_env(str(CONFIG))
     finally:
         mp.undo()
+    # The config file survives `make nifi-mtls-down` (and reboots), so gate
+    # on the server actually being up, not just the file existing.
+    if not _nifi_reachable(cfg):
+        pytest.skip(f"mTLS NiFi not reachable at {cfg.host} (run `make nifi-mtls-up`)")
+    return cfg
 
 
 @pytest.fixture(scope="module", autouse=True)

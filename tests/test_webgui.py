@@ -23,9 +23,17 @@ class FakeClient:
         return [{"id": "p1", "name": "Gen", "type": "org.x.G", "state": "RUNNING",
                  "path": "", "group_id": "root"}]
 
+    def walk_groups(self):
+        yield "Torture", {"id": "g1", "name": "Torture"}
+        yield "Torture/Stage", {"id": "g2", "name": "Stage"}
+
     def list_queues(self):
         return [{"id": "c1", "source": "Gen", "destination": "Log", "path": "",
                  "queued": 2, "queued_label": "2 / 14 bytes"}]
+
+    def run_queue_endpoint_once(self, conn_id, which):
+        self.ops.append(("queue_run_once", conn_id, which))
+        return "Log" if which == "destination" else "Gen"
 
     def bulletins(self, limit=100):
         return []
@@ -40,6 +48,14 @@ class FakeClient:
     def flowfile_detail(self, connection_id, uuid):
         return {"attributes": {"filename": "f.txt"}, "content": "hello"}
 
+    def trace_flowfile(self, uuid, max_events=100):
+        self.ops.append(("trace", uuid))
+        return {"uuid": uuid, "hops": [{"event_id": 10, "component": "Update"}]}
+
+    def event_content(self, event_id, direction="output"):
+        self.ops.append(("event_content", event_id, direction))
+        return "payload"
+
     def run_processor_once(self, proc_id):
         self.ops.append(("run_once", proc_id))
 
@@ -52,9 +68,24 @@ class FakeClient:
     def stop_group(self, group):
         self.ops.append(("stop_group", group))
 
+    def tidy_group(self, group, layout="horizontal", recurse=True):
+        self.ops.append(("tidy", group, layout, recurse))
+        return 7
+
     def quiesce_group(self, group):
         self.ops.append(("quiesce", group))
         return "2 / 14 bytes"
+
+    def explain_status(self, group="root", docs_dir="docs/explanations"):
+        self.ops.append(("explain_status", group))
+        return {"group": group, "configured": True, "exists": False,
+                "outdated": False, "generated": None, "model": None,
+                "path": "docs/explanations/x.md", "doc": None}
+
+    def explain_group(self, group="root", docs_dir="docs/explanations",
+                      recurse=True, force=False):
+        self.ops.append(("explain", group, recurse, force))
+        return [{"group": group, "status": "generated", "path": "x.md"}]
 
 
 def _call(client, method, path, query=None, body=None, flows_dir=Path("flows")):
@@ -66,6 +97,8 @@ def test_about_and_listings():
     assert _call(client, "GET", "/api/about")[1]["version"] == "1.24.0"
     assert _call(client, "GET", "/api/processors")[1][0]["name"] == "Gen"
     assert _call(client, "GET", "/api/queues")[1][0]["queued"] == 2
+    assert _call(client, "GET", "/api/groups")[1] == [
+        {"id": "g1", "path": "Torture"}, {"id": "g2", "path": "Torture/Stage"}]
     assert _call(client, "GET", "/api/errors")[1][0]["name"] == "Lonely"
 
 
@@ -75,6 +108,42 @@ def test_processor_actions_route_to_client():
         status, payload = _call(client, "POST", f"/api/processors/p1/{action}")
         assert status == 200 and payload["ok"]
     assert [op for op, _ in client.ops] == ["run_once", "start", "stop"]
+
+
+def test_queue_run_once_routes_to_endpoint():
+    client = FakeClient()
+    status, payload = _call(client, "POST", "/api/queues/c1/run-destination-once")
+    assert status == 200 and payload["ran"] == "Log"
+    status, payload = _call(client, "POST", "/api/queues/c1/run-source-once")
+    assert status == 200 and payload["ran"] == "Gen"
+    assert client.ops == [("queue_run_once", "c1", "destination"),
+                          ("queue_run_once", "c1", "source")]
+    status, payload = _call(client, "POST", "/api/queues/c1/frobnicate")
+    assert status == 404
+
+
+def test_tidy_passes_scope_and_direction():
+    client = FakeClient()
+    status, payload = _call(client, "POST", "/api/tidy",
+                            body={"group": "Torture", "layout": "vertical"})
+    assert status == 200 and payload["moved"] == 7
+    status, payload = _call(client, "POST", "/api/tidy",
+                            body={"group": "root", "recurse": False})
+    assert status == 200
+    assert client.ops == [("tidy", "Torture", "vertical", True),
+                          ("tidy", "root", "horizontal", False)]
+
+
+def test_explain_routes_pass_scope_and_flags():
+    client = FakeClient()
+    status, payload = _call(client, "GET", "/api/explain",
+                            query={"group": ["Torture"]})
+    assert status == 200 and payload["configured"] and not payload["exists"]
+    status, payload = _call(client, "POST", "/api/explain",
+                            body={"group": "Torture", "force": True, "recurse": False})
+    assert status == 200 and payload["ok"]
+    assert payload["results"][0]["status"] == "generated"
+    assert ("explain", "Torture", False, True) in client.ops
 
 
 def test_group_drain_reports_dropped():
@@ -90,6 +159,19 @@ def test_flowfile_drilldown():
     _, detail = _call(client, "GET", "/api/flowfile",
                       query={"connection_id": ["c1"], "uuid": ["u1"]})
     assert detail["content"] == "hello"
+
+
+def test_trace_routes():
+    client = FakeClient()
+    status, payload = _call(client, "GET", "/api/trace", query={"uuid": ["u1"]})
+    assert status == 200 and payload["hops"][0]["component"] == "Update"
+    status, payload = _call(client, "GET", "/api/trace/content",
+                            query={"event_id": ["10"], "direction": ["input"]})
+    assert status == 200 and payload["content"] == "payload"
+    # direction defaults to output when the page doesn't say
+    _call(client, "GET", "/api/trace/content", query={"event_id": ["10"]})
+    assert client.ops == [("trace", "u1"), ("event_content", "10", "input"),
+                          ("event_content", "10", "output")]
 
 
 def test_unknown_route_404s_and_errors_are_json():

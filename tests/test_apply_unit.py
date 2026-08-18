@@ -301,3 +301,52 @@ def test_variable_registry_update_is_applied_on_1x():
     assert "DELETE /process-groups/root-live/variable-registry/update-requests/vr1" in (
         " ".join(client.ops)
     ) or any("update-requests/vr1" in op for op in client.ops)
+
+
+# --- failure containment (torture-flow round one, P0) ------------------------
+
+
+def test_partial_failure_raises_apply_error_with_progress():
+    """A mid-sequence failure must say how far it got and still restart
+    whatever the applier stopped along the way."""
+    import pytest
+
+    from niflow.apply import ApplyError
+
+    live, desired = _pair()
+    live.processors[1].nifi_id = None  # Log has no live id -> remove will fail
+    del desired.processors[1]
+    del desired.connections[0]
+    client = FakeClient()
+    client.seed_processor("p-gen", state="RUNNING")
+    client.seed_connection(
+        "c-1",
+        {"id": "p-gen", "type": "PROCESSOR"},
+        {"id": "p-log", "type": "PROCESSOR"},
+    )
+    changes = diff_flows(live, desired)
+    with pytest.raises(ApplyError) as info:
+        PlanApplier(client, "root-pg", live, desired).apply(changes)
+    err = info.value
+    assert err.applied == 1 and err.remaining == 1
+    assert "remove processor" in str(err) and "1 of 2" in str(err)
+    # The connection removal went through before the failure...
+    assert "DELETE /connections/c-1" in client.ops
+    # ...and Gen, stopped to drain that connection, was restarted anyway.
+    assert client.ops[-1] == "run-status p-gen -> RUNNING"
+
+
+def test_preflight_rejects_dangling_endpoint_before_any_mutation():
+    import pytest
+
+    from niflow.apply import ApplyError
+    from niflow.core import Processor as P
+
+    live, desired = _pair()
+    rogue = P(name="Rogue", type="org.x.G")  # never added to the desired tree
+    desired.add_connection(desired.processors[1].to(rogue))
+    client = FakeClient()
+    changes = diff_flows(live, desired)
+    with pytest.raises(ApplyError, match="nothing was changed"):
+        PlanApplier(client, "root-pg", live, desired).apply(changes)
+    assert client.ops == []

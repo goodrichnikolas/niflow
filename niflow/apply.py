@@ -70,6 +70,26 @@ _STAGE = {
 _PORT_ENDPOINT = {"input_port": "input-ports", "output_port": "output-ports"}
 
 
+class ApplyError(RuntimeError):
+    """An incremental apply failed partway through (or refused to start).
+
+    The apply is a sequence of REST calls with no transaction around it, so
+    a mid-sequence failure leaves the live group between states. This error
+    says exactly how far it got; ``hint`` is filled in by the caller that
+    owns the pre-push backup (push_update) with the rollback command.
+    """
+
+    def __init__(self, message: str, *, applied: int = 0, remaining: int = 0):
+        super().__init__(message)
+        self.applied = applied
+        self.remaining = remaining
+        self.hint: str = ""
+
+    def __str__(self) -> str:
+        base = super().__str__()
+        return f"{base} {self.hint}" if self.hint else base
+
+
 class PlanApplier:
     """Applies a plan produced by :func:`niflow.plan.diff_flows`."""
 
@@ -92,6 +112,10 @@ class PlanApplier:
         self.desired_service_paths: Dict[int, Tuple[Tuple[str, ...], str]] = {}
         # Processors/ports stopped by us that were running: (kind, id).
         self.to_restart: List[Tuple[str, str]] = []
+
+        # Target major version, resolved on first use (properties are keyed
+        # differently on the 1.x line — see niflow.processors.rules).
+        self._target_major: int | None = None
 
         self._index_group(live, ())
         self._index_desired(desired, ())
@@ -131,16 +155,62 @@ class PlanApplier:
         ordered = sorted(
             changes, key=lambda c: (_STAGE.get((c.op, c.kind), 99), len(c.path))
         )
-        for change in ordered:
-            handler = getattr(self, f"_{change.op}_{change.kind}", None)
-            if handler is None:
-                logger.warning(
-                    "No applier for %s %s (%s) — skipped", change.op, change.kind, change.name
-                )
+        self._preflight(ordered)
+        applied = 0
+        change = None
+        try:
+            for change in ordered:
+                handler = getattr(self, f"_{change.op}_{change.kind}", None)
+                if handler is None:
+                    logger.warning(
+                        "No applier for %s %s (%s) — skipped", change.op, change.kind, change.name
+                    )
+                    continue
+                logger.info("%s %s %s: %s", change.op, change.kind, change.location, change.name)
+                handler(change)
+                applied += 1
+        except Exception as exc:
+            remaining = len(ordered) - applied
+            raise ApplyError(
+                f"apply failed on '{change.op} {change.kind} "
+                f"{change.location}: {change.name}': {exc} — {applied} of "
+                f"{len(ordered)} change(s) were applied before the failure, "
+                f"{remaining} were not; the live group is part-way between "
+                f"states.",
+                applied=applied,
+                remaining=remaining,
+            ) from exc
+        finally:
+            # Whatever happened, put back what we stopped — a failed apply
+            # must not additionally leave running components stopped.
+            self._restart_stopped()
+
+    def _preflight(self, changes: List[Change]) -> None:
+        """Resolve everything resolvable from the model before mutating.
+
+        Every planned connection endpoint must locate its component in the
+        desired tree (a pure in-memory lookup). Catching a dangling endpoint
+        here means a doomed plan fails before the first REST mutation
+        instead of partway through.
+        """
+        problems: List[str] = []
+        for change in changes:
+            if change.op != "add" or change.kind != "connection":
                 continue
-            logger.info("%s %s %s: %s", change.op, change.kind, change.location, change.name)
-            handler(change)
-        self._restart_stopped()
+            conn: Connection = change.desired
+            for component in (conn.source, conn.target):
+                try:
+                    self._owner_of(component, change.path)
+                except KeyError as exc:
+                    problems.append(f"{change.location}: {change.name}: {exc.args[0]}")
+        if problems:
+            raise ApplyError(
+                "refusing to apply: planned connection endpoints cannot be "
+                "resolved in the desired model (nothing was changed):\n  "
+                + "\n  ".join(problems),
+                applied=0,
+                remaining=len(changes),
+            )
 
     # ------------------------------------------------------- state plumbing
 
@@ -535,9 +605,23 @@ class PlanApplier:
     # --- processors
 
     def _processor_config(self, proc: Processor) -> dict:
+        from niflow.processors.rules import canonical_properties, properties_for_target
+
+        if self._target_major is None:
+            self._target_major = self.client._major_version()
+        translated, unsupported = properties_for_target(
+            proc.type,
+            canonical_properties(proc.type, proc.properties),
+            self._target_major,
+        )
+        for key in unsupported:
+            logger.warning(
+                "%s: property %r does not exist on NiFi %d.x — unsetting it on the target",
+                proc.name, key, self._target_major,
+            )
         properties = {
             k: (self._service_id(v) if isinstance(v, ControllerService) else v)
-            for k, v in proc.properties.items()
+            for k, v in translated.items()
         }
         return {
             "properties": properties,

@@ -202,6 +202,45 @@ How often a processor runs:
 (niflow's "Run File" button stops a source `GenerateFlowFile` and triggers it for
 exactly **one** scheduling pass via `RUN_ONCE` — one FlowFile per click.)
 
+### Execution Node — and why "Primary Node Only" is sources-only
+In a **cluster**, every node runs its own copy of the whole flow. That's usually
+what you want — more nodes, more throughput — but it's a disaster for some
+*sources*: three nodes all running `ListFile` against the same shared directory
+would ingest every file **three times**. The fix is the processor's **Execution
+Node** setting:
+
+- **All nodes** (default) — the processor runs everywhere.
+- **Primary node** — it runs only on the one node the cluster has elected
+  *primary*, so a listing/polling source produces each item exactly once.
+
+**The rule that bit us:** NiFi refuses "Primary Node Only" on any processor with
+an **incoming connection** — the validation error reads *"'Execution Node' is
+invalid because Processors with incoming connections cannot be scheduled for
+Primary Node Only."* The processor sits invalid (⚠) and won't start.
+
+Why the rule exists: a connection's queue is **local to each node** — FlowFiles
+live in the node's own repositories and don't teleport between nodes. If a
+mid-flow processor ran primary-only, FlowFiles queued on the *other* nodes would
+sit in front of a processor that never runs there — stranded forever. Only a
+processor with no inputs (a source) can safely run on one node, because there's
+nothing queued for it anywhere else. (The cluster-friendly way to funnel work
+onto fewer nodes mid-flow is the **connection's** load-balance strategy, e.g.
+"Single node" — the queue itself moves the data, which primary-only scheduling
+can't do.)
+
+Two corollaries worth knowing:
+- The primary node can **change** (election on node loss). Primary-only sources
+  simply resume on the new primary — with their **component state** (e.g.
+  `ListFile`'s "already seen" list) shared via ZooKeeper so the handoff doesn't
+  re-ingest everything.
+- On a **standalone** NiFi the setting is accepted and effectively meaningless —
+  but the incoming-connection rule is enforced *everywhere*, standalone included.
+  That's how the torture flow's `Cron 'audit'` (funnel → PRIMARY-scheduled
+  `LogAttribute`) got stuck invalid on a single-node dev box.
+
+`niflow validate` now catches this combination statically (execution node
+`PRIMARY` + any incoming connection) before a push ever reaches the server.
+
 ### Data Provenance
 NiFi records **every event** in a FlowFile's life — created, cloned, modified,
 sent, dropped — with full lineage. You can pick any FlowFile and replay its entire

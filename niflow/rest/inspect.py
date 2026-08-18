@@ -121,6 +121,22 @@ class InspectMixin:
         self.stop_processor(proc_id)
         self._set_processor_state(proc_id, "RUN_ONCE")
 
+    def run_queue_endpoint_once(self, conn_id: str, which: str) -> str:
+        """Run-once the processor at one end of a queue; returns its name.
+
+        ``which`` is ``"source"`` (feeds the queue) or ``"destination"``
+        (consumes it) — the queue-centric view of :meth:`run_processor_once`.
+        Resolved per call because queue listings come from the status
+        snapshot, which carries endpoint names but not ids. Raises when that
+        end isn't a processor (funnels and ports have no run-once).
+        """
+        end = self._get_json(f"/connections/{conn_id}")["component"].get(which) or {}
+        if end.get("type") != "PROCESSOR":
+            kind = (end.get("type") or "unknown").replace("_", " ").lower()
+            raise NiFiApiError(400, f"the queue's {which} is a {kind}, not a processor")
+        self.run_processor_once(end["id"])
+        return end.get("name", "")
+
     def set_port_state(self, kind: str, port_id: str, state: str) -> None:
         """Start/stop one port. ``kind`` is ``input_port`` or ``output_port``."""
         endpoint = "input-ports" if kind == "input_port" else "output-ports"
@@ -330,15 +346,10 @@ class InspectMixin:
             return f"(content unavailable: {exc})"
         return getattr(resp, "text", "") or ""
 
-    def recent_events(self, component_id: str, max_results: int = 25) -> List[dict]:
-        """Recent provenance events for a component, newest first.
-
-        Mirrors "View data provenance" on a processor — the click-path this is
-        meant to replace — scoped to one component via a provenance query
-        (create → poll → delete).
-        """
+    def _provenance_query(self, search_terms: dict, max_results: int, what: str) -> List[dict]:
+        """Run one async provenance query (create → poll → delete); raw DTOs."""
         body = {"provenance": {"request": {
-            "searchTerms": {"ProcessorID": {"value": component_id, "inverse": False}},
+            "searchTerms": search_terms,
             "maxResults": max_results,
             "summarize": True,
         }}}
@@ -348,12 +359,24 @@ class InspectMixin:
             deadline = time.monotonic() + _POLL_TIMEOUT_S
             while not prov.get("finished"):
                 if time.monotonic() > deadline:
-                    raise NiFiApiError(408, f"provenance query for {component_id} timed out")
+                    raise NiFiApiError(408, f"provenance query for {what} timed out")
                 time.sleep(_POLL_INTERVAL_S)
                 prov = self._get_json(f"/provenance/{prov_id}")["provenance"]
-            events = ((prov.get("results") or {}).get("provenanceEvents")) or []
+            return ((prov.get("results") or {}).get("provenanceEvents")) or []
         finally:
             self._request("DELETE", f"/provenance/{prov_id}")
+
+    def recent_events(self, component_id: str, max_results: int = 25) -> List[dict]:
+        """Recent provenance events for a component, newest first.
+
+        Mirrors "View data provenance" on a processor — the click-path this is
+        meant to replace — scoped to one component via a provenance query
+        (create → poll → delete).
+        """
+        events = self._provenance_query(
+            {"ProcessorID": {"value": component_id, "inverse": False}},
+            max_results, component_id,
+        )
         return [
             {
                 "event_id": e["eventId"],
@@ -383,3 +406,67 @@ class InspectMixin:
                 f"/provenance-events/{event_id}/content/output", size
             ),
         }
+
+    def trace_flowfile(self, uuid: str, max_events: int = 100) -> dict:
+        """One FlowFile's provenance journey as ordered hops with attribute diffs.
+
+        Events come from a ``FlowFileUUID`` provenance query, oldest first
+        (event ids are monotonic, event *times* are lossy strings). The trace
+        is uuid-scoped: a fork/clone child has its own uuid, so each hop
+        carries ``parents``/``children`` for callers to jump traces along a
+        branch instead of silently merging them.
+
+        Per hop: the post-event ``attributes``, the ``changes`` that event
+        made (``before`` is ``None`` for an attribute born there — NiFi omits
+        ``previousValue`` for those, and sends ``previousValue == value`` for
+        untouched ones), the ``relationship`` taken, and whether each payload
+        side is still fetchable via :meth:`event_content`.
+        """
+        events = self._provenance_query(
+            {"FlowFileUUID": {"value": uuid, "inverse": False}}, max_events, uuid
+        )
+        events.sort(key=lambda e: int(e["eventId"]))
+        hops = []
+        for summary in events[:max_events]:
+            ev = self._get_json(
+                f"/provenance-events/{summary['eventId']}"
+            )["provenanceEvent"]
+            attrs = ev.get("attributes") or []
+            hops.append({
+                "event_id": ev.get("eventId"),
+                "event_type": ev.get("eventType", ""),
+                "time": ev.get("eventTime", ""),
+                "component": ev.get("componentName", ""),
+                "component_id": ev.get("componentId", ""),
+                "component_type": ev.get("componentType", ""),
+                "relationship": ev.get("relationship") or "",
+                "size": ev.get("fileSizeBytes", 0) or 0,
+                "attributes": {a["name"]: a.get("value") for a in attrs},
+                "changes": [
+                    {"name": a["name"], "before": a.get("previousValue"),
+                     "after": a.get("value")}
+                    for a in attrs if a.get("previousValue") != a.get("value")
+                ],
+                "input_available": bool(ev.get("inputContentAvailable")),
+                "output_available": bool(ev.get("outputContentAvailable")),
+                "content_equal": ev.get("contentEqual"),
+                "parents": list(ev.get("parentUuids") or []),
+                "children": list(ev.get("childUuids") or []),
+            })
+        return {"uuid": uuid, "hops": hops}
+
+    def event_content(self, event_id, direction: str = "output") -> str:
+        """One side of a provenance event's payload; ``input`` or ``output``.
+
+        Returns ``""`` when the content repository no longer holds that claim
+        (NiFi ages claims out independently of the provenance index).
+        """
+        ev = self._get_json(f"/provenance-events/{event_id}")["provenanceEvent"]
+        if not ev.get(f"{direction}ContentAvailable"):
+            return ""
+        # fileSizeBytes describes the output side; the input size isn't in the
+        # DTO, so only the output fetch gets the zero-byte guard.
+        size = (ev.get("fileSizeBytes", 0) or 0) if direction == "output" else 1
+        return self._content(
+            f"/provenance-events/{event_id}/content/{direction}", size
+        )

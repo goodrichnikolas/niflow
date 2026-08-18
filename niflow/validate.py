@@ -26,8 +26,12 @@ from __future__ import annotations
 import re
 from typing import Dict, List, Set
 
-from niflow.core import Flow, ProcessGroup
-from niflow.processors.rules import descriptors_for, relationships_for
+from niflow.core import Flow, ProcessGroup, find_identity_collisions
+from niflow.processors.rules import (
+    canonical_properties,
+    descriptors_for,
+    relationships_for,
+)
 
 # Time-duration units NiFi accepts (FormatUtils). Generous on spelling so we
 # never flag a *valid* duration — the goal is catching obvious typos like
@@ -118,7 +122,9 @@ def _property_issues(proc, label: str) -> List[dict]:
     descriptors = descriptors_for(proc.type)
     if not descriptors:
         return []
-    props = proc.properties or {}
+    # Display-name keys ("Custom Text") count as setting the canonical
+    # property — the emitter rewrites them the same way at push time.
+    props = canonical_properties(proc.type, proc.properties or {})
     out: List[dict] = []
     for name, entry in descriptors.items():
         if not _dependency_active(entry, props):
@@ -140,14 +146,22 @@ def _property_issues(proc, label: str) -> List[dict]:
 
 def validate_flow(flow: Flow) -> List[dict]:
     """Return a list of ``{"component", "message"}`` issues, empty if clean."""
-    issues: List[dict] = []
+    issues: List[dict] = [
+        # Name-based identity means same-kind duplicates in one group would
+        # silently merge or clobber each other on push — always an error.
+        {"component": where, "message": message}
+        for where, message in find_identity_collisions(flow)
+    ]
 
     def visit(group: ProcessGroup, prefix: str) -> None:
         path = f"{prefix}/{group.name}" if prefix else group.name
 
-        # Relationships each component actually feeds out, by source identity.
+        # Relationships each component actually feeds out, by source identity,
+        # and which components have anything feeding *in*.
         used: Dict[int, Set[str]] = {}
+        has_incoming: Set[int] = set()
         for conn in group.connections:
+            has_incoming.add(id(conn.target))
             for rel in conn.relationships:
                 used.setdefault(id(conn.source), set()).add(rel)
 
@@ -155,6 +169,18 @@ def validate_flow(flow: Flow) -> List[dict]:
             label = f"{path}/{proc.name}"
             connected = used.get(id(proc), set())
             auto = set(proc.auto_terminate or [])
+
+            # NiFi only allows Primary-Node-Only scheduling on *source*
+            # processors; one with an incoming connection is live-invalid
+            # ("'Execution Node' is invalid because Processors with incoming
+            # connections cannot be scheduled for Primary Node Only.").
+            if proc.execution_node == "PRIMARY" and id(proc) in has_incoming:
+                issues.append({
+                    "component": label,
+                    "message": "execution node PRIMARY requires a source "
+                               "processor — NiFi rejects Primary Node Only on "
+                               "processors with incoming connections",
+                })
 
             for rel in sorted(connected & auto):
                 issues.append({

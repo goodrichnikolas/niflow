@@ -15,6 +15,7 @@ niflow plan flows/prod_flow.py               # semantic "what will change"
 niflow push flows/prod_flow.py --update      # apply just that delta in place
 niflow diff flows/prod_flow.py               # raw JSON diff vs the live canvas
 niflow test flows/prod_flow.py               # inject FlowFiles, assert what comes out
+niflow trace <flowfile-uuid>                 # replay one file's journey, attr diffs per hop
 niflow push flows/prod_flow.py --start       # or: full replace and start
 
 niflow pull --all -o flows/                  # mirror EVERY top-level group
@@ -243,7 +244,9 @@ make test-integration-v1             # integration tests against 1.24
 - **`niflow-web`** (`make webgui`) — browser-based helper on
   `http://127.0.0.1:7777`, zero extra dependencies: processor list with
   run-once/start/stop, queue browser with FlowFile attribute+content
-  inspection, bulletins/error panels, and plan-preview + incremental push for
+  inspection, a Trace tab that replays one FlowFile's provenance journey hop
+  by hop (attribute before/after, relationship taken, payload on demand),
+  bulletins/error panels, and plan-preview + incremental push for
   `flows/*.py`. Under WSL it opens the *Windows* default browser.
 - **`niflow-gui`** (`make gui`) — the PyQt6 desktop helper (`pip install -e
   ".[gui]"`), same capabilities as a native window.

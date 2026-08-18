@@ -41,6 +41,7 @@ from niflow.core import (
 )
 from niflow.layout import compute_layout
 from niflow.processors.bundles import default_bundle
+from niflow.processors.rules import canonical_properties
 
 # Standard UUID DNS namespace — used as the root for deterministic UUID5s so
 # generated identifiers don't collide with random NiFi-assigned ones.
@@ -449,45 +450,126 @@ def _emit_parameter_contexts(flow: Flow) -> dict:
     return out
 
 
+class IdentityCollisionError(ValueError):
+    """Two components hashed to the same deterministic identifier.
+
+    Emitting the snapshot anyway would make NiFi silently merge or drop one
+    of them (observed: same-named processors/groups vanishing on push), so
+    this is always a hard error.
+    """
+
+
 def _assign_identifiers(
     group: ProcessGroup,
     parent_path: Tuple[str, ...],
     identifiers: Dict[int, str],
 ) -> None:
-    """Recursively assign UUID5 identifiers to every component in ``group``.
+    """Assign UUID5 identifiers to every component in the tree.
 
     The seed for each UUID5 is a slash-joined string: ``"<kind>:<g1>/.../<own>"``
     where ``g1..gn`` are the group-name chain from root and ``<own>`` is the
     component's own name. This keeps re-emits byte-stable.
+
+    Two passes: components first across the *whole* tree, then connections —
+    a connection's seed embeds its endpoint identifiers, and an endpoint may
+    live in a child group whose components would otherwise not be assigned
+    yet (cross-group wiring to a child port).
     """
+    claimed: Dict[str, str] = {}
+    _assign_component_identifiers(group, parent_path, identifiers, claimed)
+    _assign_connection_identifiers(group, parent_path, identifiers, claimed)
+
+
+def _claim(
+    claimed: Dict[str, str],
+    identifiers: Dict[int, str],
+    component: Any,
+    kind: str,
+    path: Tuple[str, ...],
+    label: str,
+) -> None:
+    uid = _det_uuid(kind, path)
+    other = claimed.get(uid)
+    if other is not None:
+        raise IdentityCollisionError(
+            f"identity collision: {label} clashes with {other} — niflow "
+            f"identities are name-based within each group, so NiFi would "
+            f"silently merge or drop one of them; rename one and push again"
+        )
+    claimed[uid] = label
+    identifiers[id(component)] = uid
+
+
+def _assign_component_identifiers(
+    group: ProcessGroup,
+    parent_path: Tuple[str, ...],
+    identifiers: Dict[int, str],
+    claimed: Dict[str, str],
+) -> None:
     own_path = parent_path + (group.name,)
-    identifiers[id(group)] = _det_uuid("process_group", own_path)
+    where = "/".join(own_path)
+    _claim(claimed, identifiers, group, "process_group", own_path,
+           f"process group {where!r}")
 
     for service in group.controller_services:
-        identifiers[id(service)] = _det_uuid("controller_service", own_path + (service.name,))
+        _claim(claimed, identifiers, service, "controller_service",
+               own_path + (service.name,),
+               f"controller service {service.name!r} in {where!r}")
     for port in group.input_ports:
-        identifiers[id(port)] = _det_uuid("input_port", own_path + (port.name,))
+        _claim(claimed, identifiers, port, "input_port", own_path + (port.name,),
+               f"input port {port.name!r} in {where!r}")
     for port in group.output_ports:
-        identifiers[id(port)] = _det_uuid("output_port", own_path + (port.name,))
+        _claim(claimed, identifiers, port, "output_port", own_path + (port.name,),
+               f"output port {port.name!r} in {where!r}")
     for processor in group.processors:
-        identifiers[id(processor)] = _det_uuid("processor", own_path + (processor.name,))
+        _claim(claimed, identifiers, processor, "processor",
+               own_path + (processor.name,),
+               f"processor {processor.name!r} in {where!r}")
     # Funnels and labels have no (unique) name; seed on their index instead.
     for i, funnel in enumerate(group.funnels):
         identifiers[id(funnel)] = _det_uuid("funnel", own_path + (str(i),))
     for i, label in enumerate(group.labels):
         identifiers[id(label)] = _det_uuid("label", own_path + (str(i),))
-    for connection in group.connections:
-        # A connection's seed includes the endpoints so two connections with
-        # the same (empty) name between different pairs don't collide.
-        seed = (
+
+    for child in group.process_groups:
+        _assign_component_identifiers(child, own_path, identifiers, claimed)
+
+
+def _assign_connection_identifiers(
+    group: ProcessGroup,
+    parent_path: Tuple[str, ...],
+    identifiers: Dict[int, str],
+    claimed: Dict[str, str],
+) -> None:
+    own_path = parent_path + (group.name,)
+    where = "/".join(own_path)
+    # A connection's seed is (name, source-id, target-id, relationships):
+    # parallel edges between the same pair are legal in NiFi as long as any
+    # one of those differs. Exact duplicates (same everything) disambiguate
+    # by occurrence index, pairing in declaration order like funnels do.
+    seeds: List[Tuple[str, ...]] = [
+        (
             connection.name or "",
             identifiers.get(id(connection.source), ""),
             identifiers.get(id(connection.target), ""),
+            ",".join(sorted(connection.relationships or [])),
         )
-        identifiers[id(connection)] = _det_uuid("connection", own_path + seed)
+        for connection in group.connections
+    ]
+    counts: Dict[Tuple[str, ...], int] = {}
+    for seed in seeds:
+        counts[seed] = counts.get(seed, 0) + 1
+    occurrence: Dict[Tuple[str, ...], int] = {}
+    for connection, seed in zip(group.connections, seeds):
+        if counts[seed] > 1:
+            n = occurrence.get(seed, 0)
+            occurrence[seed] = n + 1
+            seed = seed + (f"#{n}",)
+        _claim(claimed, identifiers, connection, "connection", own_path + seed,
+               f"connection {connection.name or '(unnamed)'} in {where!r}")
 
     for child in group.process_groups:
-        _assign_identifiers(child, own_path, identifiers)
+        _assign_connection_identifiers(child, own_path, identifiers, claimed)
 
 
 def _det_uuid(kind: str, path: Tuple[str, ...]) -> str:
@@ -651,8 +733,15 @@ def _emit_processor(
         "type": processor.type,
         "bundle": _emit_bundle(processor.bundle, processor.type),
         "position": _emit_position(processor.position or auto_position),
-        "properties": _emit_properties(processor.properties, identifiers),
-        "propertyDescriptors": _emit_service_ref_descriptors(processor.properties),
+        # Canonicalize display-name keys ("Custom Text") to server keys
+        # ("generate-ff-custom-text") — NiFi would otherwise store the display
+        # name as a dynamic property and leave the real one unset.
+        "properties": _emit_properties(
+            canonical_properties(processor.type, processor.properties), identifiers
+        ),
+        "propertyDescriptors": _emit_service_ref_descriptors(
+            canonical_properties(processor.type, processor.properties)
+        ),
         "schedulingPeriod": processor.scheduling_period,
         "schedulingStrategy": processor.scheduling_strategy,
         "concurrentlySchedulableTaskCount": processor.concurrent_tasks,
