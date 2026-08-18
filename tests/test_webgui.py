@@ -48,6 +48,14 @@ class FakeClient:
     def flowfile_detail(self, connection_id, uuid):
         return {"attributes": {"filename": "f.txt"}, "content": "hello"}
 
+    def trace_flowfile(self, uuid, max_events=100):
+        self.ops.append(("trace", uuid))
+        return {"uuid": uuid, "hops": [{"event_id": 10, "component": "Update"}]}
+
+    def event_content(self, event_id, direction="output"):
+        self.ops.append(("event_content", event_id, direction))
+        return "payload"
+
     def run_processor_once(self, proc_id):
         self.ops.append(("run_once", proc_id))
 
@@ -151,6 +159,19 @@ def test_flowfile_drilldown():
     _, detail = _call(client, "GET", "/api/flowfile",
                       query={"connection_id": ["c1"], "uuid": ["u1"]})
     assert detail["content"] == "hello"
+
+
+def test_trace_routes():
+    client = FakeClient()
+    status, payload = _call(client, "GET", "/api/trace", query={"uuid": ["u1"]})
+    assert status == 200 and payload["hops"][0]["component"] == "Update"
+    status, payload = _call(client, "GET", "/api/trace/content",
+                            query={"event_id": ["10"], "direction": ["input"]})
+    assert status == 200 and payload["content"] == "payload"
+    # direction defaults to output when the page doesn't say
+    _call(client, "GET", "/api/trace/content", query={"event_id": ["10"]})
+    assert client.ops == [("trace", "u1"), ("event_content", "10", "input"),
+                          ("event_content", "10", "output")]
 
 
 def test_unknown_route_404s_and_errors_are_json():
