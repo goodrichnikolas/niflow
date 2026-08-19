@@ -41,7 +41,10 @@ from niflow.core import (
 )
 from niflow.layout import compute_layout
 from niflow.processors.bundles import default_bundle
-from niflow.processors.rules import canonical_properties
+from niflow.processors.rules import canonical_properties, properties_for_target
+from niflow.utils import get_logger
+
+logger = get_logger()
 
 # Standard UUID DNS namespace — used as the root for deterministic UUID5s so
 # generated identifiers don't collide with random NiFi-assigned ones.
@@ -224,7 +227,14 @@ def _populate_group(
         service = ControllerService(
             name=service_dto["name"],
             type=service_dto.get("type", ""),
-            properties=_clean_properties(service_dto.get("properties")),
+            # Normalise pulled keys to the canonical (catalog) namespace so a
+            # model pulled from a 1.x server speaks the same names as one
+            # pulled from 2.x — otherwise editing a pulled flow by canonical
+            # key silently adds a second key for the same property.
+            properties=canonical_properties(
+                service_dto.get("type", ""),
+                _clean_properties(service_dto.get("properties")),
+            ),
             # Older exports don't carry scheduledState on services; assume
             # enabled unless explicitly DISABLED.
             enabled=service_dto.get("scheduledState") != "DISABLED",
@@ -287,7 +297,11 @@ def _populate_group(
         processor = Processor(
             name=proc_dto["name"],
             type=proc_dto.get("type", ""),
-            properties=_clean_properties(proc_dto.get("properties")),
+            # Same canonical-namespace normalisation as services above.
+            properties=canonical_properties(
+                proc_dto.get("type", ""),
+                _clean_properties(proc_dto.get("properties")),
+            ),
             scheduling_period=proc_dto.get("schedulingPeriod", "0 sec"),
             scheduling_strategy=proc_dto.get("schedulingStrategy", "TIMER_DRIVEN"),
             concurrent_tasks=proc_dto.get("concurrentlySchedulableTaskCount", 1),
@@ -390,8 +404,17 @@ def _build_connection(
 # =============================================================================
 
 
-def to_json(flow: Flow, *, indent: int = 2) -> str:
-    """Emit ``flow`` as a NiFi ``VersionedFlowSnapshot`` JSON string."""
+def to_json(flow: Flow, *, indent: int = 2, target_major: Optional[int] = None) -> str:
+    """Emit ``flow`` as a NiFi ``VersionedFlowSnapshot`` JSON string.
+
+    ``target_major`` is the major version of the NiFi server the snapshot is
+    destined for. The catalog speaks the 2.x property namespace, but a 1.x
+    server keys renamed properties by their old names — and NiFi only runs its
+    key-migration machinery in the 2.x direction, so a 2.x-named key sent to
+    1.x lands as an inert *dynamic* property while the real one stays at its
+    default. Pass the server's major version on any push path; leave ``None``
+    for offline emission (files, diff normalisation), which stays canonical.
+    """
     # Pre-walk the tree to assign deterministic identifiers (UUID5 over a
     # path-derived name). We store them in an id() -> str map keyed on the
     # Python object identity so connection emission can look them up later.
@@ -407,6 +430,7 @@ def to_json(flow: Flow, *, indent: int = 2) -> str:
         parent_identifier=None,
         identifiers=identifiers,
         owners=owners,
+        target_major=target_major,
     )
 
     envelope = {
@@ -613,6 +637,7 @@ def _emit_group(
     identifiers: Dict[int, str],
     auto_position: Optional[Tuple[float, float]] = None,
     owners: Optional[Dict[int, str]] = None,
+    target_major: Optional[int] = None,
 ) -> dict:
     identifier = identifiers[id(group)]
     # Auto-layout fills in coordinates for components without an explicit
@@ -626,7 +651,8 @@ def _emit_group(
         "comments": group.comment or "",
         "position": _emit_position(group.position or auto_position),
         "controllerServices": [
-            _emit_service(svc, identifier, identifiers) for svc in group.controller_services
+            _emit_service(svc, identifier, identifiers, target_major)
+            for svc in group.controller_services
         ],
         "inputPorts": [
             _emit_port(p, identifier, identifiers, "INPUT_PORT", auto.get(id(p)))
@@ -637,7 +663,7 @@ def _emit_group(
             for p in group.output_ports
         ],
         "processors": [
-            _emit_processor(proc, identifier, identifiers, auto.get(id(proc)))
+            _emit_processor(proc, identifier, identifiers, auto.get(id(proc)), target_major)
             for proc in group.processors
         ],
         "connections": [
@@ -667,7 +693,7 @@ def _emit_group(
             for lbl in group.labels
         ],
         "processGroups": [
-            _emit_group(child, identifier, identifiers, auto.get(id(child)), owners)
+            _emit_group(child, identifier, identifiers, auto.get(id(child)), owners, target_major)
             for child in group.process_groups
         ],
     }
@@ -696,7 +722,17 @@ def _emit_service(
     service: ControllerService,
     group_identifier: str,
     identifiers: Dict[int, str],
+    target_major: Optional[int] = None,
 ) -> dict:
+    # Offline emission passes service properties through untouched; with a
+    # known target the same canonical -> server-namespace translation as
+    # processors applies (the compat table covers service types too).
+    props = service.properties
+    if target_major is not None:
+        props = _server_properties(
+            service.type, canonical_properties(service.type, props),
+            target_major, service.name,
+        )
     return {
         "componentType": "CONTROLLER_SERVICE",
         "identifier": identifiers[id(service)],
@@ -706,9 +742,32 @@ def _emit_service(
         "bundle": _emit_bundle(service.bundle, service.type, service=True),
         "comments": service.comments or "",
         "scheduledState": "ENABLED" if service.enabled else "DISABLED",
-        "properties": _emit_properties(service.properties, identifiers),
-        "propertyDescriptors": _emit_service_ref_descriptors(service.properties),
+        "properties": _emit_properties(props, identifiers),
+        "propertyDescriptors": _emit_service_ref_descriptors(props),
     }
+
+
+def _server_properties(
+    type_str: str, props: dict, target_major: Optional[int], owner_name: str
+) -> dict:
+    """Translate canonical property keys to the target server's namespace.
+
+    Identity when no target is known (offline emission stays canonical). A
+    property with no counterpart on the target is *omitted* — snapshot pushes
+    create components fresh, so unlike the incremental applier there is no
+    stale value to unset — and warned about, since the model's intent can't
+    reach that server.
+    """
+    if target_major is None:
+        return props
+    translated, unsupported = properties_for_target(type_str, props, target_major)
+    for key in unsupported:
+        logger.warning(
+            "%s: property %r does not exist on NiFi %d.x — omitted from the snapshot",
+            owner_name, key, target_major,
+        )
+        translated.pop(key, None)
+    return translated
 
 
 def _emit_port(
@@ -738,7 +797,17 @@ def _emit_processor(
     group_identifier: str,
     identifiers: Dict[int, str],
     auto_position: Optional[Tuple[float, float]] = None,
+    target_major: Optional[int] = None,
 ) -> dict:
+    # Canonicalize display-name keys ("Custom Text") to server keys
+    # ("generate-ff-custom-text") — NiFi would otherwise store the display
+    # name as a dynamic property and leave the real one unset — then, when the
+    # target server is known, translate to its namespace (a 1.x server keys
+    # renamed properties by their old names and won't migrate 2.x ones).
+    props = _server_properties(
+        processor.type, canonical_properties(processor.type, processor.properties),
+        target_major, processor.name,
+    )
     return {
         "componentType": "PROCESSOR",
         "identifier": identifiers[id(processor)],
@@ -747,15 +816,8 @@ def _emit_processor(
         "type": processor.type,
         "bundle": _emit_bundle(processor.bundle, processor.type),
         "position": _emit_position(processor.position or auto_position),
-        # Canonicalize display-name keys ("Custom Text") to server keys
-        # ("generate-ff-custom-text") — NiFi would otherwise store the display
-        # name as a dynamic property and leave the real one unset.
-        "properties": _emit_properties(
-            canonical_properties(processor.type, processor.properties), identifiers
-        ),
-        "propertyDescriptors": _emit_service_ref_descriptors(
-            canonical_properties(processor.type, processor.properties)
-        ),
+        "properties": _emit_properties(props, identifiers),
+        "propertyDescriptors": _emit_service_ref_descriptors(props),
         "schedulingPeriod": processor.scheduling_period,
         "schedulingStrategy": processor.scheduling_strategy,
         "concurrentlySchedulableTaskCount": processor.concurrent_tasks,

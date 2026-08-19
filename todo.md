@@ -266,9 +266,22 @@ the P0 fixes.
 - [ ] Fixture injection for follow (testing.py's injector as `--source`-like
       input), watch expressions (hop × attribute table), replay-after-fix.
 
-## Cross-version property fidelity (found 2026-08-18) — OPEN, P1 for work use
-- [ ] **Pushing with a 2.x-harvested catalog to a 1.x server silently mis-sets
-      renamed properties.** The emitter canonicalizes legacy keys to the
+## Cross-version property fidelity (found 2026-08-18) — FIXED same day
+- [x] **Pushing with a 2.x-harvested catalog to a 1.x server silently mis-sets
+      renamed properties.** *(fixed 2026-08-18)*: snapshot emission is now
+      server-version-aware — `to_json(target_major=…)` translates canonical
+      keys to the target's namespace via the existing `properties_for_target`
+      compat join (processors AND controller services, `propertyDescriptors`
+      included; unsupported keys are omitted with a warning). Every push path
+      passes the live server's major version (full push, in-place push,
+      incremental subtree instantiation); offline emission stays canonical, so
+      files and diff normalisation are unchanged. The incremental applier
+      already translated. Live-verified on 1.24: torture push → plan = 0 and
+      the server's real `Regular Expression` key carries the pushed regex; the
+      previously-deterministic `test_flow_testing_live` failures now pass in
+      9s (root cause confirmed — ConvertRecord's `Record Reader` had been
+      landing as an inert dynamic property, leaving the processor invalid).
+      Original description follows. The emitter canonicalizes legacy keys to the
       catalog's names (e.g. ReplaceText `Regular Expression` → `Search Value`),
       but on 1.24 the real property is still `Regular Expression` — NiFi 1.x
       stores the canonicalized key as a *dynamic* property and the real one
@@ -287,7 +300,6 @@ the P0 fixes.
       deterministically against local 1.24 — sandbox teardown 409s with
       "Upstream component of Connection (ConvertRecord…) is running", and
       ConvertRecord's keys (`record-reader`→`Record Reader`) are exactly the
-      renamed ones. Retest after the fidelity fix; the rest of the v1
-      integration suite (314 tests) passes, and the 71 `test_catalog.py`
-      failures on 1.24 are just the 2.x catalog sweep against a 1.x server
-      (CI rightly ignores test_catalog.py).
+      renamed ones. CONFIRMED same root cause: green after the fix. The 71
+      `test_catalog.py` failures on 1.24 remain expected — the 2.x catalog
+      sweep against a 1.x server (CI rightly ignores test_catalog.py).

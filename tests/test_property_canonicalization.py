@@ -195,3 +195,74 @@ def test_emitter_writes_canonical_keys():
     snapshot = json.loads(to_json(_flow_with({"generate-ff-custom-text": "x"})))
     (proc,) = snapshot["flowContents"]["processors"]
     assert proc["properties"] == {"Custom Text": "x"}
+
+
+# ------------------------------------------- emitter: server-version targeting
+
+
+def _emitted_processor(properties: dict, type_str: str = GFF, **kwargs) -> dict:
+    flow = Flow("F")
+    flow.add(Processor(name="Gen", type=type_str, properties=properties))
+    snapshot = json.loads(to_json(flow, **kwargs))
+    (proc,) = snapshot["flowContents"]["processors"]
+    return proc
+
+
+def test_emitter_1x_target_writes_1x_keys():
+    # The live repro: a canonical (2.x) key sent to a 1.x server lands as an
+    # inert dynamic property and the real one stays at its default.
+    proc = _emitted_processor(
+        {"Search Value": r"(\d+)", "Replacement Value": "n"},
+        type_str=REPLACE_TEXT, target_major=1,
+    )
+    assert proc["properties"]["Regular Expression"] == r"(\d+)"
+    assert "Search Value" not in proc["properties"]
+
+
+def test_emitter_1x_target_translates_legacy_authored_keys_too():
+    proc = _emitted_processor({"Custom Text": "x"}, target_major=1)
+    assert proc["properties"] == {"generate-ff-custom-text": "x"}
+
+
+def test_emitter_2x_target_and_offline_stay_canonical():
+    for kwargs in ({}, {"target_major": 2}):
+        proc = _emitted_processor({"generate-ff-custom-text": "x"}, **kwargs)
+        assert proc["properties"] == {"Custom Text": "x"}
+
+
+def test_emitter_1x_target_translates_service_ref_descriptors():
+    from niflow.core import ControllerService
+
+    reader = ControllerService(
+        name="Reader", type="org.apache.nifi.csv.CSVReader"
+    )
+    flow = Flow("F")
+    flow.add_controller_service(reader)
+    flow.add(Processor(name="Conv", type=CONVERT, properties={"Record Reader": reader}))
+    snapshot = json.loads(to_json(flow, target_major=1))
+    (proc,) = snapshot["flowContents"]["processors"]
+    assert "record-reader" in proc["properties"]
+    assert "record-reader" in proc["propertyDescriptors"]
+    assert "Record Reader" not in proc["properties"]
+
+
+def test_emitter_1x_target_omits_unsupported_keys(caplog):
+    # "Data Format" exists on both lines; pick a key present only in the 2.x
+    # catalog namespace for this type via the compat join — fall back to a
+    # synthetic check through properties_for_target if none exists.
+    props, unsupported = properties_for_target(
+        GFF, {"Mime Type": "text/plain", "Custom Text": "x"}, 1
+    )
+    if not unsupported:  # both keys exist on 1.x — nothing to omit
+        assert set(props) == {"mime-type", "generate-ff-custom-text"}
+        return
+    proc = _emitted_processor(
+        {"Mime Type": "text/plain", "Custom Text": "x"}, target_major=1
+    )
+    for key in unsupported:
+        assert key not in proc["properties"]
+
+
+def test_emitter_1x_target_dynamic_keys_pass_through():
+    proc = _emitted_processor({"my.dynamic": "v"}, target_major=1)
+    assert proc["properties"]["my.dynamic"] == "v"

@@ -413,11 +413,16 @@ class Flow(ProcessGroup):
 
         return _from_json(source)
 
-    def to_json(self, *, indent: int = 2) -> str:
-        """Emit this flow as a NiFi ``VersionedFlowSnapshot`` JSON string."""
+    def to_json(self, *, indent: int = 2, target_major: Optional[int] = None) -> str:
+        """Emit this flow as a NiFi ``VersionedFlowSnapshot`` JSON string.
+
+        ``target_major`` translates property keys to that NiFi line's
+        namespace (see :func:`niflow.formats.json_format.to_json`); leave it
+        ``None`` for offline emission.
+        """
         from niflow.formats import to_json as _to_json
 
-        return _to_json(self, indent=indent)
+        return _to_json(self, indent=indent, target_major=target_major)
 
     def to_python(self, *, module_docstring: Optional[str] = None) -> str:
         """Emit this flow as a runnable Python module using the niflow API."""
