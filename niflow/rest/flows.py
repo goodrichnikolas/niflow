@@ -153,7 +153,7 @@ class FlowsMixin:
             logger.info("Replacing existing group %r (%s)", flow.name, pg_id)
             self._teardown(pg_id)
 
-        snapshot = json.loads(flow.to_json())
+        snapshot = json.loads(flow.to_json(target_major=self._major_version()))
         self._align_bundles(snapshot)
         new_id = self._create_from_snapshot(parent_id, flow.name, snapshot, position)
         flow.nifi_id = new_id
@@ -418,7 +418,7 @@ class FlowsMixin:
         ``externalControllerServiceReferences`` so it wires them back up.
         Components nested in child groups bring their own services along.
         """
-        snapshot = json.loads(flow.to_json())
+        snapshot = json.loads(flow.to_json(target_major=self._major_version()))
         self._align_bundles(snapshot)
         contents = snapshot["flowContents"]
 

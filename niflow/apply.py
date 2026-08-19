@@ -771,7 +771,9 @@ class PlanApplier:
         child: ProcessGroup = change.desired
         parent_gid = self._group_id(change.path)
         sub = _as_flow(child)
-        snapshot = json.loads(sub.to_json())
+        if self._target_major is None:
+            self._target_major = self.client._major_version()
+        snapshot = json.loads(sub.to_json(target_major=self._target_major))
         self.client._align_bundles(snapshot)
         x, y = child.position or (0.0, 0.0)
         new_id = self.client._create_from_snapshot(
