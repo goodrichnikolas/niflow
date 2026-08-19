@@ -196,10 +196,12 @@ relationships and no occurrence index; processors/groups seed on name alone.
       (finally), and (c) raises ApplyError reporting exactly N-of-M applied, which
       push_update enriches with the pre-push backup path + `niflow rollback` hint.
       Tests: tests/test_apply_unit.py (failure-containment section).
-- [ ] **P1 — plan/apply never converges on parallel edges:** same-endpoint
-      connections are paired arbitrarily, so plans "rotate" them (cold path →
-      hot path clone → cold to second worker → …) and re-apply forever. Second
-      consecutive plan still showed 33 ops.
+- [x] **P1 — plan/apply never converges on parallel edges** *(fixed 2026-08-18)*:
+      `plan._diff_keyed` now pairs same-key buckets by field similarity
+      (`_closest_index` — exact twin always pairs at cost zero) instead of
+      popping in listed order. Live-verified on 1.24 + 2.7.2: torture-flow
+      plan → push --update → plan converges to zero (baseline HEAD showed 33
+      rotating ops on the same live group).
 - [x] **P1 — property-name aliasing causes phantom drift.** *(fixed 2026-08-15)*
       `rules.canonical_properties(type, props)` rewrites display-name keys
       (harvested: descriptors now carry `display`, catalog gained a
@@ -219,18 +221,73 @@ relationships and no occurrence index; processors/groups seed on name alone.
       unsets). Live proof: `niflow plan flows/torture.py` against the running
       group dropped from property drift on every processor to ZERO
       `properties[…]` lines — remaining ops are the parallel-edge P1 above.
-- [ ] **P2 — `niflow validate` false-positives on dynamic relationships:**
-      RouteOnAttribute dynamic properties ARE relationships; 27 bogus errors on a
-      valid flow. (Bonus done 2026-08-15: validate now flags PRIMARY-node +
+- [x] **P2 — `niflow validate` false-positives on dynamic relationships**
+      *(fixed 2026-08-18)*: `rules.DYNAMIC_RELATIONSHIP_TYPES` (RouteOnAttribute,
+      RouteOnContent, RouteText, RouteHL7, QueryRecord; routing-strategy-gated)
+      feeds validate — dynamic relationships are valid to wire/auto-terminate and
+      the unterminated check covers them too. `validate flows/torture.py` is down
+      to exactly the intentional PRIMARY-node error. Curated list, not harvested:
+      ProcessorDTO doesn't expose `supportsDynamicRelationships`; harvesting it
+      via the 2.x `/flow/processor-definition` endpoint in codegen would
+      generalise this to custom NARs. (Bonus done 2026-08-15: validate now flags PRIMARY-node +
       incoming connection, which NiFi rejects — torture flow's Cron 'audit' is
       the live repro, kept invalid on purpose. Tests in test_validate.py.)
-- [ ] **P2 — funnel identity is ordinal** (was line 98's "fine for now"): local
-      declaration order vs server list order mismatch produced phantom funnel
-      connection churn in `diff` right after a clean push.
-- [ ] **P2 — autoTerminatedRelationships order-sensitive in diff** — sort both
-      sides before comparing.
+- [x] **P2 — funnel identity is ordinal** *(fixed 2026-08-18)*: funnels now match
+      by connection topology, not list position — `plan.funnel_signatures` /
+      `match_funnels` drive the differ, `apply._live_component_id` resolves
+      through the same pairing, and `json_format._assign_identifiers` seeds
+      funnel UUID5s on topology order (`_canonical_funnels`). Live-verified on
+      1.24 + 2.7.2: clean push → plan = 0, `niflow diff` has zero
+      connection/funnel churn against real server ordering. One-time caveat:
+      multi-funnel flows whose declaration order ≠ topology order get new funnel
+      UUID5s, so their next VC push recreates those funnel connections once.
+- [x] **P2 — autoTerminatedRelationships order-sensitive in diff** *(fixed
+      2026-08-18)*: emitted sorted (`retriedRelationships` too) and normalised
+      at model construction (`core.Processor._sorted_relationship_sets`).
 
 Repro state: flows/torture.py now uses unique names (duplicates are rejected by
 design; that behaviour is locked in tests/test_identity.py). The half-applied
 live NiflowTorture group from round one was deleted and re-pushed clean after
 the P0 fixes.
+
+## Live stepper (2026-08-18) — SHIPPED (CLI), webgui deferred
+- [x] **`niflow follow <group>`** (niflow/follow.py): quiesce (records prior
+      RUNNING set), pick a FlowFile (front of first non-empty queue, `--uuid`,
+      `--queue`, or `--source NAME` run-once mint), then step hop by hop —
+      locate the queue holding the uuid, run-once the destination, poll the
+      incremental provenance cursor (`flowfile_events_since`), render with the
+      SAME hop renderer as trace (`format_hop`, now shared; trace output
+      byte-identical). Interactive keys Enter/a/c/q; `--auto` (+`--max-hops`),
+      `--restore` restarts only the previously-running set, `--full`. Forks
+      surface child uuids with a picker (`--auto` follows the first child).
+      Live-verified end-to-end on 1.24.0 AND 2.7.2 (mint → attribute diff →
+      ROUTE relationship → DROP terminal).
+- [ ] Webgui Follow tab (reuse the Trace tab's renderer).
+- [ ] Fixture injection for follow (testing.py's injector as `--source`-like
+      input), watch expressions (hop × attribute table), replay-after-fix.
+
+## Cross-version property fidelity (found 2026-08-18) — OPEN, P1 for work use
+- [ ] **Pushing with a 2.x-harvested catalog to a 1.x server silently mis-sets
+      renamed properties.** The emitter canonicalizes legacy keys to the
+      catalog's names (e.g. ReplaceText `Regular Expression` → `Search Value`),
+      but on 1.24 the real property is still `Regular Expression` — NiFi 1.x
+      stores the canonicalized key as a *dynamic* property and the real one
+      stays at its default, so the pushed value is NOT active. Symptom: plan
+      shows `properties[Regular Expression]: '<default>' -> None` after a clean
+      push (live snapshot carries both keys; canonicalization correctly refuses
+      to clobber). Repro: `niflow push flows/torture.py` against 1.24 with the
+      stock (2.x) catalog. Fix direction: key emission must be server-version
+      aware — de-canonicalize via LEGACY_PROPERTY_ALIASES when the target is
+      1.x (push/plan know the server version; offline to_json can stay
+      canonical). Workaround today: use a 1.x-harvested catalog (`make
+      catalog-v1`) against 1.x servers — doctor already warns on mismatch.
+      Matters because work NiFi is 1.24/1.28 (the priority axis).
+      Possibly related (verified pre-existing at 62b795a, NOT from the
+      2026-08-18 fixes): `tests/test_flow_testing_live.py` fails
+      deterministically against local 1.24 — sandbox teardown 409s with
+      "Upstream component of Connection (ConvertRecord…) is running", and
+      ConvertRecord's keys (`record-reader`→`Record Reader`) are exactly the
+      renamed ones. Retest after the fidelity fix; the rest of the v1
+      integration suite (314 tests) passes, and the 71 `test_catalog.py`
+      failures on 1.24 are just the 2.x catalog sweep against a 1.x server
+      (CI rightly ignores test_catalog.py).

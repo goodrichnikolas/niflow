@@ -11,8 +11,9 @@ name. The plan drives two consumers:
   touches only what changed.
 
 Identity is name-based within each group (NiFi allows duplicate names; when
-they occur, same-named components are paired in listed order and the rest
-become adds/removes). Positions and layout are deliberately NOT diffed —
+they occur, same-keyed components pair by field similarity — an exact twin
+always wins — and the rest become adds/removes; funnels, which have no name,
+match by connection topology). Positions and layout are deliberately NOT diffed —
 moving things on the canvas is cosmetic and must never force an update.
 Sensitive processor properties never appear in live snapshots, so a desired
 literal value for one always registers as an update; reference them through
@@ -20,6 +21,7 @@ parameters (``#{...}``) to keep plans quiet.
 """
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -134,12 +136,18 @@ def _diff_group(
         "processor", path, changes, _diff_processor_fields,
     )
 
-    # Funnels are anonymous (nothing diffable besides position): match by
-    # ordinal, surplus becomes add/remove.
-    for i in range(len(desired.funnels), len(live.funnels)):
-        changes.append(Change("remove", "funnel", path, f"funnel[{i}]", live=live.funnels[i]))
-    for i in range(len(live.funnels), len(desired.funnels)):
-        changes.append(Change("add", "funnel", path, f"funnel[{i}]", desired=desired.funnels[i]))
+    # Funnels are anonymous, so they're identified by connection topology
+    # (what feeds them / what they feed) rather than list position — the
+    # server lists funnels in arbitrary order. Unmatched surplus becomes
+    # add/remove; a matched pair has nothing diffable besides position.
+    funnel_pairs = match_funnels(live, desired)
+    matched_live = set(funnel_pairs.values())
+    for j, funnel in enumerate(live.funnels):
+        if j not in matched_live:
+            changes.append(Change("remove", "funnel", path, f"funnel[{j}]", live=funnel))
+    for i, funnel in enumerate(desired.funnels):
+        if i not in funnel_pairs:
+            changes.append(Change("add", "funnel", path, f"funnel[{i}]", desired=funnel))
 
     # Labels: match by text (duplicates pair in order).
     _diff_keyed(
@@ -148,10 +156,12 @@ def _diff_group(
 
     # Connections: identity is (source endpoint, target endpoint); the
     # relationship set and queue settings are updatable fields. Endpoint keys
-    # are built per side — funnels by ordinal within their group, ports
+    # are built per side — funnels through the topology pairing above, ports
     # qualified by owning child group — so a live tree (with ids) and a
     # desired tree (without) still line up.
-    live_key = _endpoint_keyer(live)
+    live_key = _endpoint_keyer(
+        live, funnel_ordinals={j: i for i, j in funnel_pairs.items()}
+    )
     desired_key = _endpoint_keyer(desired)
     _diff_keyed(
         live.connections, desired.connections, None,
@@ -194,7 +204,7 @@ def _diff_keyed(live_items, desired_items, key_fn, kind, path, changes,
     for item in desired_items:
         bucket = live_by_key.get(key_fn_desired(item))
         if bucket:
-            live_item = bucket.pop(0)
+            live_item = bucket.pop(_closest_index(bucket, item, field_differ))
             if field_differ is not None:
                 fields = field_differ(live_item, item)
                 if fields:
@@ -208,6 +218,22 @@ def _diff_keyed(live_items, desired_items, key_fn, kind, path, changes,
     for bucket in live_by_key.values():
         for leftover in bucket:
             changes.append(Change("remove", kind, path, namer(leftover), live=leftover))
+
+
+def _closest_index(bucket: List[Any], desired: Any, field_differ) -> int:
+    """Index of the live candidate most similar to ``desired``.
+
+    Same-key duplicates (parallel edges between one endpoint pair, notably)
+    all land in one bucket; popping the first listed candidate paired them
+    arbitrarily, so consecutive plans "rotated" the clones and re-applied
+    forever. Choosing the candidate with the fewest differing fields means
+    an exact twin always pairs at cost zero — which is exactly what makes
+    plan -> apply -> plan converge. Ties keep listed order (deterministic).
+    """
+    if len(bucket) == 1 or field_differ is None:
+        return 0
+    costs = [len(field_differ(candidate, desired)) for candidate in bucket]
+    return costs.index(min(costs))
 
 
 def _diff_processor_fields(live: Processor, desired: Processor) -> Dict[str, Tuple[Any, Any]]:
@@ -289,12 +315,14 @@ def _normalise_field(name: str, value: Any) -> Any:
     return value
 
 
-def _endpoint_keyer(group: ProcessGroup):
+def _endpoint_keyer(group: ProcessGroup, funnel_ordinals: Optional[Dict[int, int]] = None):
     """Key connection endpoints of ``group`` structurally (no live ids).
 
-    Funnels key by ordinal within the group; ports belonging to a direct
-    child group are qualified by the child's name (two children may both
-    expose an ``out`` port).
+    Funnels key by ordinal within the group — remapped through
+    ``funnel_ordinals`` when given, so a live funnel keys as its matched
+    desired twin (unmatched ones get a negative key that never collides).
+    Ports belonging to a direct child group are qualified by the child's
+    name (two children may both expose an ``out`` port).
     """
     funnel_ordinal = {id(f): i for i, f in enumerate(group.funnels)}
     own_ports = {id(p) for p in group.input_ports + group.output_ports}
@@ -305,7 +333,10 @@ def _endpoint_keyer(group: ProcessGroup):
 
     def key(component: NiFiComponent) -> Tuple[str, Any, str]:
         if isinstance(component, Funnel):
-            return ("funnel", funnel_ordinal.get(id(component), -1), "")
+            i = funnel_ordinal.get(id(component), -1)
+            if funnel_ordinals is not None:
+                i = funnel_ordinals.get(i, -1 - i)
+            return ("funnel", i, "")
         kind = type(component).__name__.lower()
         owner = ""
         if isinstance(component, Port) and id(component) not in own_ports:
@@ -313,6 +344,76 @@ def _endpoint_keyer(group: ProcessGroup):
         return (kind, owner, getattr(component, "name", "") or "")
 
     return key
+
+
+def match_funnels(live: ProcessGroup, desired: ProcessGroup) -> Dict[int, int]:
+    """Pair funnels across two groups: desired ordinal -> live ordinal.
+
+    Funnels have no name, so identity comes from connection topology: same-
+    signature funnels pair in listed order (they are indistinguishable), and
+    leftovers — rewired funnels — pair by best endpoint overlap so an
+    equal-count rewire stays connection churn instead of funnel churn. Also
+    used by the applier, so plan and apply resolve the same live funnel.
+    """
+    live_sigs = funnel_signatures(live)
+    unclaimed: Dict[Any, List[int]] = {}
+    for j, sig in enumerate(live_sigs):
+        unclaimed.setdefault(sig, []).append(j)
+
+    pairs: Dict[int, int] = {}
+    desired_sigs = funnel_signatures(desired)
+    leftover: List[int] = []
+    for i, sig in enumerate(desired_sigs):
+        bucket = unclaimed.get(sig)
+        if bucket:
+            pairs[i] = bucket.pop(0)
+        else:
+            leftover.append(i)
+
+    spare = sorted(j for bucket in unclaimed.values() for j in bucket)
+    for i in leftover:
+        if not spare:
+            break
+        best = max(spare, key=lambda j: _signature_overlap(desired_sigs[i], live_sigs[j]))
+        spare.remove(best)
+        pairs[i] = best
+    return pairs
+
+
+def funnel_signatures(group: ProcessGroup) -> List[Tuple[Any, Any]]:
+    """Topology signature per funnel: (what feeds it, what it feeds).
+
+    Neighbour endpoints use the structural key — funnel neighbours collapse
+    to a wildcard, so funnel-to-funnel chains stay ordinal within their
+    signature bucket — and inbound edges carry their relationships so two
+    funnels fed by the same processor on different relationships differ.
+    """
+    key = _endpoint_keyer(group)
+
+    def neighbour(component: NiFiComponent) -> Tuple[str, Any, str]:
+        if isinstance(component, Funnel):
+            return ("funnel", "*", "")
+        return key(component)
+
+    signatures: List[Tuple[Any, Any]] = []
+    for funnel in group.funnels:
+        ins = sorted(
+            (neighbour(c.source), tuple(sorted(c.relationships or [])))
+            for c in group.connections
+            if c.target is funnel
+        )
+        outs = sorted(
+            neighbour(c.target) for c in group.connections if c.source is funnel
+        )
+        signatures.append((tuple(ins), tuple(outs)))
+    return signatures
+
+
+def _signature_overlap(a: Tuple[Any, Any], b: Tuple[Any, Any]) -> int:
+    """How many inbound/outbound endpoint entries two signatures share."""
+    return sum(
+        sum((Counter(a[side]) & Counter(b[side])).values()) for side in (0, 1)
+    )
 
 
 def _connection_name(conn: Connection) -> str:

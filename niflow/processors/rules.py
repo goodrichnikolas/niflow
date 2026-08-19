@@ -70,6 +70,62 @@ def property_names_for(type_str: str) -> Optional[List[str]]:
     return list(names) if names is not None else None
 
 
+# Types whose *dynamic properties become relationships* (RouteOnAttribute's
+# property "hot" creates a relationship "hot"). The REST create response the
+# harvest reads (ProcessorDTO) doesn't expose ``supportsDynamicRelationships``
+# — only the 2.x ``/flow/processor-definition/...`` endpoint does, which the
+# harvest doesn't call — so this is curated by hand as a documented last
+# resort. Each entry is either ``None`` (dynamic properties are always
+# relationships) or a gate ``{"property", "value"}``: the behaviour only
+# applies while that property holds that value (its default), because the
+# other routing strategies collapse the relationships to matched/unmatched.
+DYNAMIC_RELATIONSHIP_TYPES: Dict[str, Optional[Dict[str, str]]] = {
+    "org.apache.nifi.processors.standard.RouteOnAttribute": {
+        "property": "Routing Strategy", "value": "Route to Property name"},
+    "org.apache.nifi.processors.standard.RouteOnContent": None,
+    "org.apache.nifi.processors.standard.RouteText": {
+        "property": "Routing Strategy",
+        "value": "Route to each matching Property Name"},
+    "org.apache.nifi.processors.hl7.RouteHL7": None,
+    "org.apache.nifi.processors.standard.QueryRecord": None,
+}
+
+
+def supports_dynamic_relationships(type_str: str) -> bool:
+    """Whether a type's dynamic properties can create relationships."""
+    return type_str in DYNAMIC_RELATIONSHIP_TYPES
+
+
+def dynamic_relationships_for(
+    type_str: str, props: Dict[str, object]
+) -> Optional[List[str]]:
+    """Relationship names the processor's dynamic properties create, or ``None``.
+
+    ``None`` means "don't treat dynamic property names as relationships" —
+    either the type isn't a dynamic-relationship one, its routing strategy has
+    been switched away from per-property routing (or is set via EL/parameters
+    and can't be judged), or the catalog lacks the property-name table needed
+    to tell real properties from dynamic ones. A list (possibly empty) means
+    per-property routing is active and exactly those names are relationships.
+    """
+    if type_str not in DYNAMIC_RELATIONSHIP_TYPES:
+        return None
+    props = canonical_properties(type_str, props or {})
+    gate = DYNAMIC_RELATIONSHIP_TYPES[type_str]
+    if gate is not None:
+        value = props.get(gate["property"])
+        if value in (None, ""):
+            descriptors = descriptors_for(type_str) or {}
+            value = (descriptors.get(gate["property"]) or {}).get("default")
+        if value != gate["value"]:
+            return None
+    names = property_names_for(type_str)
+    if names is None:
+        return None
+    known = set(names)
+    return sorted(k for k, v in props.items() if k not in known and v is not None)
+
+
 # NiFi 2.x renamed many canonical property keys to match their display names
 # (its migrateProperties machinery translates old keys on import, but the old
 # names are exposed nowhere in the REST API). The renames niflow has actually

@@ -525,14 +525,28 @@ def _assign_component_identifiers(
         _claim(claimed, identifiers, processor, "processor",
                own_path + (processor.name,),
                f"processor {processor.name!r} in {where!r}")
-    # Funnels and labels have no (unique) name; seed on their index instead.
-    for i, funnel in enumerate(group.funnels):
+    # Funnels and labels have no (unique) name; seed on an index instead.
+    # Funnel indices follow *topology* order (what feeds them / what they
+    # feed, ties keep list order): the server lists funnels arbitrarily, so
+    # seeding on raw list position made a pulled flow serialise different
+    # connection endpoints than the local model — phantom churn in
+    # `niflow diff` right after a clean push.
+    for i, funnel in enumerate(_canonical_funnels(group)):
         identifiers[id(funnel)] = _det_uuid("funnel", own_path + (str(i),))
     for i, label in enumerate(group.labels):
         identifiers[id(label)] = _det_uuid("label", own_path + (str(i),))
 
     for child in group.process_groups:
         _assign_component_identifiers(child, own_path, identifiers, claimed)
+
+
+def _canonical_funnels(group: ProcessGroup) -> List[Funnel]:
+    """The group's funnels in topology order (stable across declaration order)."""
+    from niflow.plan import funnel_signatures  # lazy: plan sits above formats
+
+    signatures = funnel_signatures(group)
+    order = sorted(range(len(group.funnels)), key=lambda i: (signatures[i], i))
+    return [group.funnels[i] for i in order]
 
 
 def _assign_connection_identifiers(
@@ -745,7 +759,9 @@ def _emit_processor(
         "schedulingPeriod": processor.scheduling_period,
         "schedulingStrategy": processor.scheduling_strategy,
         "concurrentlySchedulableTaskCount": processor.concurrent_tasks,
-        "autoTerminatedRelationships": list(processor.auto_terminate),
+        # Relationship collections are sets to NiFi; emit them sorted so
+        # declaration order vs server order can't produce phantom diffs.
+        "autoTerminatedRelationships": sorted(processor.auto_terminate),
         "comments": processor.comments or "",
         "penaltyDuration": processor.penalty_duration,
         "yieldDuration": processor.yield_duration,
@@ -754,7 +770,7 @@ def _emit_processor(
         "executionNode": processor.execution_node,
         "scheduledState": processor.scheduled_state,
         "retryCount": processor.retry_count,
-        "retriedRelationships": list(processor.retried_relationships),
+        "retriedRelationships": sorted(processor.retried_relationships),
         "backoffMechanism": processor.backoff_mechanism,
         "maxBackoffPeriod": processor.max_backoff_period,
     }

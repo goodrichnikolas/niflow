@@ -114,6 +114,97 @@ def test_auto_terminating_a_nonexistent_relationship_is_flagged(known_relationsh
     assert any("'bogus' does not exist" in m for m in msgs)
 
 
+# --- dynamic relationships (RouteOnAttribute and friends) --------------------
+# These use the real committed catalog: RouteOnAttribute is harvested with the
+# static set ['unmatched'] and a 'Routing Strategy' descriptor whose default is
+# per-property routing.
+
+ROUTE_ATTR = "org.apache.nifi.processors.standard.RouteOnAttribute"
+
+
+def _router(name="Router", *, auto=(), strategy=None, **props):
+    if strategy is not None:
+        props["Routing Strategy"] = strategy
+    return Processor(name=name, type=ROUTE_ATTR, properties=props,
+                     auto_terminate=list(auto))
+
+
+def test_dynamic_relationships_connected_validate_clean():
+    # Dynamic properties 'hot'/'cold' ARE relationships — wiring them is valid.
+    flow = Flow("f")
+    router = _router(auto=["unmatched"],
+                     hot="${x:equals('h')}", cold="${x:equals('c')}")
+    sink = _proc("Sink")
+    sink.auto_terminate = ["success"]
+    flow.add_processor(router, sink)
+    flow.add_connection(router.to(sink, relationships=["hot"]),
+                        router.to(sink, relationships=["cold"]))
+    assert [i for i in validate_flow(flow) if i["component"] == "f/Router"] == []
+
+
+def test_dynamic_relationship_auto_terminated_validates_clean():
+    flow = Flow("f")
+    flow.add_processor(_router(auto=["unmatched", "hot"], hot="${x}"))
+    assert validate_flow(flow) == []
+
+
+def test_unhandled_dynamic_relationship_is_flagged_like_static_ones():
+    # 'cold' creates a relationship that is neither wired nor auto-terminated.
+    flow = Flow("f")
+    flow.add_processor(_router(auto=["unmatched", "hot"],
+                               hot="${x}", cold="${y}"))
+    msgs = [i["message"] for i in validate_flow(flow)]
+    assert "relationship 'cold' is not connected or auto-terminated" in msgs
+
+
+def test_static_relationships_still_required_on_dynamic_types():
+    flow = Flow("f")
+    flow.add_processor(_router(auto=["hot"], hot="${x}"))  # 'unmatched' dangles
+    msgs = [i["message"] for i in validate_flow(flow)]
+    assert "relationship 'unmatched' is not connected or auto-terminated" in msgs
+
+
+def test_non_default_routing_strategy_disables_dynamic_checks():
+    # With matched-routing the dynamic properties are NOT relationships and the
+    # live set becomes matched/unmatched — unknowable from the harvest, so both
+    # the inverse check and the existence checks must stay quiet.
+    flow = Flow("f")
+    router = _router(auto=["unmatched", "matched"],
+                     strategy="Route to 'match' if all match", hot="${x}")
+    flow.add_processor(router)
+    assert validate_flow(flow) == []
+
+
+def test_dynamic_relationship_names_do_not_leak_to_other_types(known_relationships):
+    # 'Known' is not a dynamic-relationship type: an unknown relationship name
+    # is still an error even when a same-named dynamic property exists.
+    flow = Flow("f")
+    src = Processor(name="Src", type="Known", properties={"hot": "${x}"},
+                    auto_terminate=["success", "failure"])
+    dst = _proc("Dst")
+    dst.auto_terminate = ["success"]
+    flow.add_processor(src, dst)
+    flow.add_connection(src.to(dst, relationships=["hot"]))
+    msgs = [i["message"] for i in validate_flow(flow)]
+    assert any("uses relationship 'hot' that does not exist" in m for m in msgs)
+
+
+def test_torture_flow_only_flags_the_intentional_primary_node_error():
+    # flows/torture.py is the live repro: 24 dynamic fanout relationships plus
+    # wired 'hot'/'cold'/'give-up' must be clean, while the deliberately
+    # invalid Cron 'audit' (PRIMARY node + incoming connection) stays flagged.
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parent.parent / "flows" / "torture.py"
+    spec = importlib.util.spec_from_file_location("torture_flow", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    issues = validate_flow(module.flow)
+    assert [i["component"] for i in issues] == ["NiflowTorture/Cron 'audit'"]
+    assert "PRIMARY" in issues[0]["message"]
+
+
 # --- property checks from harvested descriptors -----------------------------
 
 def _known(name, **props):
