@@ -756,3 +756,42 @@ def test_doctor_flags_a_flow_directory_that_violates_the_baseline(tmp_path):
     scanned, issues = _scan_flows(1, str(tmp_path))
     assert scanned == 1
     assert any("Pretty Print" in i["message"] for i in issues)
+
+
+def test_push_warns_when_a_type_has_no_1x_data_to_translate_with(caplog):
+    """A custom NAR is the case the stock harvests can never cover.
+
+    `properties_for_target` returns identity for a type `compat_v1` has never
+    seen, so the properties go under their 2.x keys and 1.24 files the ones it
+    doesn't recognise as inert dynamic properties — silently, which is the
+    whole failure mode the cross-version work exists to stop.
+    """
+    from niflow.rest.flows import _warn_untranslatable_types
+
+    flow = Flow(name="Custom")
+    flow.add(Processor(name="Ours", type="com.work.nifi.SecretSauce",
+                       auto_terminate=["success"]))
+    with caplog.at_level("WARNING", logger="niflow"):
+        blind = _warn_untranslatable_types(flow, 1, "https://work:8443/nifi-api")
+    assert blind == ["com.work.nifi.SecretSauce"]
+    assert "no NiFi 1.x property data" in caplog.text
+    assert "make catalog-v1" in caplog.text
+
+
+def test_a_2x_only_type_is_not_reported_as_untranslatable(caplog):
+    """flow_issues already says the push will fail — twice is noise."""
+    from niflow.rest.flows import _warn_untranslatable_types
+
+    flow = Flow(name="TwoX")
+    flow.add(Processor(name="Del", type="org.apache.nifi.processors.standard.DeleteSFTP",
+                       auto_terminate=["success", "failure", "not found"]))
+    with caplog.at_level("WARNING", logger="niflow"):
+        assert _warn_untranslatable_types(flow, 1) == []
+
+
+def test_nothing_is_said_when_pushing_to_2x():
+    from niflow.rest.flows import _warn_untranslatable_types
+
+    flow = Flow(name="Custom")
+    flow.add(Processor(name="Ours", type="com.work.nifi.SecretSauce"))
+    assert _warn_untranslatable_types(flow, 2) == []

@@ -69,6 +69,59 @@ def _warn_baseline(flow: Flow, live_major: int, live_version: str) -> List[dict]
     return issues
 
 
+def _warn_untranslatable_types(flow: Flow, major: int, host: str = "") -> List[str]:
+    """Types this push cannot translate, because nothing was harvested.
+
+    Pushing to a 1.x server, ``properties_for_target`` returns identity for
+    a type ``compat_v1`` has never seen — "unknown, don't translate" — so
+    the properties go under their catalog (2.x) keys, 1.x files any it does
+    not recognise as inert dynamic properties, and the real ones run at
+    their defaults. Silently. That is the same failure the cross-version
+    work chased, in the one hole it cannot close by itself.
+
+    The stock catalogs no longer have such a hole (every type either has
+    1.x data or is known 2.x-only, in which case ``flow_issues`` already
+    says the push will fail). What still lands here is a **custom NAR** —
+    work's own processors, which no harvest of a stock container can know —
+    and a compat table generated before the type existed. Both are exactly
+    the case where a silent identity translation is worst, so say it.
+    """
+    if major != 1:
+        return []
+    from niflow.processors.rules import harvested_on_v1
+    from niflow.version_map import (
+        PROCESSOR_TYPES_ONLY_NEW, SERVICE_TYPES_ONLY_NEW,
+    )
+
+    known_only_new = set(PROCESSOR_TYPES_ONLY_NEW) | set(SERVICE_TYPES_ONLY_NEW)
+    blind: List[str] = []
+
+    def visit(group) -> None:
+        for component in list(group.processors) + list(group.controller_services):
+            type_str = component.type
+            if (type_str not in known_only_new
+                    and not harvested_on_v1(type_str)
+                    and type_str not in blind):
+                blind.append(type_str)
+        for child in group.process_groups:
+            visit(child)
+
+    visit(flow)
+    if not blind:
+        return []
+    logger.warning(
+        "%d type(s) in %r have no NiFi 1.x property data, so their "
+        "properties are being sent under their catalog keys untranslated: "
+        "%s", len(blind), flow.name, ", ".join(sorted(blind)),
+    )
+    logger.warning(
+        "  If this server runs them (a custom NAR, or a newer 1.x line), "
+        "harvest it once: NIFLOW_NIFI_HOST=%s make catalog-v1",
+        host,
+    )
+    return blind
+
+
 class FlowsMixin:
     def validate_flow_live(self, flow: Flow, timeout: float = 30.0) -> List[dict]:
         """Dry-run ``flow`` against the live server; returns validation errors.
@@ -253,6 +306,7 @@ class FlowsMixin:
         except Exception:  # unreachable server is the caller's problem, not ours
             return []
         _warn_baseline(flow, major, self.version())
+        _warn_untranslatable_types(flow, major, getattr(self, "base", ""))
         issues = flow_issues(flow, major)
         if not issues:
             return []
@@ -341,14 +395,19 @@ class FlowsMixin:
         existing = [c for c in self._child_groups(parent_id) if c["name"] == flow.name]
         if not existing:
             live = Flow(name=flow.name)
-            return None, live, diff_flows(live, flow)
+            return None, live, diff_flows(live, flow, self._major_version())
         pg_id = existing[0]["id"]
         live = from_json(self.download_snapshot(pg_id))
         # The download sanitises run state; without this a stated enabled=True
         # would re-plan forever (see :meth:`_overlay_run_state`).
         self._overlay_run_state(pg_id, live)
         live.nifi_id = pg_id
-        return pg_id, live, diff_flows(live, flow)
+        # The server itself says which line it is; plan.diff_flows only has to
+        # *infer* that (from 1.x-only property keys in the snapshot) for
+        # callers with no client, and a flow whose live side happens to carry
+        # no 1.x-only residue would otherwise be judged with the 2.x catalog
+        # alone — the diff-side half of the cross-version fix.
+        return pg_id, live, diff_flows(live, flow, self._major_version())
 
     def push_update(
         self,
@@ -649,7 +708,7 @@ class FlowsMixin:
         self.ensure_parameter_contexts(flow)
         live = from_json(self.download_snapshot(pg_id))
         live.nifi_id = pg_id
-        changes = diff_flows(live, flow)
+        changes = diff_flows(live, flow, self._major_version())
         repairable = [
             c for c in changes
             if c.op == "update" and c.kind in self._IN_PLACE_REPAIR_KINDS

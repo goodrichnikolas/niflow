@@ -695,39 +695,37 @@ all produce a non-empty plan in both directions.
       `niflow fuzz --tier 3 --replay service-1a6c3e11eb` passes.
       **Found while fixing it — the live read is blind (new P2, see below).**
 
-- [ ] **P1 — on NiFi 1.24, a controller-service *reference* silently does not
-      wire up for the 42 catalog types with no 1.x compatibility data.**
-      `properties_for_target` returns identity when `compat_v1` has no entry for
-      a type ("unknown — don't translate"), so the property is emitted under its
-      2.x key; 1.24 stores it as an inert dynamic property and the real
-      reference stays unset. Live proof: `DeleteSFTP` + `Proxy Configuration
-      Service` pushed to 1.24 pulls back with the property *absent*
-      (`properties[Proxy Configuration Service]: None -> service 'Svc'` in the
-      plan); the same case on 2.7.2 converges. This is the 2026-08-18
-      cross-version bug again, in the hole the fix could not cover.
-      Repro: `NIFLOW_NIFI_HOST=…:8444 niflow fuzz --tier 3 --replay service-12687f42cf`.
-      The offline tier now lists the affected types (`types with NO 1.x
-      compatibility data`: ConsumeKafka, PublishKafka, CopyS3Object, the Box
-      family, …). Fix direction: harvest compat data for every type the 1.x
-      server reports (not just the intersection), and treat "no data for this
-      type" as a *warning* at push time rather than silent identity.
-      Server line: **1.x only**. Feeds T13.
-
-- [ ] **P2 — properties that exist only on 1.x drift forever against a 1.24
-      server.** A live 1.24 processor materialises its own 1.x-only properties
-      (`QueryRecord.cache-schema`, `ListFTP.Proxy Type`, …); the desired model
-      (hand-written, or authored against the 2.x catalog) does not have them and
-      the 2.x catalog has no descriptor, so `plan._diff_properties` reads the
-      effective default as `None` and proposes unsetting them — on every plan,
-      forever, and `push --update` really does send the unset.
-      Repro: `NIFLOW_NIFI_HOST=…:8444 niflow fuzz --tier 3 --replay shape-4f6f5d6272`
-      (`properties[cache-schema]: 'true' -> None`).
-      Root cause: the differ has no notion of the target server's namespace —
-      the emit side got that in the 2026-08-18 fix, the diff side did not. A
-      live property that does not exist in the model's namespace is not ours to
-      manage and should be ignored, not unset.
-      Server line: **1.x only** (pull-based flows are immune — they carry the
-      1.x keys; hand-written and 2.x-authored flows are not).
+- [x] **P1 — a controller-service reference silently did not wire up on 1.24
+      for types with no 1.x compatibility data.** *(closed 2026-08-20)* The
+      42 types turned out to be **2.x-only types** — DeleteSFTP, ConsumeKafka
+      (1.24 has `ConsumeKafka_2_6`), the Box family — and T13's full harvest
+      settled it: of 292 catalog processor types and 123 service types, the
+      set with no 1.x data and not known 2.x-only is now **empty**. Pushing
+      one of them to 1.24 was never going to work, and `flow_issues` /
+      `validate --target-version 1.24` already say so out loud ("type does not
+      exist on NiFi 1.24.0 … the push will fail").
+      What remains is the hole no harvest of a stock container can fill: a
+      **custom NAR** (work's own processors) or a compat table generated
+      before a type existed. There, `properties_for_target` still returns
+      identity — "unknown, don't translate" — and 1.24 files the unrecognised
+      keys as inert dynamic properties. `_warn_untranslatable_types` now names
+      those types before any mutation and points at
+      `NIFLOW_NIFI_HOST=… make catalog-v1`. Silent identity translation was
+      the actual bug; it is no longer silent.
+- [x] **P2 — properties that exist only on 1.x drifted forever against a 1.24
+      server.** Fixed 2026-08-19 by `descriptors_for_target`: with the
+      target's own descriptors, a 1.x-only property sitting at its 1.x default
+      is what "the model says nothing" means there, and no change is proposed
+      (a value that is NOT the default is still real drift, which is the
+      distinction that had to survive).
+      *(2026-08-20)* The remaining half was **who tells the differ which line
+      it is**: `plan.diff_flows` inferred the major from 1.x-only property
+      keys in the live snapshot, which is the right fallback for a caller with
+      no client but guesses `None` (= judge with the 2.x catalog) whenever the
+      live side happens to carry no 1.x-only residue. `plan()`,
+      `push_update()` and the in-place repair path now pass
+      `self._major_version()` — the server says what it is; inference is only
+      for callers that cannot ask.
 
 - [x] **P2 — `@PrimaryNodeOnly` processors drift forever: `execution_node:
       'PRIMARY' -> 'ALL'`.** NiFi forces `executionNode=PRIMARY` on types
