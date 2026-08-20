@@ -327,6 +327,15 @@ is wired to the [NiFiMCP](https://github.com/ms82119/NiFiMCP) server via
 `.mcp.json` (sibling checkout). It complements NiFlow: NiFlow defines, pulls,
 and pushes flows as code; the MCP server inspects and pokes the live canvas.
 
+## Docs
+
+Tutorial-style walkthroughs of each part, in [docs/](docs/README.md):
+[pull/push](docs/pull-and-push.md) · [plan/apply](docs/plan-and-apply.md) ·
+[validate](docs/validate.md) · [trace/follow](docs/trace-and-follow.md) ·
+[testing](docs/testing.md) · [backup/rollback](docs/backup-and-rollback.md) ·
+[watch](docs/watch.md) · [explain](docs/explain.md) · [GUIs](docs/guis.md) ·
+[catalog & versions](docs/catalog-and-versions.md) · [fuzz](docs/fuzz.md).
+
 ## Project layout
 
 ```

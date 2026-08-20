@@ -340,9 +340,16 @@ by ticket number, not priority; the priority axis is "things that hurt at work".
       report what was dropped. Mirrored in the PyQt Inspector ("Purge queue"
       button, enabled on queue selection). Verified live on 2.7.2:
       `1 / 93 bytes` dropped from one connection.
-- [ ] **T3 — docs/*.md per major component.** A short tutorial-style doc for each
-      major piece (pull/push, plan/apply, trace/follow, explain, validate, gui,
-      webgui, testing, backup/rollback, catalog).
+- [x] **T3 — docs/*.md per major component.** *(done 2026-08-20)* Eleven
+      tutorial-style pages plus an index (`docs/README.md`, linked from the
+      README): pull-and-push, plan-and-apply, validate, trace-and-follow,
+      testing, backup-and-rollback, watch, explain, guis, catalog-and-versions,
+      fuzz. Each is written against what the code actually does on both lines
+      and carries the live-verified gotchas rather than a feature list — the
+      lineage-query surprise in trace, run-once serving the wrong queue in
+      follow, why silence is not a request in plan, what the import writes that
+      no descriptor predicts. The two generated pages (version-compat,
+      work-nifi-setup) are indexed alongside them.
 - [x] **T4 — .gitignore flows/ by default.** Done 2026-08-19: `flows/*` with
       per-file negations for the shipped examples (`.gitkeep`, abc_to_json,
       torture, labyrinth) — it has to be `flows/*`, not `flows/`, because git
