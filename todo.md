@@ -1184,31 +1184,39 @@ on both lines).
       The real fix is `startDate`/`endDate` on the provenance request (the
       DTO supports both) to bound "recent" by time instead of by count.
       Deliberately not done here: it changes what "recent events" means.
-- [ ] **T7b — 50 branches is technically fine and practically unusable.** The
-      50-way split registers all 50 correctly and quickly, but the CLI branch
-      table then prints 50 rows and `next_live` walks them one at a time.
-      Wants grouping by (relationship, destination) with a count, and a
-      "follow N of them" sample — a UX design job, not a bug.
-- [ ] **T7c — a merge point stalls until its bin fills.** Following one child
-      into a 50-entry MergeContent bin, the step run-onces the merger and
-      nothing happens (correctly — 49 files are missing) and reports
-      `stalled`. It should recognise a merging destination and say "this
-      processor is binning: it needs N more FlowFiles before it will emit",
-      which means reading `Minimum Number of Entries`/`Max Bin Age` and the
-      queue depth. Needs a design decision about how much processor-specific
-      knowledge the stepper is allowed.
+- [x] **T7b — a wide fork folds into one row.** *(done 2026-08-20)*
+      `FlowFollower.branch_groups()` folds branches by (relationship,
+      destination); above 12 branches the CLI prints the grouped view — count,
+      live/muted/done, three sample uuids, and the `m dest:<x>` that mutes the
+      whole group — with `b all` still listing every row. Branch **numbers are
+      preserved**, so `s N` and `m N` keep working on a folded list. 50 rows
+      for what is one branch fifty times over was the complaint; the useful
+      sentence is "50 went to Merge on 'split', none muted".
+- [x] **T7c — a merge point says it is binning, not stalled.** *(done
+      2026-08-20)* `_binning_note()` reads the destination's *materialised*
+      properties (new `client.processor_config()`) and, when it declares a
+      minimum-entries/records threshold, replaces "ran 'Merge' 8x and this
+      FlowFile has not moved" with "'Merge' is binning, not stuck: its queue
+      holds 1 FlowFile and it needs 50 before it emits anything (49 more, or
+      10 sec passes)". The design decision the ticket asked for: **property-
+      driven, not type-driven** — any processor declaring such a threshold
+      bins, including work's own, and no curated type list has to be kept.
+      Both key namespaces are read (1.24 keys MergeRecord's thresholds
+      kebab-case), an EL/parameter value is treated as unknowable rather than
+      guessed, and a failure to read the processor never breaks a step.
 - [ ] **T7d — MergeContent emits one fewer hop per input on 2.7.2.** The same
       50-way merge gives `50 × ATTRIBUTES_MODIFIED + 1 JOIN + 50 DROP` on
       1.24 but `1 JOIN + 50 DROP` on 2.7.2 (no ATTRIBUTES_MODIFIED). Any
       test asserting hop counts across a merge differs by line; the live
       tests here deliberately assert shape, not counts.
-- [ ] **T7e — empty-`searchTerms` provenance queries are unreliable on 2.x.**
+- [x] **T7e — empty-`searchTerms` provenance queries are refused.**
       Observed on 2.7.2: events belonging to since-deleted process groups are
       *counted* in `totalCount` but never returned, so an unfiltered "what
       happened recently" query answered `total: '0'` at maxResults 100 and
-      500, then `106` at 1000. Always pass a search term. niflow does not
-      currently issue an unfiltered query; this is a landmine for anything
-      that adds one.
+      500, then `106` at 1000. niflow never issued one, but nothing stopped
+      the next person adding it. *(2026-08-20)* `_provenance_query` now raises
+      on empty `searchTerms` and says what to filter by — refusing beats
+      silently answering with a fraction of the events.
 - [x] **T7f — webgui's `hopCard()` renders `lineage`.** *(done 2026-08-20)*
       The JS twin now makes the same choice `format_hop` does: a hop carrying
       `lineage` shows the ⤳ note **instead of** a diff table (a relative's
