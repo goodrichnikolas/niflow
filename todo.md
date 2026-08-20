@@ -1,5 +1,25 @@
 # niflow — TODO / future work
 
+## Where things stand — 2026-08-20
+The 2026-08-19 ticket sweep (T1–T17) is **closed**: every ticket is done except
+the two that cannot be done from here — **T7a** (bounding "recent events" by
+time rather than count, which changes what "recent" means) and **T7h** (needs a
+cluster). **T7d** is a recorded fact about MergeContent's hop counts, not a
+task.
+
+Every fuzz P-finding is closed too. Sweeps as of today: offline **3,419 cases /
+0 findings**; tier 3 **120 / 0 on 2.7.2 and 120 / 0 on 1.24.0**. Unit tests 685;
+`make test-integration` green on 2.7.2.
+
+Still open, all of them enhancements rather than tickets:
+
+* fixture injection for `follow` (testing.py's injector as a `--source`-like
+  input), watch expressions, replay-after-fix — the stepper's next step;
+* fuzz-harness coverage gaps: a controller-service *catalog* sweep, a case kind
+  for parameter contexts with real secrets, and `apply.py` failure injection;
+* T7a and T7h above.
+
+
 ## Push & version control
 ### 2.x in-place push (replace templates with copy/paste)
 The in-place rebuild (preserve group id + registry linkage) currently relies on NiFi 1.x
@@ -95,8 +115,12 @@ Steps (do registry/test infra FIRST so we can probe the schema live before commi
       first-ever snapshot push of a ported flow to 2.x flushed them out).
 - [x] Variables (1.x registry) now APPLY incrementally (async update-request dance,
       null value = delete); live-verified on 1.24. 2.x still warns (no registry there).
-- [ ] Funnel-heavy flows: connection identity for funnels is ordinal-based; inserting
-      a funnel mid-list churns adjacent connections. Fine for now.
+- [x] Funnel-heavy flows: funnel identity is **topology-based**, not ordinal.
+      Fixed 2026-08-18 (`plan.match_funnels`/`funnel_signatures`, also used by
+      the applier so plan and apply resolve the same live funnel): funnels with
+      the same connection signature pair in listed order, and rewired leftovers
+      pair by best endpoint overlap, so inserting or rewiring a funnel stays
+      connection churn instead of funnel churn.
 
 ## Work-connection hardening + web GUI (2026-07-27) — SHIPPED
 - [x] `.niflow.env` config file (defaults < file < env), mTLS client-cert auth
