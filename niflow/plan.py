@@ -429,6 +429,7 @@ def _diff_properties(
     """
     from niflow.processors.rules import (
         canonical_properties, descriptors_for_target, import_created_properties,
+        unsupported_properties,
     )
 
     live = canonical_properties(type_str, live)
@@ -436,11 +437,20 @@ def _diff_properties(
     descriptors = descriptors_for_target(type_str, target_major)
     fields: Dict[str, Tuple[Any, Any]] = {}
     server_managed = import_created_properties(type_str, target_major)
+    # Properties the target line does not have at all. The emitter already
+    # omits them from the snapshot and says so loudly (and `validate` fails on
+    # them against the baseline), so re-reporting them as drift on every plan
+    # is the "cries wolf" pattern: the plan would never converge and the real
+    # changes would be buried under an intent that cannot land there.
+    impossible = set(unsupported_properties(type_str, desired, target_major)) \
+        if target_major is not None else set()
     for key in sorted(set(live) | set(desired)):
         a, b = live.get(key), desired.get(key)
         if key in server_managed and b is None and a is not None:
             # The import wired a service it created into this property; the
             # model saying nothing is not a request to unset it.
+            continue
+        if key in impossible and a is None:
             continue
         allowable = (descriptors.get(key) or {}).get("allowable")
         default = (descriptors.get(key) or {}).get("default")

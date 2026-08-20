@@ -835,8 +835,18 @@ all produce a non-empty plan in both directions.
       secrets, and `apply.py` failure injection (the incremental applier is only
       covered through the live tier).
 ## Fuzz round two — offline and live sweeps are clean (2026-08-20)
-Tier 3 against 2.7.2: **120 cases, 0 findings** (was 10 `live_push_update` +
-2 `validate_false_positive` when the day started). Three things closed it:
+Tier 3: **120 cases, 0 findings on 2.7.2 and 0 on 1.24.0** (2.7.2 started the
+day at 10 `live_push_update` + 2 `validate_false_positive`; 1.24 kept one
+`live_push_update` after those fixes). Four things closed it:
+
+* **A property the target line does not have is not drift.** 1.24's last
+  finding: a model stating `PublishAMQP`'s 2.x-only `Headers Source`. The
+  emitter already omits it from the snapshot and warns, and `validate` fails
+  on it against the baseline — so the live side can never have it, and
+  reporting it as a change on every plan is the cries-wolf pattern again, with
+  the real changes buried under an intent that cannot land. `_diff_properties`
+  skips a desired-only key the target line does not have; on the line that
+  *does* have it, it is an ordinary change.
 
 * **NiFi 2.x creates components of its own on import.** The AWS processors'
   inline credentials became a controller service in 2.x, and the import

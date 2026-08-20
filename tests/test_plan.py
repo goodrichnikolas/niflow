@@ -445,3 +445,27 @@ def test_a_service_the_import_does_not_create_is_still_removed():
     changes = diff_flows(live, desired, 2)
     assert [(c.op, c.kind, c.name) for c in changes] == [
         ("remove", "controller_service", "Pool")]
+
+
+def test_a_property_the_target_line_cannot_have_is_not_drift():
+    """The emitter omits it and says so; the plan must not cry wolf forever.
+
+    `Headers Source` is a 2.x-only PublishAMQP property. Pushed to 1.24 it is
+    dropped from the snapshot with a warning (and `validate` fails on it
+    against the baseline), so the live side will never have it — reporting it
+    as a change on every plan buries the real ones.
+    """
+    from niflow.core import Flow, Processor
+
+    amqp = "org.apache.nifi.amqp.processors.PublishAMQP"
+    live = Flow("F")
+    live.add(Processor(name="Pub", type=amqp, properties={"AMQP Version": "0.9.1"}))
+    desired = Flow("F")
+    desired.add(Processor(name="Pub", type=amqp, properties={
+        "AMQP Version": "0.9.1", "Headers Source": "FLOWFILE_ATTRIBUTES"}))
+
+    assert diff_flows(live, desired, 1) == []
+    # On the line that HAS the property it is an ordinary change.
+    changes = diff_flows(live, desired, 2)
+    assert [c.fields for c in changes] == [
+        {"properties[Headers Source]": (None, "FLOWFILE_ATTRIBUTES")}]
