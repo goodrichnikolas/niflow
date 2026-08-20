@@ -1165,16 +1165,23 @@ on both lines).
       500, then `106` at 1000. Always pass a search term. niflow does not
       currently issue an unfiltered query; this is a landmine for anything
       that adds one.
-- [ ] **T7f — webgui's `hopCard()` does not render `lineage`.** The CLI's
-      `format_hop` shows the merge/fork note; the GUI's JS twin still needs
-      the same branch (and could colour a synthetic `CROSS`/`MOVED` hop
-      differently). Owner: whoever holds webgui.py.
-- [ ] **T7g — `niflow trace` on an unknown uuid prints an empty journey.**
-      `trace_flowfile` now returns `truncated`, and an unknown uuid returns
-      zero hops with no complaint. The CLI (cli.py, not this pass's file)
-      should say "no provenance for this uuid — it may have aged out of the
-      repository, or the uuid is wrong" and surface `truncated` as "showing
-      the newest N of a longer journey".
+- [x] **T7f — webgui's `hopCard()` renders `lineage`.** *(done 2026-08-20)*
+      The JS twin now makes the same choice `format_hop` does: a hop carrying
+      `lineage` shows the ⤳ note **instead of** a diff table (a relative's
+      event diffed against this file is nonsense, so its diff is deliberately
+      empty and the table would have read "no attribute changes" where the
+      explanation belongs), plus the CLI's "continues as <uuid>" jump for each
+      child. A synthetic hop (`CROSS`/`MOVED` — a port crossing or a transfer
+      NiFi recorded no event for) drops the time/size stamp, because "0 B"
+      there reads as an empty FlowFile, and draws dashed (`.hop.synth`) so it
+      is visibly not a real event. Both tabs share the one renderer.
+- [x] **T7g — a capped trace says so.** *(done 2026-08-20)* The unknown-uuid
+      case already printed "wrong UUID, or the events have aged out"; what was
+      missing was `truncated`. `niflow trace` now prints "Showing the newest N
+      hops of a longer journey — the file's earlier hops are not below" and
+      takes `--max-events N`, and the Trace tab says "hop #1 below is not
+      where this FlowFile began". Hop #1 of a capped journey being read as the
+      origin is exactly the wrong conclusion to let someone draw.
 - [ ] **T7h — not testable locally.** No cluster, so: primary-node-only
       scheduling, load-balanced connections actually redistributing, and
       `disconnectedNodeAcknowledged` semantics are all untested. Nor is real

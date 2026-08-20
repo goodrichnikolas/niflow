@@ -4,6 +4,7 @@ A NiFiClient-shaped stub scripts a tiny flow — Gen -(c1)-> Mid -(c2)-> Sink �
 and run-once side effects move the file and append provenance hops, so the
 follower's quiesce/step/fork/auto/restore logic runs without a live NiFi.
 """
+import argparse
 import pytest
 
 from niflow.follow import (
@@ -1186,3 +1187,40 @@ def test_only_our_own_drop_ends_the_branch(stub):
     f.pick_flowfile()
     outcome = f.step()
     assert outcome["dropped"] is False
+
+
+def test_cli_trace_says_when_the_journey_was_capped(monkeypatch, capsys):
+    """T7g: hop #1 of a capped trace is not the origin — the CLI has to say so."""
+    from niflow import cli
+
+    hop = {
+        "flowfile_uuid": "u1", "own": True, "event_id": 9, "event_type": "SEND",
+        "time": "12:00:00.000", "component": "Put", "component_id": "p1",
+        "group_id": "g1", "relationship": "success", "size": 10,
+        "attributes": {"a": "1"}, "changes": [], "children": [], "parents": [],
+        "input_available": False, "output_available": False, "content_equal": None,
+    }
+
+    class C:
+        def trace_flowfile(self, uuid, max_events=1000):
+            assert max_events == 5
+            return {"uuid": uuid, "hops": [hop], "truncated": True}
+
+    monkeypatch.setattr(cli, "_client", lambda: C())
+    args = argparse.Namespace(uuid="u1", full=False, max_events=5)
+    assert cli.cmd_trace(args) == 0
+    out = capsys.readouterr().out
+    assert "newest 1 hops of a longer journey" in out
+
+
+def test_cli_trace_is_quiet_when_the_journey_is_complete(monkeypatch, capsys):
+    from niflow import cli
+
+    class C:
+        def trace_flowfile(self, uuid, max_events=1000):
+            return {"uuid": uuid, "hops": [], "truncated": False}
+
+    monkeypatch.setattr(cli, "_client", lambda: C())
+    assert cli.cmd_trace(argparse.Namespace(uuid="u1", full=False, max_events=1000)) == 1
+    out = capsys.readouterr().out
+    assert "No provenance events" in out and "aged out" in out

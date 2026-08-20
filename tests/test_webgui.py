@@ -391,3 +391,24 @@ def test_page_has_a_follow_tab_that_reuses_the_trace_renderer():
     assert PAGE.count("function hopCard(") == 1   # one renderer, two tabs
     assert PAGE.count("=> hopCard(h, i,") == 2   # called from Trace and Follow
     assert "keep running in NiFi" in PAGE         # the mute contract, on screen
+
+
+def test_hop_card_renders_the_lineage_note_like_the_cli_does():
+    """T7f: a merge/fork/port-crossing note was CLI-only; the GUI dropped it.
+
+    `format_hop` prints "⤳ this FlowFile was merged into abc123… here" and
+    stops — no diff table, because a relative's event diffed against this file
+    is nonsense. The JS twin has to make the same choice, or the GUI shows an
+    empty "no attribute changes" where the explanation should be.
+    """
+    assert "h.lineage" in PAGE
+    assert '<div class="lineage">' in PAGE
+    assert "continues as" in PAGE            # the child-uuid jump the CLI offers
+    assert 'h.synthetic ? "" :' in PAGE      # no time/size on an eventless hop
+    assert ".hop.synth" in PAGE              # and it doesn't look like a real hop
+
+
+def test_trace_tab_says_when_the_journey_was_capped():
+    """T7g: a capped trace shows the NEWEST N hops, so #1 is not the origin."""
+    assert "t.truncated" in PAGE
+    assert "not where this FlowFile" in PAGE

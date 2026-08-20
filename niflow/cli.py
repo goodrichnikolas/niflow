@@ -497,12 +497,19 @@ def cmd_trace(args: argparse.Namespace) -> int:
     """Print one FlowFile's provenance journey, hop by hop."""
     from niflow.follow import annotate_hops, format_hop
 
-    trace = _client().trace_flowfile(args.uuid)
+    trace = _client().trace_flowfile(args.uuid, max_events=args.max_events)
     hops = trace["hops"]
     if not hops:
         print(f"No provenance events for {args.uuid} — wrong UUID, or the "
               "events have aged out of the provenance repository.")
         return 1
+    # A capped journey is the newest N events, not the first N — saying so
+    # matters, because the hop numbered 1 is then NOT where the file began and
+    # reading it as the origin is the wrong conclusion.
+    if trace.get("truncated"):
+        print(f"Showing the newest {len(hops)} hops of a longer journey — "
+              f"the file's earlier hops are not below "
+              f"(raise --max-events to see further back).\n")
     # Same annotation the stepper applies, so trace and follow render
     # identically (added/changed/removed + content changes).
     annotate_hops(hops)
@@ -827,6 +834,9 @@ def main(argv: Optional[list] = None) -> int:
     p.add_argument("uuid", help="FlowFile UUID (from a queue listing, bulletin, or log)")
     p.add_argument("--full", action="store_true",
                    help="Show every attribute at every hop, not just what changed")
+    p.add_argument("--max-events", type=int, default=1000, metavar="N",
+                   help="Cap the journey at the newest N provenance events "
+                        "(default 1000; a capped trace says so)")
     p.set_defaults(func=cmd_trace)
 
     p = sub.add_parser(

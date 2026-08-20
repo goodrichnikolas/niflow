@@ -669,6 +669,12 @@ PAGE = r"""<!doctype html>
   .hop .hophead { display:flex; gap:.6rem; align-items:center; flex-wrap:wrap;
                   margin-bottom:.4rem; }
   .hop table { width:auto; min-width:50%; }
+  /* A hop with no event behind it (a port crossing, a transfer NiFi did not
+     record) or one belonging to a relative on the same lineage: dashed, so it
+     is visibly not something that happened to this FlowFile at this second. */
+  .hop.synth { border-style:dashed; }
+  .hop .lineage { color:var(--muted); margin:.2rem 0 .3rem; }
+  .hop .lineage .arrow { color:var(--accent); margin-right:.35rem; }
   /* The stepper's headline: what changed at this hop has to catch the eye. */
   .hop.flash { animation: hopflash 1.6s ease-out; }
   @keyframes hopflash { 0%, 35% { background:var(--flash); } 100% { background:transparent; } }
@@ -821,18 +827,35 @@ function hopCard(h, i, flash) {
   const kin = (label, uuids) => (uuids || []).map(u =>
     `<div class="muted">${label} ${esc(u)}
        <button class="op" onclick="traceJump('${esc(u)}')">trace</button></div>`).join("");
-  return `<div class="hop${flash ? " flash" : ""}">
+  // The CLI's format_hop() twin. A hop carrying `lineage` is either synthetic
+  // (a port crossing / an unrecorded transfer: no event, so no time and no
+  // size — printing "0 B" there reads as an empty FlowFile) or an event on a
+  // relative's FlowFile that the lineage query returned. Either way its diff
+  // is deliberately empty, so the note replaces the table instead of sitting
+  // above an unhelpful "no attribute changes".
+  const synthetic = h.synthetic || h.lineage;
+  const stamp = h.synthetic ? "" :
+    `<span class="muted">${esc(h.time)} · ${esc(h.size)} B</span>`;
+  const note = h.lineage
+    ? `<div class="lineage"><span class="arrow">⤳</span>${esc(h.lineage)}</div>` : "";
+  const continues = h.lineage
+    ? (h.children || []).map(u =>
+        `<div class="muted">continues as ${esc(u)}
+           <button class="op" onclick="traceJump('${esc(u)}')">trace</button></div>`).join("")
+    : "";
+  return `<div class="hop${flash ? " flash" : ""}${synthetic ? " synth" : ""}">
     <div class="hophead">
       <b>#${i + 1} ${compLink(h.group_id, h.component_id, h.component || "(flow)")}</b>
       <span class="pill">${esc(h.event_type)}${h.relationship ? " → " + esc(h.relationship) : ""}</span>
-      <span class="muted">${esc(h.time)} · ${esc(h.size)} B</span>
+      ${stamp}
       <span style="flex:1"></span>
       <button class="op" onclick="hopAttrs(${i})">Attributes</button>
       ${h.input_available ? `<button class="op" onclick="hopContent(${i},'input')">Content in</button>` : ""}
       ${h.output_available ? `<button class="op" onclick="hopContent(${i},'output')">Content out</button>` : ""}
     </div>
-    ${diffTable(h)}
-    ${kin("joined from", h.parents)}${kin("spawned", h.children)}
+    ${note}
+    ${h.lineage ? continues : diffTable(h) +
+        kin("joined from", h.parents) + kin("spawned", h.children)}
     <pre id="hopx${i}" style="display:none"></pre>
   </div>`;
 }
@@ -1026,7 +1049,11 @@ async function render() {
         </div>` + (!t ? "" : !t.hops.length
         ? `<p class="muted">No provenance events for this UUID — wrong id, or the
              events have aged out of the provenance repository.</p>`
-        : t.hops.map((h, i) => hopCard(h, i, false)).join(""));
+        : (t.truncated
+            ? `<p class="muted">Showing the newest ${t.hops.length} hops of a
+                 longer journey — hop #1 below is not where this FlowFile
+                 began.</p>` : "")
+          + t.hops.map((h, i) => hopCard(h, i, false)).join(""));
       const tu = $("#tu");
       tu.onkeydown = e => { if (e.key === "Enter") traceGo(); };
     }
