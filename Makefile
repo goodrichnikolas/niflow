@@ -19,7 +19,8 @@ PY ?= $(shell \
 PIP ?= $(if $(filter uv,$(firstword $(PY))),uv pip,$(PY) -m pip)
 
 .PHONY: help install nifi-up nifi-down nifi-logs nifi-wait nifi1-up nifi1-down nifi1-wait \
-	test test-integration test-integration-v1 fuzz fuzz-v1 catalog catalog-v1 version-map convert example clean \
+	test test-integration test-integration-v1 fuzz fuzz-v1 catalog catalog-v1 \
+	import-defaults import-defaults-v1 version-map convert example clean \
 	list pull push copy diff validate gui
 
 help:
@@ -55,6 +56,8 @@ help:
 	@echo "                         (TIER=1|2|3 COUNT=n SEED=n TYPES=re RESUME=1; exit 1 = found one)"
 	@echo "    catalog              Regenerate processor/service catalogs from NiFi"
 	@echo "    catalog-v1           Regenerate the 1.x property compat table (localhost:8444)"
+	@echo "    import-defaults      Record what a flow IMPORT writes that create does not"
+	@echo "                         (import-defaults-v1 for 1.24; one block per line)"
 	@echo "    version-map          Rebuild the 1.x-vs-2.x property difference map (BOTH NiFis up)"
 	@echo "    fixtures             Refresh real-server golden snapshots (tests/fixtures/real/)"
 	@echo "    convert              make convert IN=flow.json OUT=flow.py [FLAGS=...]"
@@ -200,6 +203,17 @@ catalog:
 
 catalog-v1:
 	NIFLOW_NIFI_HOST=https://localhost:8444/nifi-api $(PY) -m niflow.codegen --compat
+
+# What a NiFi line writes onto a component when it IMPORTS a flow, over and
+# above the property descriptors' own defaults (2.7.2 gives a JsonRecordSetWriter
+# `Allow Scientific Notation = true` on import, `false` on create). Run once per
+# line — each writes its own block into niflow/import_defaults.py and leaves the
+# other alone. Both containers up:  make import-defaults import-defaults-v1
+import-defaults:
+	$(PY) -m niflow.codegen --import-defaults
+
+import-defaults-v1:
+	NIFLOW_NIFI_HOST=https://localhost:8444/nifi-api $(PY) -m niflow.codegen --import-defaults
 
 # Regenerate the cross-version property difference map (niflow/version_map.py)
 # and its human-readable report (docs/version-compat.md). Needs BOTH lines up:

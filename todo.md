@@ -868,18 +868,36 @@ plan to see). Without those two, the fix would have traded 344 findings for
       `enabled` is an honest two-way assertion and a stated `RUNNING` no longer
       drifts forever. Cover: tests/test_pull_run_state.py.
 
-- [ ] **P3 — a live property whose value NiFi materialises differently from its
-      own descriptor default drifts forever.** Sibling of the `''` vs unset P3.
-      Live on 2.7.2: a pushed `JsonRecordSetWriter` comes back with
-      `Allow Scientific Notation = 'true'` while the service's own descriptor
-      (harvest *and* live REST) says the default is `'false'`, so
-      `_diff_properties` reads the model's effective value as `'false'` and
-      plans `'true' -> None` on every run. niflow never emitted the property —
-      NiFi wrote it on import. Repro: push any flow with a
-      `JsonRecordSetWriter` to 2.7.2 and plan. Fix direction: probably the same
-      one as the 1.x-only-property P2 — a live property the model does not
-      state, and whose value niflow cannot have caused, is not ours to unset.
-      Server line: 2.x (the 1.24 twin of it is `schema-protocol-version`).
+- [x] **P3 — a live property NiFi materialises differently from its own
+      descriptor default.** *(fixed 2026-08-20, verified live on 2.7.2 and
+      1.24.0)* It is the **import** path, not create: creating a
+      `JsonRecordSetWriter` through the REST API on 2.7.2 gives
+      `Allow Scientific Notation = 'false'`, exactly as its descriptor says —
+      *importing* a flow snapshot that never mentions the property gives
+      `'true'`, because NiFi preserves the behaviour older flows had. Nothing
+      niflow emitted it, and no descriptor predicts it, so the differ read it
+      as drift and planned `'true' -> None` on every run. Harmless while the
+      applier silently dropped removals; the moment it stopped dropping them
+      (fix above) it became a real write NiFi would immediately undo, on every
+      push, stopping and restarting the component each time.
+      `python -m niflow.codegen --import-defaults` (`make import-defaults`,
+      `make import-defaults-v1`) pushes one instance of every type through the
+      real import path in batches and records every property whose materialised
+      value differs from its descriptor default, into
+      **`niflow/import_defaults.py`**, keyed by NiFi major so each line can be
+      harvested on its own. Sensitive properties are excluded — NiFi returns
+      `********` for them, and a mask is not a default.
+      `rules.descriptors_for_target()` overlays them, so silence is worth what
+      the server will actually put there and an explicit value is still an
+      assertion that gets diffed.
+      **The shape of it:** 2.7.2 diverges on exactly two types —
+      `JsonRecordSetWriter` (`Allow Scientific Notation`) and
+      `AWSCredentialsProviderControllerService` (`Use Anonymous Credentials`).
+      1.24.0 diverges on **none**: every property it materialises equals its own
+      descriptor default, so the `schema-protocol-version` twin was really the
+      2.x-catalog-has-no-descriptor bug, which `descriptors_for_target` already
+      fixed. Live proof: push a flow with a `JsonRecordSetWriter` to 2.7.2 and
+      plan — zero changes.
 
 ## 1.x in-place push fidelity (2026-08-19) — FIXED, verified live on 1.24 + 2.7.2
 The fuzz P1 above: a registry-versioned group on 1.24/1.28 is rebuilt by

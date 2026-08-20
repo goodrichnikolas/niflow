@@ -279,6 +279,7 @@ def descriptors_for_target(
     own defaults are.
     """
     base = dict(descriptors_for(type_str) or {})
+    base = _with_import_defaults(base, type_str, major_version)
     if major_version != 1:
         return base
     v1 = _compat_entry("DESCRIPTORS", type_str)
@@ -289,6 +290,49 @@ def descriptors_for_target(
     for name, entry in v1.items():
         base[v1_by_canonical.get(name, name)] = entry
     return base
+
+
+def import_defaults_for(type_str: str, major_version: Optional[int]) -> Dict[str, str]:
+    """What *importing a flow* makes this line write onto a type, by property.
+
+    Distinct from a descriptor default and not predictable from one: creating a
+    ``JsonRecordSetWriter`` through the REST API on 2.7.2 gives
+    ``Allow Scientific Notation = 'false'`` exactly as its descriptor says, but
+    importing a flow snapshot that never mentions the property gives ``'true'``
+    (NiFi preserving what older flows did). Harvested through the real import
+    path by ``python -m niflow.codegen --import-defaults``; empty when that has
+    not been run for this line, which is the old behaviour.
+    """
+    if major_version is None:
+        return {}
+    try:
+        from niflow.import_defaults import IMPORT_DEFAULTS
+    except Exception:
+        return {}
+    return dict((IMPORT_DEFAULTS.get(major_version) or {}).get(type_str) or {})
+
+
+def _with_import_defaults(
+    descriptors: Dict[str, dict], type_str: str, major_version: Optional[int]
+) -> Dict[str, dict]:
+    """Overlay the import defaults as *the* default for the keys they cover.
+
+    The server's own behaviour on import beats what its descriptors advertise:
+    a model that says nothing about the property will end up holding this
+    value, so this is what "unset" is worth on that line. Without it the differ
+    read the materialised value as drift and planned an unset on every run —
+    which, once the applier learned to really send removals, became a write
+    NiFi would immediately undo.
+    """
+    overlay = import_defaults_for(type_str, major_version)
+    if not overlay:
+        return descriptors
+    out = dict(descriptors)
+    for key, value in overlay.items():
+        entry = dict(out.get(key) or {})
+        entry["default"] = value
+        out[key] = entry
+    return out
 
 
 # Types whose *dynamic properties become relationships* (RouteOnAttribute's

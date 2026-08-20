@@ -286,3 +286,55 @@ def test_curated_rename_normalises_a_pulled_1x_key():
         "org.apache.nifi.dbcp.DBCPConnectionPool",
         {"dbcp-max-conn-lifetime": "-1"},
     ) == {"Maximum Connection Lifetime": "-1"}
+
+
+# --- what a flow IMPORT writes, over the descriptors' own defaults -----------
+
+JSON_WRITER = "org.apache.nifi.json.JsonRecordSetWriter"
+
+
+def test_import_default_becomes_the_effective_default_on_that_line():
+    """Verified live on 2.7.2: create says 'false', import says 'true'.
+
+    NiFi preserves what older flows did when it imports a snapshot that never
+    mentions the property, so 'true' is what a silent model is worth there.
+    """
+    from niflow.processors.rules import descriptors_for_target, import_defaults_for
+
+    assert import_defaults_for(JSON_WRITER, 2) == {"Allow Scientific Notation": "true"}
+    assert descriptors_for_target(JSON_WRITER, 2)["Allow Scientific Notation"][
+        "default"] == "true"
+    # 1.24 materialises its descriptors' own defaults — nothing to overlay.
+    assert import_defaults_for(JSON_WRITER, 1) == {}
+    assert descriptors_for_target(JSON_WRITER, 1)["Allow Scientific Notation"][
+        "default"] == "false"
+
+
+def test_an_unstated_import_default_is_not_drift():
+    """The regression this closes: plan said 'true' -> None on every run.
+
+    Harmless while the applier silently dropped removals; a real write NiFi
+    would immediately undo once it stopped dropping them.
+    """
+    from niflow.plan import _diff_properties
+
+    assert _diff_properties({"Allow Scientific Notation": "true"}, {},
+                            JSON_WRITER, 2) == {}
+
+
+def test_stating_the_other_value_is_still_drift():
+    """Silence takes the server's value; an explicit value is an assertion."""
+    from niflow.plan import _diff_properties
+
+    fields = _diff_properties({"Allow Scientific Notation": "true"},
+                              {"Allow Scientific Notation": "false"},
+                              JSON_WRITER, 2)
+    assert fields == {"properties[Allow Scientific Notation]": ("true", "false")}
+
+
+def test_no_import_data_for_a_line_changes_nothing():
+    from niflow.processors.rules import descriptors_for_target, import_defaults_for
+
+    assert import_defaults_for(JSON_WRITER, None) == {}
+    assert descriptors_for_target(JSON_WRITER, None)["Allow Scientific Notation"][
+        "default"] == "false"
