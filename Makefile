@@ -1,9 +1,31 @@
+# --- interpreter discovery ----------------------------------------------------
+# Not every machine has a bare `python` on PATH (work's doesn't), and the
+# project may live in a venv or be uv-managed. Take the first that exists:
+#   1. an activated virtualenv ($VIRTUAL_ENV)
+#   2. a project-local ./.venv
+#   3. `uv run python`, when uv is installed AND this is a uv project (uv.lock)
+#   4. python3, else plain python
+# The user always wins:  make PY=/path/to/python <target>   (`make help` prints
+# which interpreter was detected).
+PY ?= $(shell \
+	if [ -n "$$VIRTUAL_ENV" ] && [ -x "$$VIRTUAL_ENV/bin/python" ]; then echo "$$VIRTUAL_ENV/bin/python"; \
+	elif [ -x .venv/bin/python ]; then echo .venv/bin/python; \
+	elif command -v uv >/dev/null 2>&1 && [ -f uv.lock ]; then echo "uv run python"; \
+	elif command -v python3 >/dev/null 2>&1; then echo python3; \
+	else echo python; fi)
+# uv owns its environment, so install through `uv pip`; otherwise use the
+# detected interpreter's own pip, so `make install` lands where `make test`
+# will look for it.
+PIP ?= $(if $(filter uv,$(firstword $(PY))),uv pip,$(PY) -m pip)
+
 .PHONY: help install nifi-up nifi-down nifi-logs nifi-wait nifi1-up nifi1-down nifi1-wait \
-	test test-integration test-integration-v1 catalog catalog-v1 convert example clean \
+	test test-integration test-integration-v1 fuzz fuzz-v1 catalog catalog-v1 version-map convert example clean \
 	list pull push copy diff validate gui
 
 help:
 	@echo "NiFlow make targets:"
+	@echo ""
+	@echo "  Interpreter: $(PY)  (override: make PY=/path/to/python <target>)"
 	@echo ""
 	@echo "  Workflow (against the NiFi in NIFLOW_NIFI_HOST, default local Docker):"
 	@echo "    list             Show the process-group tree with ids"
@@ -18,7 +40,7 @@ help:
 	@echo "    explain, backup, rollback, commit, doctor, pull/push --all"
 	@echo ""
 	@echo "  Environment:"
-	@echo "    install          Install niflow + dev deps (editable)"
+	@echo "    install          Install niflow + dev deps (editable, via $(PIP))"
 	@echo "    nifi-up          Start local NiFi 2.7.2  (https://localhost:8443/nifi)"
 	@echo "    nifi1-up         Start local NiFi 1.24.0 (https://localhost:8444/nifi)"
 	@echo "    nifi-wait        Block until NiFi 2.x is healthy   (nifi1-wait for 1.24)"
@@ -29,48 +51,51 @@ help:
 	@echo "    test                 Run unit tests (no NiFi required)"
 	@echo "    test-integration     Integration tests against NiFi 2.x (localhost:8443)"
 	@echo "    test-integration-v1  Integration tests against NiFi 1.24 (localhost:8444)"
+	@echo "    fuzz                 Bug-hunt: thousands of generated micro-flows"
+	@echo "                         (TIER=1|2|3 COUNT=n SEED=n TYPES=re RESUME=1; exit 1 = found one)"
 	@echo "    catalog              Regenerate processor/service catalogs from NiFi"
 	@echo "    catalog-v1           Regenerate the 1.x property compat table (localhost:8444)"
+	@echo "    version-map          Rebuild the 1.x-vs-2.x property difference map (BOTH NiFis up)"
 	@echo "    fixtures             Refresh real-server golden snapshots (tests/fixtures/real/)"
 	@echo "    convert              make convert IN=flow.json OUT=flow.py [FLAGS=...]"
 	@echo "    example              Deploy examples/simple_etl.py"
 	@echo "    clean                Remove caches and NiFi data dirs"
 
 install:
-	pip install -e ".[dev]"
+	$(PIP) install -e ".[dev]"
 
 # --- live-NiFi workflow -------------------------------------------------------
 
 list:
-	python -m niflow list
+	$(PY) -m niflow list
 
 copy:
 	@if [ -z "$(GROUP)" ]; then echo "Usage: make copy GROUP=<name-or-id> [NAME='My Copy']"; exit 2; fi
-	python -m niflow copy "$(GROUP)" $(if $(NAME),--name "$(NAME)")
+	$(PY) -m niflow copy "$(GROUP)" $(if $(NAME),--name "$(NAME)")
 
 pull:
 	@if [ -z "$(GROUP)" ] || [ -z "$(OUT)" ]; then \
 		echo "Usage: make pull GROUP=<name-or-id> OUT=flows/my_flow.py"; exit 2; \
 	fi
-	python -m niflow pull "$(GROUP)" -o "$(OUT)"
+	$(PY) -m niflow pull "$(GROUP)" -o "$(OUT)"
 
 diff:
 	@if [ -z "$(FILE)" ]; then echo "Usage: make diff FILE=flows/my_flow.py"; exit 2; fi
-	python -m niflow diff "$(FILE)"
+	$(PY) -m niflow diff "$(FILE)"
 
 validate:
 	@if [ -z "$(FILE)" ]; then echo "Usage: make validate FILE=flows/my_flow.py"; exit 2; fi
-	python -m niflow validate "$(FILE)"
+	$(PY) -m niflow validate "$(FILE)"
 
 push:
 	@if [ -z "$(FILE)" ]; then echo "Usage: make push FILE=flows/my_flow.py [START=1]"; exit 2; fi
-	python -m niflow push "$(FILE)" $(if $(START),--start)
+	$(PY) -m niflow push "$(FILE)" $(if $(START),--start)
 
 gui:
-	python -m niflow.gui
+	$(PY) -m niflow.gui
 
 webgui:
-	python -m niflow.webgui --reload
+	$(PY) -m niflow.webgui --reload
 
 # --- local NiFi containers ----------------------------------------------------
 
@@ -140,35 +165,74 @@ nifi-logs:
 # --- tests / codegen ----------------------------------------------------------
 
 test:
-	pytest -m "not integration" -v
+	$(PY) -m pytest -m "not integration" -v
 
 test-integration:
-	pytest -m integration -v
+	$(PY) -m pytest -m integration -v
 
 test-integration-v1:
-	NIFLOW_NIFI_HOST=https://localhost:8444/nifi-api pytest -m integration -v
+	NIFLOW_NIFI_HOST=https://localhost:8444/nifi-api $(PY) -m pytest -m integration -v
+
+# Bug-hunting sweep: thousands of generated micro-flows through niflow's own
+# pipeline. Tier 1 needs no NiFi at all and takes seconds; tiers 2/3 push
+# sandboxes into $(NIFLOW_NIFI_HOST) and want a long run:
+#   make fuzz                                    # whole catalog, offline
+#   make fuzz TIER=2 COUNT=200                   # + NiFi's own validation
+#   make fuzz TIER=3 COUNT=100 TYPES='standard\.'  # + live push/pull/plan
+#   make fuzz RESUME=1                           # continue an interrupted sweep
+# Findings land in .niflow-fuzz/ (results.jsonl + a standalone repro per bug).
+fuzz:
+	$(PY) -m niflow fuzz \
+		$(if $(TIER),--tier $(TIER)) \
+		$(if $(COUNT),--count $(COUNT)) \
+		$(if $(SEED),--seed $(SEED)) \
+		$(if $(KINDS),--kinds "$(KINDS)") \
+		$(if $(TYPES),--types "$(TYPES)") \
+		$(if $(OUT),-o "$(OUT)") \
+		$(if $(RESUME),--resume) \
+		$(if $(REPLAY),--replay "$(REPLAY)")
+
+fuzz-v1:
+	NIFLOW_NIFI_HOST=https://localhost:8444/nifi-api $(MAKE) fuzz TIER=$(or $(TIER),3)
 
 catalog:
-	python -m niflow.codegen
+	$(PY) -m niflow.codegen
 
 catalog-v1:
-	NIFLOW_NIFI_HOST=https://localhost:8444/nifi-api python -m niflow.codegen --compat
+	NIFLOW_NIFI_HOST=https://localhost:8444/nifi-api $(PY) -m niflow.codegen --compat
+
+# Regenerate the cross-version property difference map (niflow/version_map.py)
+# and its human-readable report (docs/version-compat.md). Needs BOTH lines up:
+#   make nifi-up nifi1-up && make nifi-wait nifi1-wait && make version-map
+# Point NIFLOW_NIFI_HOST_NEW/_OLD elsewhere to map the pair you actually run
+# (e.g. your 2.x sandbox against work's 1.28) instead of the local containers.
+VERSION_MAP_NEW ?= https://localhost:8443/nifi-api
+VERSION_MAP_OLD ?= https://localhost:8444/nifi-api
+VERSION_MAP_DIR ?= .niflow-rulebooks
+
+version-map:
+	@mkdir -p $(VERSION_MAP_DIR)
+	NIFLOW_NIFI_HOST=$(VERSION_MAP_NEW) $(PY) -m niflow.codegen \
+		--dump-rulebook $(VERSION_MAP_DIR)/new.json
+	NIFLOW_NIFI_HOST=$(VERSION_MAP_OLD) $(PY) -m niflow.codegen \
+		--dump-rulebook $(VERSION_MAP_DIR)/old.json
+	$(PY) -m niflow.versiondiff $(VERSION_MAP_DIR)/new.json $(VERSION_MAP_DIR)/old.json
 
 # Refresh the real-server golden fixtures (tests/fixtures/real/) from the
 # NiFi in NIFLOW_NIFI_HOST. Run once per NiFi line:
 #   make fixtures
 #   NIFLOW_NIFI_HOST=https://localhost:8444/nifi-api make fixtures
 fixtures:
-	python scripts/capture_fixtures.py
+	$(PY) scripts/capture_fixtures.py
 
 convert:
 	@if [ -z "$(IN)" ] || [ -z "$(OUT)" ]; then \
 		echo "Usage: make convert IN=<input> OUT=<output> [FLAGS='--from xml --to py']"; exit 2; \
 	fi
-	python -m niflow.convert $(IN) $(OUT) $(FLAGS)
+	$(PY) -m niflow.convert $(IN) $(OUT) $(FLAGS)
 
 example:
-	python examples/simple_etl.py
+	$(PY) examples/simple_etl.py
 
 clean:
 	rm -rf .pytest_cache **/__pycache__ .nifi-data

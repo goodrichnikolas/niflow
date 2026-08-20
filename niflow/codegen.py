@@ -48,6 +48,21 @@ COMPAT_V1_PATH = _NIFLOW_ROOT / "processors" / "compat_v1.py"
 _HARVEST_GROUP = "__niflow_harvest__"
 _CLIENT_ID = "niflow-codegen"
 
+# A dynamic property name no real processor declares, used to find out whether a
+# type turns dynamic properties into *relationships* (RouteOnAttribute and
+# friends). NiFi 1.x has no ``/flow/processor-definition`` endpoint to ask —
+# 1.24 answers that URL with a 404 — but setting one dynamic property and
+# reading the relationships back works on both lines, so the fact is harvested
+# rather than curated.
+_DYNAMIC_PROBE_PROPERTY = "niflow-harvest-probe"
+
+# Cap on how many allowable values of one property get probed for conditional
+# relationships. A relationship set that turns on a property does so on a small
+# enum (UpdateAttribute's "Store State", RouteOnAttribute's "Routing Strategy");
+# a very long allowable list is a lookup of some sort, not a mode switch, and
+# probing it would cost far more than it can find.
+_MAX_CONDITIONAL_PROBE_VALUES = 12
+
 
 # --- name sanitisation ------------------------------------------------------
 
@@ -212,7 +227,79 @@ def _emit_relationships(rules: dict) -> str:
     return "RELATIONSHIPS = {\n" + "\n".join(lines) + ("\n" if lines else "") + "}\n"
 
 
-def _emit_descriptors(rules: dict) -> str:
+def _emit_primary_node_only(rules: dict) -> str:
+    """Produce ``PRIMARY_NODE_ONLY``: the types NiFi pins to the primary node.
+
+    ``@PrimaryNodeOnly`` processors (ListFTP, ListSFTP, ...) come up with
+    ``executionNode=PRIMARY`` however they were created, and the server will
+    not accept ``ALL``; the differ reads this set so the model's ``ALL``
+    default stops planning a change that can never apply (see
+    :func:`niflow.plan._normalise_field`).
+    """
+    types = sorted(t for t, rule in rules.items() if rule.get("primary_node_only"))
+    lines = [f"    {type_str!r}," for type_str in types]
+    return "PRIMARY_NODE_ONLY = frozenset({\n" + "\n".join(lines) + ("\n" if lines else "") + "})\n"
+
+
+def _emit_type_set(rules: dict, table: str = "TYPES") -> str:
+    """Produce the set of every type the harvest actually instantiated.
+
+    Without this, "harvested and has no properties at all" is indistinguishable
+    from "never harvested": :func:`_emit_property_names` and
+    :func:`_emit_descriptors` both skip a type with an empty table, so ten types
+    that exist on 1.24 (``ForkEnrichment``, ``ExtractEmailAttachments``, the
+    lookup services, ...) read as holes in the compat data and every
+    cross-version lookup for them degraded to "unknown — don't translate".
+    """
+    lines = [f"    {type_str!r}," for type_str in sorted(rules)]
+    return f"{table} = frozenset({{\n" + "\n".join(lines) + ("\n" if lines else "") + "})\n"
+
+
+def _emit_conditional_relationships(rules: dict) -> str:
+    """Produce ``CONDITIONAL_RELATIONSHIPS``: relationships a property switches on.
+
+    A processor's relationship set is not a per-type constant. ``UpdateAttribute``
+    grows a ``set state fail`` relationship the moment ``Store State`` is set to
+    "Store state locally", and NiFi then refuses to start the processor until it
+    is handled — a flow that ``validate`` called clean. Keyed
+    ``{type: {property: {value: (relationships, ...)}}}``, each entry the FULL
+    relationship set while that property holds that value; only values whose set
+    differs from the type's default set are recorded.
+    """
+    lines = []
+    for type_str, rule in sorted(rules.items()):
+        conditional = rule.get("conditional_relationships") or {}
+        if not conditional:
+            continue
+        inner = ", ".join(
+            f"{prop!r}: {{"
+            + ", ".join(
+                f"{value!r}: {tuple(sorted(rels))!r}"
+                for value, rels in sorted(by_value.items())
+            )
+            + "}"
+            for prop, by_value in sorted(conditional.items())
+        )
+        lines.append(f"    {type_str!r}: {{{inner}}},")
+    return ("CONDITIONAL_RELATIONSHIPS = {\n" + "\n".join(lines)
+            + ("\n" if lines else "") + "}\n")
+
+
+def _emit_dynamic_relationships(rules: dict) -> str:
+    """Produce ``DYNAMIC_RELATIONSHIPS``: types whose dynamic properties are relationships.
+
+    Harvested by setting one probe dynamic property and reading the relationship
+    list back, which works on both NiFi lines — the 2.x-only
+    ``/flow/processor-definition`` endpoint (404 on 1.24) is not needed, and this
+    replaces guessing from a curated list.
+    """
+    types = sorted(t for t, rule in rules.items() if rule.get("dynamic_relationships"))
+    lines = [f"    {type_str!r}," for type_str in types]
+    return ("DYNAMIC_RELATIONSHIPS = frozenset({\n" + "\n".join(lines)
+            + ("\n" if lines else "") + "})\n")
+
+
+def _emit_descriptors(rules: dict, table: str = "DESCRIPTORS") -> str:
     """Produce the ``DESCRIPTORS`` map: ``type -> {prop -> {required, allowable, ...}}``.
 
     The harvested property rulebook the validator uses to flag missing required
@@ -223,10 +310,10 @@ def _emit_descriptors(rules: dict) -> str:
         descriptors = rule.get("descriptors") or {}
         if descriptors:
             lines.append(f"    {type_str!r}: {descriptors!r},")
-    return "DESCRIPTORS = {\n" + "\n".join(lines) + ("\n" if lines else "") + "}\n"
+    return f"{table} = {{\n" + "\n".join(lines) + ("\n" if lines else "") + "}\n"
 
 
-def _emit_property_names(rules: dict) -> str:
+def _emit_property_names(rules: dict, table: str = "PROPERTY_NAMES") -> str:
     """Produce the ``PROPERTY_NAMES`` map: ``type -> (canonical prop names)``.
 
     Unlike ``DESCRIPTORS`` this is exhaustive — the differ and emitter use it
@@ -237,7 +324,7 @@ def _emit_property_names(rules: dict) -> str:
         names = rule.get("properties") or []
         if names:
             lines.append(f"    {type_str!r}: {tuple(names)!r},")
-    return "PROPERTY_NAMES = {\n" + "\n".join(lines) + ("\n" if lines else "") + "}\n"
+    return f"{table} = {{\n" + "\n".join(lines) + ("\n" if lines else "") + "}\n"
 
 
 def _render(
@@ -315,26 +402,125 @@ def _trim_descriptors(descriptors: Optional[dict]) -> dict:
         default = d.get("defaultValue")
         if default not in (None, ""):
             entry["default"] = default
+        service = d.get("identifiesControllerService")
+        if service:
+            entry["service"] = service
         allowable = [
             a["allowableValue"]["value"]
             for a in (d.get("allowableValues") or [])
             if a.get("allowableValue")
         ]
-        if allowable:
+        # A controller-service reference's "allowable values" are the service
+        # INSTANCES that happened to exist in the harvest group — live UUIDs,
+        # not an enum. Recording them made every regeneration churn (a fresh id
+        # per run) and gave the validator a stale id list to reject real values
+        # against. The `service` key above is the fact worth keeping.
+        if allowable and not service:
             entry["allowable"] = allowable
-        service = d.get("identifiesControllerService")
-        if service:
-            entry["service"] = service
-        dependencies = [
-            {"property": dep.get("propertyName"),
-             "values": list(dep.get("dependentValues") or [])}
-            for dep in (d.get("dependencies") or [])
-        ]
+        # NiFi hands dependencies (and their values) back out of a Set, so the
+        # order varies run to run. Sort both — the list is ANDed, so order
+        # carries no meaning — otherwise every regeneration churns the diff.
+        # Allowable values are NOT sorted: that order is the UI's.
+        dependencies = sorted(
+            ({"property": dep.get("propertyName"),
+              "values": sorted(dep.get("dependentValues") or [])}
+             for dep in (d.get("dependencies") or [])),
+            key=lambda dep: dep["property"] or "",
+        )
         if dependencies:
             entry["dependencies"] = dependencies
         if entry:
             out[name] = entry
     return out
+
+
+def _probe_relationships(
+    client: Any, created: dict, base: List[str], descriptors: dict
+) -> Tuple[bool, dict]:
+    """Find the relationships a *fresh* instance does not show.
+
+    ``ProcessorDTO.relationships`` on the create response is the set for the
+    default property values only, and that is not the whole truth:
+
+    * a property value can *add* relationships — ``UpdateAttribute`` with
+      ``Store State`` = "Store state locally" grows ``set state fail``, and NiFi
+      then refuses to start the processor until it is handled;
+    * a *dynamic* property can be a relationship in its own right
+      (``RouteOnAttribute``), which NiFi 1.x exposes nowhere — its 2.x
+      ``/flow/processor-definition`` endpoint answers 404 on 1.24.
+
+    Both are recovered the same cheap way: PUT the property, read the
+    relationship list off the update response. Returns
+    ``(dynamic_relationships, {property: {value: [relationships]}})`` where the
+    conditional map holds only values whose set differs from *base*.
+
+    Best-effort throughout: a PUT NiFi refuses (an allowable value that needs a
+    sibling property set first, say) just means that combination is not probed.
+    """
+    component = created.get("component") or {}
+    processor_id = component.get("id")
+    revision = created.get("revision")
+    if not processor_id or not revision:
+        return False, {}
+    state = {"revision": revision}
+
+    def put(properties: dict) -> Optional[List[str]]:
+        """Set *properties*, return the resulting relationship names or None."""
+        try:
+            resp = client._request(
+                "PUT", f"/processors/{processor_id}",
+                json={"revision": state["revision"],
+                      "component": {"id": processor_id,
+                                    "config": {"properties": properties}}},
+            ).json()
+        except Exception:
+            # The revision may or may not have moved; re-read it so the next
+            # probe isn't doomed by a stale one.
+            try:
+                entity = client._get_json(f"/processors/{processor_id}")
+                state["revision"] = entity["revision"]
+            except Exception:
+                return None
+            return None
+        state["revision"] = resp.get("revision") or state["revision"]
+        return [r["name"] for r in (resp.get("component") or {}).get("relationships", [])]
+
+    base_set = sorted(base)
+
+    # 1. Dynamic properties as relationships, judged at the type's defaults.
+    probed = put({_DYNAMIC_PROBE_PROPERTY: "niflow"})
+    dynamic = bool(probed is not None and _DYNAMIC_PROBE_PROPERTY in probed)
+    if probed is not None:
+        put({_DYNAMIC_PROBE_PROPERTY: None})  # back to the default set
+
+    # 2. Enum property values that change the set. Only properties with a small
+    #    allowable list are worth probing (see _MAX_CONDITIONAL_PROBE_VALUES);
+    #    a controller-service reference never gates relationships.
+    conditional: dict = {}
+    for name, descriptor in sorted(descriptors.items()):
+        if descriptor.get("identifiesControllerService"):
+            continue
+        allowable = [
+            a["allowableValue"]["value"]
+            for a in (descriptor.get("allowableValues") or [])
+            if a.get("allowableValue")
+        ]
+        default = descriptor.get("defaultValue")
+        values = [v for v in allowable if v != default]
+        if not values or len(allowable) > _MAX_CONDITIONAL_PROBE_VALUES:
+            continue
+        found: dict = {}
+        for value in values:
+            relationships = put({name: value})
+            if relationships is not None and sorted(relationships) != base_set:
+                found[value] = sorted(relationships)
+        if found:
+            conditional[name] = found
+        # Restore the default so the next property is probed in isolation —
+        # otherwise a leftover mode from one property would be attributed to
+        # the next one.
+        put({name: None})
+    return dynamic, conditional
 
 
 def _harvest_rules(client: Any, proc_types: List[Any]) -> dict:
@@ -373,13 +559,32 @@ def _harvest_rules(client: Any, proc_types: List[Any]) -> dict:
                 ).json()
                 component = resp.get("component", {})
                 descriptors = (component.get("config") or {}).get("descriptors") or {}
+                base_relationships = [
+                    r["name"] for r in component.get("relationships", [])]
+                dynamic_rel, conditional_rel = _probe_relationships(
+                    client, resp, base_relationships, descriptors)
                 rules[dt.type] = {
-                    "relationships": [r["name"] for r in component.get("relationships", [])],
+                    "relationships": base_relationships,
+                    # A relationship set is not a per-type constant: some are
+                    # switched on by a property value, and some types turn every
+                    # dynamic property into a relationship. Both are harvested
+                    # (see :func:`_probe_relationships`) because both make NiFi
+                    # refuse to start a processor `validate` called clean.
+                    "conditional_relationships": conditional_rel,
+                    "dynamic_relationships": dynamic_rel,
+                    # @PrimaryNodeOnly: NiFi forces executionNode=PRIMARY on
+                    # these and refuses ALL, so the differ needs to know which
+                    # types they are (ProcessorDTO reports it on both 1.x and
+                    # 2.x — unlike the 2.x-only processor-definition endpoint).
+                    "primary_node_only": bool(component.get("executionNodeRestricted")),
                     "descriptors": _trim_descriptors(descriptors),
                     # Full canonical key list — the differ/emitter needs to know
                     # whether a key is a real property or a dynamic one, even
                     # for properties the trimmed descriptors drop.
                     "properties": sorted(descriptors),
+                    # Untrimmed facts, used only by the cross-version rulebook
+                    # dump (harvest_rulebook); never emitted into a catalog.
+                    "raw": _full_descriptors(descriptors),
                 }
             except Exception as exc:  # restricted / un-instantiable type — skip it
                 logger.warning("Skipped %s while harvesting: %s", dt.type, exc)
@@ -393,6 +598,95 @@ def _harvest_rules(client: Any, proc_types: List[Any]) -> dict:
             )
             logger.info("Removed temp harvest group %s", group_id)
         except Exception as exc:  # don't leave it behind silently
+            logger.error("Could not delete temp harvest group %s: %s", group_id, exc)
+    return rules
+
+
+def _full_descriptors(descriptors: Optional[dict]) -> dict:
+    """Every descriptor fact the *cross-version* diff needs, untrimmed.
+
+    :func:`_trim_descriptors` throws away display names that match the
+    canonical name, descriptions, and sensitivity — all of which the version
+    map needs to pair a 2.x property with its 1.x counterpart when the key was
+    renamed. This shape is only ever written to a scratch rulebook dump (see
+    :func:`harvest_rulebook`), never to a committed catalog.
+    """
+    out: dict = {}
+    for name, d in (descriptors or {}).items():
+        out[name] = {
+            "display": d.get("displayName") or name,
+            "description": (d.get("description") or "").strip(),
+            "required": bool(d.get("required")),
+            "default": d.get("defaultValue"),
+            "sensitive": bool(d.get("sensitive")),
+            "dynamic": bool(d.get("dynamic")),
+            "service": d.get("identifiesControllerService"),
+            "allowable": [
+                a["allowableValue"]["value"]
+                for a in (d.get("allowableValues") or [])
+                if a.get("allowableValue")
+            ],
+        }
+    return out
+
+
+def _harvest_service_rules(client: Any, svc_types: List[Any]) -> dict:
+    """Instantiate one of each controller-service type to read its descriptors.
+
+    The processor harvest's twin. Controller services have the same
+    "descriptors only exist on an instance" problem, and the same cross-version
+    property renames (a ``JsonTreeReader``'s ``schema-access-strategy`` is
+    ``Schema Access Strategy`` on 2.x) — but until now nothing harvested them,
+    so every service silently skipped the compat join. Note the descriptors sit
+    at ``component.descriptors``, not under ``component.config`` as they do for
+    processors.
+
+    Returns ``{type: {"descriptors": {...}, "properties": [...], "raw": {...}}}``.
+    """
+    rules: dict = {}
+    root = client.root_id()
+    group = client._request(
+        "POST", f"/process-groups/{root}/process-groups",
+        json={"revision": {"version": 0, "clientId": _CLIENT_ID},
+              "component": {"name": _HARVEST_GROUP + "_svc",
+                            "position": {"x": 0.0, "y": 0.0}}},
+    ).json()
+    group_id = group["id"]
+    logger.info(
+        "Harvesting rules from %d controller-service types into temp group %s",
+        len(svc_types), group_id,
+    )
+    try:
+        for dt in svc_types:
+            try:
+                resp = client._request(
+                    "POST", f"/process-groups/{group_id}/controller-services",
+                    json={"revision": {"version": 0, "clientId": _CLIENT_ID},
+                          "component": {
+                              "type": dt.type,
+                              "bundle": {"group": dt.bundle.group,
+                                         "artifact": dt.bundle.artifact,
+                                         "version": dt.bundle.version}}},
+                ).json()
+                component = resp.get("component", {})
+                descriptors = component.get("descriptors") or {}
+                rules[dt.type] = {
+                    "descriptors": _trim_descriptors(descriptors),
+                    "properties": sorted(descriptors),
+                    "raw": _full_descriptors(descriptors),
+                }
+            except Exception as exc:  # restricted / un-instantiable type — skip it
+                logger.warning("Skipped service %s while harvesting: %s", dt.type, exc)
+    finally:
+        try:
+            version = client._pg_entity(group_id)["revision"]["version"]
+            client._request(
+                "DELETE", f"/process-groups/{group_id}",
+                params={"version": version, "clientId": _CLIENT_ID,
+                        "disconnectedNodeAcknowledged": "false"},
+            )
+            logger.info("Removed temp service-harvest group %s", group_id)
+        except Exception as exc:
             logger.error("Could not delete temp harvest group %s: %s", group_id, exc)
     return rules
 
@@ -411,6 +705,34 @@ def _fetch(client: Any) -> Tuple[List[Any], List[Any]]:
         [_to_documented_type(d) for d in procs],
         [_to_documented_type(d) for d in svcs],
     )
+
+
+def harvest_rulebook(config: Optional[NiFiConfig] = None) -> dict:
+    """Harvest the COMPLETE property rulebook — processors *and* services.
+
+    Unlike :func:`generate` this writes nothing; it returns a JSON-serialisable
+    dump that :mod:`niflow.versionmap` diffs against a dump from another NiFi
+    line to build the cross-version property map. Keeping it out-of-band means
+    a cross-version harvest never has to overwrite a committed catalog.
+    """
+    from niflow.client import NiFiClient
+
+    client = NiFiClient(config)
+    nifi_version = client.version()
+    logger.info("Harvesting full rulebook from NiFi %s", nifi_version)
+    procs, svcs = _fetch(client)
+    proc_named = _unique_factory_names(procs)
+    svc_named = _unique_factory_names(svcs)
+    proc_rules = _harvest_rules(client, [item for _, item in proc_named])
+    svc_rules = _harvest_service_rules(client, [item for _, item in svc_named])
+    from datetime import datetime, timezone
+
+    return {
+        "nifi_version": nifi_version,
+        "generated": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "processors": proc_rules,
+        "services": svc_rules,
+    }
 
 
 def generate(
@@ -437,6 +759,13 @@ def generate(
     svc_named = _unique_factory_names(svcs)
 
     rules = _harvest_rules(client, [item for _, item in proc_named]) if harvest else {}
+    # Controller services carry property descriptors — and the same cross-version
+    # renames — as processors do; harvesting them makes the compat join work for
+    # services instead of silently skipping every one of them.
+    svc_rules = (
+        _harvest_service_rules(client, [item for _, item in svc_named])
+        if harvest else {}
+    )
 
     PROCESSORS_CATALOG_PATH.write_text(
         _render(
@@ -447,7 +776,11 @@ def generate(
             component_cls="Processor",
             named=proc_named,
             emit_factory=_emit_processor_factory,
-            extra=_emit_relationships(rules) + "\n" + _emit_descriptors(rules)
+            extra=_emit_relationships(rules)
+            + "\n" + _emit_conditional_relationships(rules)
+            + "\n" + _emit_dynamic_relationships(rules)
+            + "\n" + _emit_primary_node_only(rules)
+            + "\n" + _emit_descriptors(rules)
             + "\n" + _emit_property_names(rules),
             meta=meta,
         )
@@ -461,6 +794,7 @@ def generate(
             component_cls="ControllerService",
             named=svc_named,
             emit_factory=_emit_service_factory,
+            extra=_emit_descriptors(svc_rules) + "\n" + _emit_property_names(svc_rules),
             meta=meta,
         )
     )
@@ -469,11 +803,14 @@ def generate(
 
 _COMPAT_HEADER = '''"""AUTO-GENERATED by ``python -m niflow.codegen --compat`` — do not edit by hand.
 
-Property rulebook harvested from a NiFi *1.x* instance. The main catalog is
-the authoring namespace (currently 2.x); :mod:`niflow.processors.rules` joins
-these tables against it to translate property keys when talking to a 1.x
-server, and to normalise 1.x keys pulled from one. Regenerate against the
-oldest 1.x line you push to::
+Property *and relationship* rulebook harvested from a NiFi *1.x* instance. The
+main catalog is the authoring namespace (currently 2.x);
+:mod:`niflow.processors.rules` joins these tables against it to translate
+property keys when talking to a 1.x server, to normalise 1.x keys pulled from
+one, and to judge a flow's relationships against the line it will actually run
+on. ``TYPES``/``SERVICE_TYPES`` list every type the harvest instantiated, so a
+type with no properties at all is still known rather than looking like a hole.
+Regenerate against the oldest 1.x line you push to::
 
     NIFLOW_NIFI_HOST=https://host:8444/nifi-api python -m niflow.codegen --compat
 """
@@ -500,22 +837,45 @@ def generate_compat(config: Optional[NiFiConfig] = None) -> int:
             f"is NiFi {nifi_version}; point NIFLOW_NIFI_HOST at a 1.x instance"
         )
     logger.info("Generating 1.x compatibility table from NiFi %s", nifi_version)
-    procs, _ = _fetch(client)
+    procs, svcs = _fetch(client)
     named = _unique_factory_names(procs)
+    svc_named = _unique_factory_names(svcs)
     rules = _harvest_rules(client, [item for _, item in named])
+    svc_rules = _harvest_service_rules(client, [item for _, item in svc_named])
     COMPAT_V1_PATH.write_text(
         _COMPAT_HEADER
         + _emit_meta(nifi_version).replace("CATALOG_META", "COMPAT_META").lstrip("\n")
+        + "\n" + _emit_type_set(rules, "TYPES")
+        + "\n" + _emit_type_set(svc_rules, "SERVICE_TYPES")
+        + "\n" + _emit_relationships(rules)
+        + "\n" + _emit_conditional_relationships(rules)
+        + "\n" + _emit_dynamic_relationships(rules)
+        + "\n" + _emit_primary_node_only(rules)
         + "\n" + _emit_descriptors(rules)
         + "\n" + _emit_property_names(rules)
+        + "\n" + _emit_descriptors(svc_rules, "SERVICE_DESCRIPTORS")
+        + "\n" + _emit_property_names(svc_rules, "SERVICE_PROPERTY_NAMES")
     )
-    return len(rules)
+    return len(rules) + len(svc_rules)
 
 
 def main() -> None:
     import sys
 
-    if "--compat" in sys.argv[1:]:
+    args = sys.argv[1:]
+    if "--dump-rulebook" in args:
+        import json
+
+        out = Path(args[args.index("--dump-rulebook") + 1])
+        book = harvest_rulebook(NiFiConfig.from_env())
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(book, indent=1, sort_keys=True))
+        print(
+            f"Wrote {out}: NiFi {book['nifi_version']}, "
+            f"{len(book['processors'])} processors, {len(book['services'])} services"
+        )
+        return
+    if "--compat" in args:
         n_types = generate_compat(NiFiConfig.from_env())
         print(f"Wrote {COMPAT_V1_PATH.relative_to(_NIFLOW_ROOT.parent)}: {n_types} types")
         return

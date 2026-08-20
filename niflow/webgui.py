@@ -12,16 +12,29 @@ remains for those who prefer it. Feature set here:
 * processor list with filter, state, run-once / start / stop per row,
   a top-level-flow dropdown and starred rows pinned to the top (both
   remembered per browser via localStorage)
-* queues with live counts -> click through to FlowFiles -> attributes+content
+* queues with live counts -> click through to FlowFiles -> attributes+content,
+  purge one queue or every queue in the selected flow
 * Trace tab: one FlowFile's provenance journey hop by hop — attribute
   diffs, relationship taken, payload per processor (``niflow trace``)
+* Follow tab: the live stepper (``niflow follow``) as a debugger — pick a
+  start point, hit Step, watch changed/added/removed attributes flash at
+  each hop, and mute the fork branches you don't care about
 * group-wide start / stop / stop+drain / purge
 * one-click "Tidy canvas": auto-arrange the selected flow (or everything)
   along its connections, left-to-right or top-to-bottom (``niflow tidy``)
 * Explain tab: plain-English walkthrough per group (``niflow explain``) —
   generated once via the configured LLM, saved under ``docs/explanations/``,
-  flagged outdated when the flow's logic changes
-* bulletins and validation-error panels
+  flagged outdated when the flow's logic changes; high-level by default
+  (nested groups get one summary line), with a depth select and a
+  documents/LLM-calls count shown before you spend them
+* Alerts tab: a background health watcher (``niflow.watch``) that
+  baselines every component and shouts when one goes healthy -> failing —
+  "CallOrdersApi was healthy for 42m, broke at 14:02, api-frontiers refused
+  the connection". The badge and the red banner are updated from every tab,
+  because nobody is sitting on the Alerts tab when it happens
+* bulletins and validation-error panels; every processor/connection named
+  anywhere on the page is a link that opens NiFi on that component
+* auto-refresh (3s), on by default, paused while you're mid-interaction
 * flow files under ``flows/``: semantic plan preview and incremental push
 * ``--reload`` (what ``make webgui`` uses): the server restarts itself when
   any niflow source file changes and open pages reload themselves — no
@@ -56,6 +69,218 @@ BOOT = uuid.uuid4().hex
 RELOAD = False  # set by serve(reload=True); tells the page to watch BOOT
 
 
+# ------------------------------------------------------------------ follow
+
+# The Follow tab drives ONE stepping session at a time, kept between requests
+# (this GUI is single-user by construction, and the session is also written to
+# .niflow-follow/ so a page refresh or a server restart can re-attach).
+_FOLLOW: dict = {"follower": None}
+
+
+def _branch_rows(follower) -> List[dict]:
+    """Branch records for the page: hop counts, not the hops themselves."""
+    rows = []
+    for branch in follower.branches():
+        row = {k: v for k, v in branch.items()
+               if k not in ("hops", "baseline", "baseline_size")}
+        row["hop_count"] = len(branch.get("hops") or [])
+        rows.append(row)
+    return rows
+
+
+def _follow_payload(follower, **extra: Any) -> dict:
+    """The whole tab state: branches, the current branch's hops, mutes."""
+    session = follower.session
+    payload = {
+        "active": True,
+        "group": session.group,
+        "session_id": session.id,
+        "current": session.current,
+        "mutes": session.mutes.describe(),
+        "mute_rules": [f"{kind}:{value}"
+                       for kind, values in session.mutes.to_dict().items()
+                       for value in values],
+        "branches": _branch_rows(follower),
+        "hops": session.history(),
+        "restorable": len(session.prior_running),
+    }
+    payload.update(extra)
+    return payload
+
+
+def _follow_route(client: NiFiClient, method: str, path: str,
+                  q, body: dict) -> Tuple[int, Any]:
+    """``/api/follow/*`` — the stepper's routes (see :mod:`niflow.follow`).
+
+    Muting routes never touch NiFi: they change what is followed and drawn,
+    nothing else.
+    """
+    from niflow.follow import FollowSession, FlowFollower, entry_points
+
+    follower = _FOLLOW["follower"]
+    if method == "GET" and path == "/api/follow/entrypoints":
+        group = q("group") or "root"
+        return 200, {"group": group, "entries": entry_points(client, group)}
+    if method == "GET" and path == "/api/follow/session":
+        if follower is not None:
+            return 200, _follow_payload(follower)
+        saved = FollowSession.latest(q("group") or None)
+        return 200, {"active": False,
+                     "resumable": {"id": saved.id, "group": saved.group,
+                                   "current": saved.current,
+                                   "hops": len(saved.history())}
+                     if saved else None}
+    if method == "POST" and path == "/api/follow/start":
+        group = body.get("group") or "root"
+        if body.get("resume"):
+            session = FollowSession.latest(group)
+            if session is None:
+                return 404, {"error": f"no saved session for {group!r}"}
+            follower = FlowFollower(client, group, session=session)
+            stopped = follower.quiesce(remember=False)
+        else:
+            session = FollowSession.open(group, client.resolve_group(group))
+            follower = FlowFollower(client, group, session=session)
+            stopped = follower.quiesce()
+            for spec in body.get("mutes") or []:
+                follower.mute(spec)
+            follower.start_from(body.get("entry") or {})
+        _FOLLOW["follower"] = follower
+        return 200, _follow_payload(follower, stopped=stopped)
+    if follower is None:
+        return 409, {"error": "no stepping session — pick a start point first"}
+    if method == "POST" and path == "/api/follow/step":
+        outcome = follower.step()
+    elif method == "POST" and path == "/api/follow/repoll":
+        outcome = follower.repoll()
+    elif method == "POST" and path == "/api/follow/mute":
+        outcome = dict(follower.mute(body.get("spec") or ""), status="muted")
+    elif method == "POST" and path == "/api/follow/unmute":
+        outcome = dict(follower.unmute(body.get("spec") or ""), status="unmuted")
+    elif method == "POST" and path == "/api/follow/switch":
+        follower.switch_to(body.get("uuid") or "")
+        outcome = {"status": "switched", "uuid": follower.uuid}
+    elif method == "POST" and path == "/api/follow/next":
+        nxt = follower.next_live()
+        if nxt:
+            follower.switch_to(nxt)
+        outcome = {"status": "switched" if nxt else "none", "uuid": nxt}
+    elif method == "POST" and path == "/api/follow/stop":
+        restored = follower.restore() if body.get("restore") else 0
+        _FOLLOW["follower"] = None
+        return 200, {"active": False, "restored": restored,
+                     "session": str(follower.session.path or "")}
+    else:
+        return 404, {"error": f"no route for {method} {path}"}
+    # Hops the caller should flash: the ones this action just produced.
+    return 200, _follow_payload(
+        follower, outcome={k: v for k, v in outcome.items() if k != "hops"},
+        fresh=[h.get("event_id") for h in outcome.get("hops") or []])
+
+
+# ------------------------------------------------------------------ watch
+
+# The background health watcher (see :mod:`niflow.watch`). One per server
+# process, started at boot so something is *always* checking: the whole point
+# of the Alerts tab is catching a break while you are looking at another tab.
+# Its state lives in .niflow-watch/, so restarting the GUI does not lose the
+# "this was healthy for three hours" baseline.
+_WATCH: dict = {"watcher": None, "thread": None, "stop": None,
+                "interval": 15.0, "group": "root"}
+
+
+def _watch_start(client: NiFiClient, lock: threading.Lock, *, group: str = "root",
+                 interval: float = 15.0, baseline: Optional[float] = None,
+                 include_warnings: bool = False) -> Any:
+    """(Re)start the background watcher thread; returns the Watcher."""
+    from niflow.watch import DEFAULT_BASELINE_SECONDS, Watcher
+
+    _watch_stop()
+    watcher = Watcher(
+        client, group,
+        baseline_seconds=DEFAULT_BASELINE_SECONDS if baseline is None else baseline,
+        include_warnings=include_warnings,
+    )
+    stop = threading.Event()
+
+    def loop() -> None:
+        while not stop.is_set():
+            try:
+                with lock:  # NiFi calls are serialised with the page's
+                    watcher.tick()
+            except Exception as exc:  # noqa: BLE001 - a dead watcher is useless
+                watcher.last_error = str(exc)
+                logger.warning("watch tick failed: %s", exc)
+            if stop.wait(interval):
+                return
+
+    thread = threading.Thread(target=loop, daemon=True, name="niflow-watch")
+    _WATCH.update(watcher=watcher, thread=thread, stop=stop,
+                  interval=interval, group=group)
+    thread.start()
+    return watcher
+
+
+def _watch_stop() -> None:
+    if _WATCH.get("stop") is not None:
+        _WATCH["stop"].set()
+    _WATCH.update(thread=None, stop=None)
+
+
+def _watch_payload(watcher: Any) -> dict:
+    return {
+        "running": _WATCH.get("thread") is not None,
+        "interval": _WATCH.get("interval"),
+        "summary": watcher.summary(),
+        "alerts": watcher.alerts(),
+        "state_file": str(watcher.store.path),
+    }
+
+
+def _watch_route(client: NiFiClient, lock: threading.Lock, method: str,
+                 path: str, q, body: dict) -> Tuple[int, Any]:
+    """``/api/alerts/*`` — read alerts, ack/dismiss them, steer the watcher.
+
+    Reads are served from the watcher's in-memory state and touch NiFi not at
+    all, which is what makes the badge safe to poll on the page's 3s tick
+    from every tab.
+    """
+    watcher = _WATCH.get("watcher")
+    if watcher is None:
+        watcher = _watch_start(client, lock, group=_WATCH.get("group") or "root",
+                               interval=_WATCH.get("interval") or 15.0)
+    if method == "GET" and path == "/api/alerts":
+        return 200, _watch_payload(watcher)
+    if method == "GET" and path == "/api/alerts/summary":
+        return 200, {"running": _WATCH.get("thread") is not None,
+                     **watcher.summary()}
+    if method == "POST" and path == "/api/alerts/ack":
+        ok = watcher.acknowledge(body.get("id") or "", body.get("on", True))
+        return (200 if ok else 404), {"ok": ok, **_watch_payload(watcher)}
+    if method == "POST" and path == "/api/alerts/dismiss":
+        ok = watcher.dismiss(body.get("id") or "")
+        return (200 if ok else 404), {"ok": ok, **_watch_payload(watcher)}
+    if method == "POST" and path == "/api/alerts/clear":
+        return 200, {"ok": True, "cleared": watcher.clear_resolved(),
+                     **_watch_payload(watcher)}
+    if method == "POST" and path == "/api/alerts/check":
+        watcher.tick()  # "check now" — one poll, on the request thread
+        return 200, _watch_payload(watcher)
+    if method == "POST" and path == "/api/alerts/watch":
+        if body.get("on", True):
+            watcher = _watch_start(
+                client, lock,
+                group=body.get("group") or _WATCH.get("group") or "root",
+                interval=float(body.get("interval") or _WATCH.get("interval") or 15.0),
+                baseline=body.get("baseline"),
+                include_warnings=bool(body.get("warnings")),
+            )
+        else:
+            _watch_stop()
+        return 200, _watch_payload(watcher)
+    return 404, {"error": f"no route for {method} {path}"}
+
+
 # ---------------------------------------------------------------- dispatch
 
 
@@ -82,6 +307,8 @@ def dispatch(
                 return 200, {
                     "version": client.version(),
                     "base": client.base,
+                    # UI base for the page's NiFi deep links (see compLink()).
+                    "ui": client.ui_url(),
                     "auth": client.config.auth_mode,
                     "boot": BOOT,
                     "reload": RELOAD,
@@ -106,10 +333,20 @@ def dispatch(
             if method == "GET" and path == "/api/flowfile":
                 return 200, client.flowfile_detail(q("connection_id"), q("uuid"))
             if method == "GET" and path == "/api/trace":
-                return 200, client.trace_flowfile(q("uuid"))
+                from niflow.follow import annotate_hops
+
+                trace = client.trace_flowfile(q("uuid"))
+                # Same annotation the stepper applies, so the Trace and Follow
+                # tabs render one hop the same way (added/changed/removed).
+                annotate_hops(trace["hops"])
+                return 200, trace
             if method == "GET" and path == "/api/trace/content":
                 return 200, {"content": client.event_content(
                     q("event_id"), q("direction") or "output")}
+            if path.startswith("/api/follow"):
+                return _follow_route(client, method, path, q, body)
+            if path.startswith("/api/alerts"):
+                return _watch_route(client, lock, method, path, q, body)
 
             if method == "POST" and path.startswith("/api/processors/"):
                 _, _, _, proc_id, action = path.split("/", 4)
@@ -129,6 +366,10 @@ def dispatch(
                     which = action.split("-")[1]
                     return 200, {"ok": True,
                                  "ran": client.run_queue_endpoint_once(conn_id, which)}
+                if action == "purge":
+                    # One queue only — the drop-request reports what it dropped.
+                    return 200, {"ok": True,
+                                 "dropped": client.drain_connection(conn_id)}
                 return 404, {"error": f"unknown queue action {action!r}"}
 
             if method == "POST" and path.startswith("/api/group/"):
@@ -141,7 +382,11 @@ def dispatch(
                 elif action == "drain":
                     return 200, {"ok": True, "dropped": client.quiesce_group("root")}
                 elif action == "purge":
-                    return 200, {"ok": True, "dropped": client.purge_queues("root")}
+                    # Scoped to the page's selected flow when it sends one;
+                    # "root" (everything) only when it doesn't.
+                    group = body.get("group") or "root"
+                    return 200, {"ok": True, "group": group,
+                                 "dropped": client.purge_queues(group)}
                 else:
                     return 404, {"error": f"unknown group action {action!r}"}
                 return 200, {"ok": True}
@@ -155,16 +400,23 @@ def dispatch(
                 )}
 
             if method == "GET" and path == "/api/explain":
-                # Doc + freshness for one group; no LLM call happens here.
-                return 200, client.explain_status(q("group") or "root")
+                # Doc + freshness for one group, plus what a generate at this
+                # depth would cost (documents/llm_calls); no LLM call here.
+                # depth 0 is meaningful ("everything below"), so no `or 1`.
+                depth = q("depth")
+                return 200, client.explain_status(
+                    q("group") or "root", depth=1 if depth is None else int(depth))
             if method == "POST" and path == "/api/explain":
+                depth = body.get("depth")
                 results = client.explain_group(
                     body.get("group") or "root",
-                    recurse=body.get("recurse", True),
+                    depth=1 if depth is None else int(depth),
                     force=body.get("force", False),
                 )
                 return 200, {"ok": True, "results": results,
-                             **client.explain_status(body.get("group") or "root")}
+                             **client.explain_status(
+                                 body.get("group") or "root",
+                                 depth=1 if depth is None else int(depth))}
 
             if method == "GET" and path == "/api/flows":
                 flows = sorted(str(p) for p in flows_dir.glob("*.py"))
@@ -286,12 +538,25 @@ def serve(
     flows_dir: str = "flows",
     open_browser: bool = True,
     reload: bool = False,
+    watch: bool = True,
+    watch_group: str = "root",
+    watch_interval: float = 15.0,
 ) -> None:
+    client = NiFiClient(config or NiFiConfig.from_env())
+    lock = threading.Lock()
     handler = type("BoundHandler", (_Handler,), {
-        "client_ref": NiFiClient(config or NiFiConfig.from_env()),
-        "lock": threading.Lock(),
+        "client_ref": client,
+        "lock": lock,
         "flows_dir": Path(flows_dir),
     })
+    if watch:
+        # Always-on background health check: the Alerts badge has to light up
+        # while you are on some other tab, which means the polling cannot be
+        # the page's job.
+        _WATCH["group"], _WATCH["interval"] = watch_group, watch_interval
+        _watch_start(client, lock, group=watch_group, interval=watch_interval)
+        logger.info("watching %r for health transitions every %ss "
+                    "(Alerts tab)", watch_group, watch_interval)
     if reload:
         # NB: the restart re-reads config from the environment/.niflow.env —
         # a `config` object passed in programmatically won't survive it.
@@ -322,9 +587,17 @@ def main() -> None:
     parser.add_argument("--no-browser", action="store_true")
     parser.add_argument("--reload", action="store_true",
                         help="restart on niflow source changes; open pages reload themselves")
+    parser.add_argument("--no-watch", action="store_true",
+                        help="don't run the background health watcher (Alerts tab)")
+    parser.add_argument("--watch-group", default="root",
+                        help="group the health watcher polls (default: root)")
+    parser.add_argument("--watch-interval", type=float, default=15.0,
+                        help="seconds between health polls (default: 15)")
     args = parser.parse_args()
     serve(host=args.host, port=args.port, flows_dir=args.flows_dir,
-          open_browser=not args.no_browser, reload=args.reload)
+          open_browser=not args.no_browser, reload=args.reload,
+          watch=not args.no_watch, watch_group=args.watch_group,
+          watch_interval=args.watch_interval)
 
 
 # ------------------------------------------------------------------- page
@@ -338,11 +611,12 @@ PAGE = r"""<!doctype html>
 <title>NiFlow Helper</title>
 <style>
   :root { --bg:#fff; --fg:#1a1a1a; --muted:#667; --line:#dfe3e8; --accent:#0b6bcb;
-          --ok:#127a3d; --warn:#a15c07; --bad:#b42318; --chip:#f2f4f7; --pin:#fdf6e3; }
+          --ok:#127a3d; --warn:#a15c07; --bad:#b42318; --chip:#f2f4f7; --pin:#fdf6e3;
+          --flash:#fff3bf; }
   @media (prefers-color-scheme: dark) {
     :root { --bg:#101418; --fg:#e6e9ec; --muted:#98a2b3; --line:#2a3138;
             --accent:#559ee8; --ok:#4cc38a; --warn:#e2b03a; --bad:#f97066; --chip:#1c232b;
-            --pin:#241f12; }
+            --pin:#241f12; --flash:#3d3313; }
   }
   * { box-sizing:border-box; }
   body { margin:0; background:var(--bg); color:var(--fg);
@@ -370,7 +644,10 @@ PAGE = r"""<!doctype html>
   button.op { border:1px solid var(--line); background:var(--chip); color:var(--fg);
               padding:.3rem .7rem; border-radius:.4rem; cursor:pointer; }
   button.op:hover { border-color:var(--accent); }
-  button.danger { color:var(--bad); }
+  button.danger { color:var(--bad); border-color:var(--bad); }
+  button.danger:hover { background:var(--bad); border-color:var(--bad); color:#fff; }
+  a.nifi { color:var(--accent); text-decoration:none; }
+  a.nifi:hover { text-decoration:underline; }
   table { border-collapse:collapse; width:100%; }
   th, td { text-align:left; padding:.35rem .55rem; border-bottom:1px solid var(--line); }
   th { color:var(--muted); font-weight:600; font-size:.8rem; text-transform:uppercase; }
@@ -392,15 +669,57 @@ PAGE = r"""<!doctype html>
   .hop .hophead { display:flex; gap:.6rem; align-items:center; flex-wrap:wrap;
                   margin-bottom:.4rem; }
   .hop table { width:auto; min-width:50%; }
+  /* The stepper's headline: what changed at this hop has to catch the eye. */
+  .hop.flash { animation: hopflash 1.6s ease-out; }
+  @keyframes hopflash { 0%, 35% { background:var(--flash); } 100% { background:transparent; } }
+  .hop.flash table.diff tr { animation: hopflash 2s ease-out; }
+  table.diff td.mark { width:1.4rem; text-align:center; font-weight:700; }
+  tr.d-added td.mark { color:var(--ok); }
+  tr.d-changed td.mark { color:var(--accent); }
+  tr.d-removed td.mark { color:var(--bad); }
+  tr.d-removed td:not(.mark) { text-decoration:line-through; color:var(--muted); }
+  .chip { display:inline-block; background:var(--chip); border-radius:.4rem;
+          padding:.1rem .5rem; font-size:.8rem; margin-top:.3rem; }
+  tr.branch-muted td { opacity:.5; }
+  tr.branch-current td { background:var(--pin); }
+  button.op.primary { border-color:var(--accent); color:var(--accent); font-weight:600; }
+  /* Alerts: a break has to be visible from whatever tab you are on, so the
+     banner lives above the tab bar and the tab itself carries a count. */
+  #alertbar { display:none; padding:.55rem 1rem; border-bottom:1px solid var(--line);
+              background:var(--bad); color:#fff; align-items:center; gap:.6rem;
+              flex-wrap:wrap; cursor:pointer; }
+  #alertbar.on { display:flex; animation: alertpulse 1.2s ease-out 3; }
+  #alertbar.ext { background:var(--bad); }
+  #alertbar.int { background:var(--warn); }
+  #alertbar.unk { background:var(--muted); }
+  @keyframes alertpulse { 0% { filter:brightness(1.5); } 100% { filter:none; } }
+  nav button .count { display:inline-block; margin-left:.4rem; min-width:1.1rem;
+                      padding:0 .35rem; border-radius:1rem; background:var(--bad);
+                      color:#fff; font-size:.75rem; font-weight:700; }
+  .alert { border:1px solid var(--line); border-left:.35rem solid var(--muted);
+           border-radius:.5rem; padding:.6rem .8rem; margin-bottom:.7rem; }
+  .alert.external { border-left-color:var(--bad); }
+  .alert.internal { border-left-color:var(--warn); }
+  .alert.unknown  { border-left-color:var(--muted); }
+  .alert.resolved { opacity:.55; }
+  .alert.acked { opacity:.65; }
+  .alert h3 { margin:0 0 .2rem; font-size:.98rem; }
+  .alert .why { margin:.35rem 0; font-size:1rem; }
+  .alert .hint { color:var(--muted); }
+  .alert .ev { color:var(--muted); font-size:.82rem; white-space:pre-wrap;
+               word-break:break-word; margin-top:.35rem; }
 </style>
 </head>
 <body>
 <header>
   <h1>NiFlow Helper</h1>
   <span class="meta" id="about">connecting…</span>
-  <label class="meta"><input type="checkbox" id="auto"> auto-refresh (3s)</label>
+  <label class="meta" title="re-reads the current tab every 3s; pauses while you type,
+while a drill-down or dialog is open, and on the Trace/Explain/Flows tabs">
+    <input type="checkbox" id="auto" checked> auto-refresh (3s)</label>
   <span id="status"></span>
 </header>
+<div id="alertbar" onclick="gotoAlerts()"></div>
 <nav id="tabs"></nav>
 <main id="view"></main>
 <script>
@@ -412,9 +731,111 @@ const api = async (path, opts) => {
   if (!r.ok) throw new Error(j.error || r.status);
   return j;
 };
-const post = (path, body) => api(path, {method:"POST", headers:{"Content-Type":"application/json"},
-                                        body: body ? JSON.stringify(body) : "{}"});
+let inflight = 0;   // mutating requests in flight (auto-refresh backs off)
+let modal = false;  // a confirm() is on screen (ditto)
+// Every destructive confirm goes through here so a 3s tick can't re-render
+// the page out from under the dialog.
+function ask(msg) { modal = true; try { return confirm(msg); } finally { modal = false; } }
+const post = async (path, body) => {
+  inflight++;  // auto-refresh holds off while a mutation is in flight
+  try {
+    return await api(path, {method:"POST", headers:{"Content-Type":"application/json"},
+                            body: body ? JSON.stringify(body) : "{}"});
+  } finally { inflight--; }
+};
 const status = msg => { $("#status").textContent = msg; };
+
+// --- NiFi deep links -------------------------------------------------
+// Same shape as NiFiClient.ui_url(): the canvas opens on `groupId` with
+// `compId` selected. The UI base arrives with /api/about; without it (not
+// connected yet) links degrade to plain text rather than going nowhere.
+function uiUrl(groupId, compId) {
+  if (!window._uiBase || (!groupId && !compId)) return "";
+  const p = [];
+  if (groupId) p.push("processGroupId=" + encodeURIComponent(groupId));
+  if (compId) p.push("componentIds=" + encodeURIComponent(compId));
+  return window._uiBase + "/?" + p.join("&");
+}
+// Queue rows name their endpoints, but NiFi's status snapshot carries no
+// endpoint ids (checked live on 1.24 and 2.7.2), so match the names against
+// the processor listing to get id + group. Cached: ids only move when a flow
+// is rebuilt, and the queues tab re-renders every few seconds.
+async function procIndex() {
+  if (window._procIx) return window._procIx;
+  const procs = await api("/api/processors");
+  window._procIx = {};
+  for (const p of procs) window._procIx[p.path + "\u0000" + p.name] = p;
+  return window._procIx;
+}
+function endpointLink(path, name) {
+  const p = (window._procIx || {})[path + "\u0000" + name];
+  // No match (a port, a funnel, a component in another group) -> plain text
+  // rather than a link that lands somewhere it didn't promise.
+  return p ? compLink(p.group_id, p.id, name, "open " + name + " in NiFi") : esc(name);
+}
+
+// One anchor for every processor / connection / group mention on the page.
+// New tab, and stopPropagation so clicking the name never triggers the row's
+// own drill-down or the buttons beside it.
+function compLink(groupId, compId, label, title) {
+  const url = uiUrl(groupId, compId);
+  if (!url) return esc(label ?? "");
+  return `<a class="nifi" href="${esc(url)}" target="_blank" rel="noopener"` +
+         ` title="${esc(title || "open in NiFi")}"` +
+         ` onclick="event.stopPropagation()">${esc(label ?? "")}</a>`;
+}
+
+// --- one hop, drawn the same way wherever it appears -----------------
+// The Trace and Follow tabs are two views of the same journey, so they share
+// this renderer the way the CLI's trace/follow share format_hop(). Hops that
+// have been through annotate_hops() carry a cross-hop `diff` (added/changed/
+// removed) and a `content_change`; anything older falls back to NiFi's own
+// per-event `changes` list.
+const DIFF_MARK = {added: "+", changed: "~", removed: "−"};
+function diffTable(h) {
+  const entries = h.diff
+    ? h.diff.map(d => [d.status, d.name, d.before, d.after])
+    : (h.changes || []).map(c => [c.before === null ? "added" : "changed",
+                                  c.name, c.before, c.after]);
+  const rank = {changed: 0, added: 1, removed: 2};
+  entries.sort((a, b) => (rank[a[0]] - rank[b[0]]) || String(a[1]).localeCompare(b[1]));
+  const cc = h.content_change;
+  const content = cc ? `<div class="chip">content ${
+      cc.before === null || cc.before === cc.after
+        ? "rewritten (" + esc(cc.after) + " B)"
+        : esc(cc.before) + " B → " + esc(cc.after) + " B"}</div>` : "";
+  if (!entries.length)
+    return content || `<span class="muted">no attribute changes</span>`;
+  return `<table class="diff">
+    <tr><th></th><th>Attribute</th><th>Before</th><th>After</th></tr>
+    ${entries.map(([st, name, before, after]) => `
+      <tr class="d-${st}"><td class="mark">${DIFF_MARK[st] || ""}</td>
+        <td>${esc(name)}</td>
+        <td class="muted">${before === null || before === undefined
+            ? "<i>(new)</i>" : esc(before)}</td>
+        <td>${after === null || after === undefined
+            ? "<i>(removed)</i>" : "<b>" + esc(after) + "</b>"}</td></tr>`).join("")}
+    </table>${content}`;
+}
+function hopCard(h, i, flash) {
+  const kin = (label, uuids) => (uuids || []).map(u =>
+    `<div class="muted">${label} ${esc(u)}
+       <button class="op" onclick="traceJump('${esc(u)}')">trace</button></div>`).join("");
+  return `<div class="hop${flash ? " flash" : ""}">
+    <div class="hophead">
+      <b>#${i + 1} ${compLink(h.group_id, h.component_id, h.component || "(flow)")}</b>
+      <span class="pill">${esc(h.event_type)}${h.relationship ? " → " + esc(h.relationship) : ""}</span>
+      <span class="muted">${esc(h.time)} · ${esc(h.size)} B</span>
+      <span style="flex:1"></span>
+      <button class="op" onclick="hopAttrs(${i})">Attributes</button>
+      ${h.input_available ? `<button class="op" onclick="hopContent(${i},'input')">Content in</button>` : ""}
+      ${h.output_available ? `<button class="op" onclick="hopContent(${i},'output')">Content out</button>` : ""}
+    </div>
+    ${diffTable(h)}
+    ${kin("joined from", h.parents)}${kin("spawned", h.children)}
+    <pre id="hopx${i}" style="display:none"></pre>
+  </div>`;
+}
 
 // One top-level-flow filter shared by every server-data tab; the pick is
 // remembered (localStorage) across tabs and sessions.
@@ -444,19 +865,26 @@ function bindFlowSelect() {
 
 const TABS = [
   ["processors", "Processors"], ["queues", "Queues & FlowFiles"],
-  ["trace", "Trace"], ["bulletins", "Bulletins"], ["errors", "Errors"],
+  ["trace", "Trace"], ["follow", "Follow"],
+  ["alerts", "Alerts"],
+  ["bulletins", "Bulletins"], ["errors", "Errors"],
   ["explain", "Explain"], ["flows", "Flows"],
 ];
 let active = "processors";
-let inspector = null;   // {connId, label, uuid} drill-down state on the queues tab
+let inspector = null;   // {connId, groupId, label, uuid} queues-tab drill-down
 let traceUuid = null;   // FlowFile the Trace tab is following (survives tab hops)
+let followFlash = [];   // event ids the last step produced -> those hops flash
 
 function nav() {
+  const n = (window._alertCount || 0);
   $("#tabs").innerHTML = TABS.map(([k, label]) =>
-    `<button data-tab="${k}" class="${k===active?'active':''}">${label}</button>`).join("");
+    `<button data-tab="${k}" class="${k===active?'active':''}">${label}` +
+    (k === "alerts" && n ? `<span class="count">${n}</span>` : "") +
+    `</button>`).join("");
   document.querySelectorAll("#tabs button").forEach(b =>
     b.onclick = () => { active = b.dataset.tab; inspector = null; nav(); render(); });
 }
+function gotoAlerts() { active = "alerts"; inspector = null; nav(); render(); }
 
 async function render() {
   const view = $("#view");
@@ -487,13 +915,13 @@ async function render() {
           <button class="op" onclick="groupOp('start')">Start All</button>
           <button class="op" onclick="groupOp('stop')">Stop All</button>
           <button class="op" onclick="groupOp('drain')">Stop &amp; Drain</button>
-          <button class="op danger" onclick="groupOp('purge')">Purge Queues</button>
+          <button class="op danger" title="drop every FlowFile queued in the selected flow" onclick="purgeFlow()">Purge Queues</button>
         </div>
         <table><tr><th></th><th>Processor</th><th>Type</th><th>State</th><th></th></tr>
         ${rows.map((p, i) => `${i === pinned && pinned ? '<tr class="gap"><td colspan="5"></td></tr>' : ""}<tr class="${i < pinned ? "pinned" : ""}">
           <td class="star ${stars.has(key(p)) ? "on" : ""}" onclick="toggleStar(${i})"
               title="${stars.has(key(p)) ? "unpin" : "pin to top"}">${stars.has(key(p)) ? "★" : "☆"}</td>
-          <td>${esc(p.path ? p.path + "/" : "")}<b>${esc(p.name)}</b></td>
+          <td>${esc(p.path ? p.path + "/" : "")}<b>${compLink(p.group_id, p.id, p.name, "open " + p.name + " in NiFi")}</b></td>
           <td class="muted">${esc(p.type.split(".").pop())}</td>
           <td class="state-${esc(p.state)}">${esc(p.state)}</td>
           <td>
@@ -514,7 +942,8 @@ async function render() {
         view.innerHTML = `
           <div class="bar"><button class="op" onclick="inspector.uuid=null;render()">← back to ${esc(inspector.label)}</button>
             <button class="op" title="how did this file get here? provenance journey with attribute diffs"
-                onclick="traceJump('${inspector.uuid}')">Trace journey</button></div>
+                onclick="traceJump('${inspector.uuid}')">Trace journey</button>
+            <span class="muted">${compLink(inspector.groupId, inspector.connId, "show this queue in NiFi")}</span></div>
           <div class="split">
             <div><h3>Attributes</h3><pre>${esc(JSON.stringify(d.attributes ?? d, null, 2))}</pre></div>
             <div><h3>Content</h3><pre>${esc(d.content ?? "(no content view)")}</pre></div>
@@ -524,18 +953,21 @@ async function render() {
         view.innerHTML = `
           <div class="bar"><button class="op" onclick="inspector=null;render()">← all queues</button>
             <span class="pill">${esc(inspector.label)} — ${files.length} FlowFile(s)</span>
+            <span class="muted">${compLink(inspector.groupId, inspector.connId, "show in NiFi")}</span>
             <span style="flex:1"></span>
             <button class="op" title="feeds this queue"
                 onclick="queueOp(inspector.connId,'source')">Run source once</button>
             <button class="op" title="consumes this queue"
-                onclick="queueOp(inspector.connId,'destination')">Run destination once</button></div>
+                onclick="queueOp(inspector.connId,'destination')">Run destination once</button>
+            <button class="op danger" title="drop every FlowFile in this queue"
+                onclick="purgeQueue(-1)">Purge queue</button></div>
           <table><tr><th>UUID</th><th>Filename</th><th>Size</th><th>Queued</th></tr>
           ${files.map(f => `<tr class="click" onclick="inspector.uuid='${f.uuid}';render()">
             <td class="muted">${esc(f.uuid)}</td><td>${esc(f.filename ?? "")}</td>
             <td>${esc(f.size ?? "")}</td><td>${esc(f.queued_duration ?? "")}</td></tr>`).join("")}
           </table>`;
       } else {
-        const [queues, tops] = await Promise.all([api("/api/queues"), flowTops()]);
+        const [queues, tops] = await Promise.all([api("/api/queues"), flowTops(), procIndex()]);
         const group = currentFlow(tops);
         const qf = localStorage.getItem("niflow.qfilter") || "all";
         const rows = queues.filter(c =>
@@ -548,21 +980,31 @@ async function render() {
               <option value="full"${qf === "full" ? " selected" : ""}>With FlowFiles</option>
               <option value="empty"${qf === "empty" ? " selected" : ""}>Empty</option>
             </select>
-            <span class="pill">${rows.length} / ${queues.length}</span></div>
+            <span class="pill">${rows.length} / ${queues.length}</span>
+            <span style="flex:1"></span>
+            <button class="op danger" title="drop every FlowFile queued in ${group === "*" ? "this NiFi" : group === "" ? "the top-level canvas" : esc(group)}"
+                onclick="purgeFlow()">Purge ${group === "*" || group === "" ? "all queues" : "this flow's queues"}</button>
+          </div>
           <table><tr><th>Queue</th><th>Path</th><th>Queued</th><th></th></tr>
-          ${rows.map(c => `<tr class="click"
-              onclick="inspector={connId:'${c.id}',label:'${esc(c.source)} → ${esc(c.destination)}',uuid:null};render()">
-            <td>${esc(c.source)} → ${esc(c.destination)}</td>
-            <td class="muted">${esc(c.path)}</td>
+          ${rows.map((c, i) => `<tr class="click" onclick="openQueue(${i})">
+            <td>${c.source_id ? compLink(c.source_group_id || c.group_id, c.source_id, c.source)
+                              : endpointLink(c.path, c.source)} →
+                ${c.destination_id ? compLink(c.destination_group_id || c.group_id, c.destination_id, c.destination)
+                                   : endpointLink(c.path, c.destination)}</td>
+            <td class="muted">${compLink(c.group_id, c.id, c.path || "(top level)", "show this connection in NiFi")}</td>
             <td>${c.queued ? `<b>${esc(c.queued_label || c.queued)}</b>` : '<span class="muted">empty</span>'}</td>
             <td>
               <button class="op" title="run ${esc(c.source)} once (feeds this queue)"
                   onclick="event.stopPropagation();queueOp('${c.id}','source')">Src once</button>
               <button class="op" title="run ${esc(c.destination)} once (consumes this queue)"
                   onclick="event.stopPropagation();queueOp('${c.id}','destination')">Dest once</button>
+              <button class="op danger" title="drop every FlowFile queued here"
+                  onclick="event.stopPropagation();purgeQueue(${i})">Purge</button>
             </td>
           </tr>`).join("")}
           </table>`;
+        // Row index -> row: keeps hostile names out of onclick attributes.
+        window._qRows = rows;
         bindFlowSelect();
         $("#qf").onchange = e => { localStorage.setItem("niflow.qfilter", e.target.value); render(); };
       }
@@ -576,14 +1018,6 @@ async function render() {
       const t = traceUuid
         ? await api(`/api/trace?uuid=${encodeURIComponent(traceUuid)}`) : null;
       window._hops = t ? t.hops : [];
-      const changes = h => h.changes.length ? `
-        <table><tr><th>Attribute</th><th>Before</th><th>After</th></tr>
-        ${h.changes.map(c => `<tr><td>${esc(c.name)}</td>
-          <td class="muted">${c.before === null ? "<i>(new)</i>" : esc(c.before)}</td>
-          <td><b>${esc(c.after ?? "")}</b></td></tr>`).join("")}
-        </table>` : `<span class="muted">no attribute changes</span>`;
-      const kin = (label, uuids) => uuids.map(u => `<div class="muted">${label}
-          ${esc(u)} <button class="op" onclick="traceJump('${esc(u)}')">trace</button></div>`).join("");
       view.innerHTML = `
         <div class="bar">
           <input type="text" id="tu" placeholder="FlowFile UUID" value="${esc(traceUuid || "")}">
@@ -592,22 +1026,128 @@ async function render() {
         </div>` + (!t ? "" : !t.hops.length
         ? `<p class="muted">No provenance events for this UUID — wrong id, or the
              events have aged out of the provenance repository.</p>`
-        : t.hops.map((h, i) => `
-          <div class="hop">
-            <div class="hophead"><b>#${i + 1} ${esc(h.component || "(flow)")}</b>
-              <span class="pill">${esc(h.event_type)}${h.relationship ? " → " + esc(h.relationship) : ""}</span>
-              <span class="muted">${esc(h.time)} · ${esc(h.size)} B${h.content_equal === false ? " · content changed" : ""}</span>
-              <span style="flex:1"></span>
-              <button class="op" onclick="hopAttrs(${i})">Attributes</button>
-              ${h.input_available ? `<button class="op" onclick="hopContent(${i},'input')">Content in</button>` : ""}
-              ${h.output_available ? `<button class="op" onclick="hopContent(${i},'output')">Content out</button>` : ""}
-            </div>
-            ${changes(h)}
-            ${kin("joined from", h.parents)}${kin("spawned", h.children)}
-            <pre id="hopx${i}" style="display:none"></pre>
-          </div>`).join(""));
+        : t.hops.map((h, i) => hopCard(h, i, false)).join(""));
       const tu = $("#tu");
       tu.onkeydown = e => { if (e.key === "Enter") traceGo(); };
+    }
+
+    if (active === "follow") {
+      // The live stepper: pick a start point, hit Step, watch the attribute
+      // diff flash at every hop. Muting a branch is a VIEW decision — NiFi
+      // keeps running it (same contract as `niflow follow --mute`).
+      const st = await api("/api/follow/session");
+      window._follow = st;
+      if (!st.active) {
+        const tops = await flowTops();
+        const sel = currentFlow(tops);
+        const g = (sel === "*" || sel === "") ? "root" : sel;
+        let entries = [];
+        let err = "";
+        try { entries = (await api(`/api/follow/entrypoints?group=${encodeURIComponent(g)}`)).entries; }
+        catch (e) { err = e.message; }
+        window._entries = entries;
+        const resume = st.resumable ? `<button class="op" onclick="followStart(-1)">
+            Resume ${esc(st.resumable.id)} (${esc(st.resumable.hops)} hop(s))</button>` : "";
+        view.innerHTML = `
+          <div class="bar">
+            ${flowSelect(tops, sel)}
+            <input type="text" id="premute" placeholder="mute up front, e.g. failure"
+                   value="${esc(localStorage.getItem("niflow.premute") || "")}">
+            ${resume}
+            <span class="muted">Starting quiesces ${esc(g)} — the group is stopped so
+              nothing races the stepper; end the session with “restore” to put it back.</span>
+          </div>` + (err ? `<p class="muted">${esc(err)}</p>` : "") + (!entries.length
+          ? `<p class="muted">No start points in ${esc(g)}: no queued FlowFiles, no
+               source processors, no input ports.</p>`
+          : `<table>
+              <tr><th>Kind</th><th>Where</th><th>Group</th><th></th><th></th></tr>
+              ${entries.map((e, i) => `<tr>
+                <td><span class="pill">${esc(e.kind)}</span></td>
+                <td>${compLink(e.group_id, e.id, e.label)}</td>
+                <td class="muted">${esc(e.path || "(top level)")}</td>
+                <td class="muted">${esc(e.detail || "")}</td>
+                <td><button class="op primary" onclick="followStart(${i})">Start here</button></td>
+              </tr>`).join("")}
+             </table>`);
+        bindFlowSelect();
+        const pm = $("#premute");
+        if (pm) pm.onchange = e => localStorage.setItem("niflow.premute", e.target.value);
+      } else {
+        window._hops = st.hops;
+        const flash = new Set(followFlash);
+        const branches = st.branches;
+        window._branches = branches;
+        view.innerHTML = `
+          <div class="bar">
+            <button class="op primary" onclick="followStep()" title="advance this FlowFile one processor">▶ Step</button>
+            <button class="op" onclick="followAct('repoll')"
+                    title="re-ask provenance without running anything (1.24 can lag)">Retry poll</button>
+            <button class="op" onclick="followAct('next')" title="follow the next live branch">Next branch</button>
+            <span class="pill">${st.hops.length} hop(s)</span>
+            <span class="muted">${esc(st.group)} · following ${esc(st.current || "")}</span>
+            <span style="flex:1"></span>
+            <input type="text" id="mspec" placeholder="mute: failure / dest:PutFile / uuid">
+            <button class="op" onclick="followMute()">Mute</button>
+            <button class="op" onclick="followStop(true)">End &amp; restore</button>
+            <button class="op danger" onclick="followStop(false)">End (leave stopped)</button>
+          </div>
+          <div class="bar">
+            <span class="muted">Muted: ${st.mute_rules.length
+              ? st.mute_rules.map(r => `<button class="op" onclick="followUnmute('${esc(r)}')"
+                    title="unmute">${esc(r)} ✕</button>`).join(" ")
+              : "nothing"} — muted branches keep running in NiFi, they are just not followed.</span>
+          </div>
+          <table>
+            <tr><th>Branch</th><th>From</th><th>Queue</th><th>State</th><th>Hops</th><th></th></tr>
+            ${branches.map((b, i) => `<tr class="${b.current ? "branch-current" : ""} ${b.state === "muted" ? "branch-muted" : ""}">
+              <td>${b.current ? "▶ " : ""}${esc(b.uuid)}</td>
+              <td class="muted">${esc(b.origin || "start")}${b.relationship ? " → " + esc(b.relationship) : ""}</td>
+              <td class="muted">${esc(b.queue || "-")}</td>
+              <td>${esc(b.state)}${b.muted_by ? " (" + esc(b.muted_by) + ")" : ""}</td>
+              <td>${esc(b.hop_count)}</td>
+              <td>
+                ${b.current ? "" : `<button class="op" onclick="followSwitch(${i})">Follow</button>`}
+                ${b.state === "muted"
+                  ? `<button class="op" onclick="followUnmute('uuid:' + window._branches[${i}].uuid)">Unmute</button>`
+                  : `<button class="op" onclick="followMuteBranch(${i})">Mute</button>`}
+                <button class="op" onclick="traceJump(window._branches[${i}].uuid)">Trace</button>
+              </td></tr>`).join("")}
+          </table>
+          <h3>Hops on this branch</h3>` + (st.hops.length
+            ? st.hops.map((h, i) => hopCard(h, i, flash.has(h.event_id))).join("")
+            : `<p class="muted">No hops yet — hit Step.</p>`);
+      }
+    }
+
+    if (active === "alerts") {
+      // Everything here is served from the watcher's in-memory state — no
+      // NiFi call — so this tab is cheap to leave open and cheap to poll.
+      const st = await api("/api/alerts");
+      const s = st.summary || {};
+      const showAll = localStorage.getItem("niflow.alertsall") === "1";
+      const rows = (st.alerts || []).filter(a => showAll || a.state === "active");
+      const last = s.last_tick ? new Date(s.last_tick * 1000).toLocaleTimeString() : "never";
+      view.innerHTML = `
+        <div class="bar">
+          <span class="pill" style="color:${st.running ? "var(--ok)" : "var(--muted)"}">
+            ${st.running ? "watching" : "paused"} ${esc(s.watching || "root")} — checked ${esc(last)}</span>
+          <span class="pill" title="components with an established healthy baseline">
+            ${s.established || 0} / ${s.tracked || 0} baselined</span>
+          ${s.chronic ? `<span class="pill" title="failing since before the watcher started — no baseline, so no alert">${s.chronic} chronic</span>` : ""}
+          <label class="meta"><input type="checkbox" id="aall" ${showAll ? "checked" : ""}> show resolved</label>
+          <span style="flex:1"></span>
+          <button class="op" onclick="alertsCheck()" title="run one health poll right now">Check now</button>
+          <button class="op" onclick="alertsWatch(${st.running ? "false" : "true"})">${st.running ? "Pause" : "Resume"} watching</button>
+          <button class="op" onclick="alertsClear()" title="forget resolved alerts">Clear resolved</button>
+        </div>
+        ${s.error ? `<p class="muted">last watcher error: ${esc(s.error)}</p>` : ""}
+        ${rows.length ? rows.map(alertCard).join("") : `<p class="muted">
+           Nothing has broken since the watcher started. It is baselining
+           ${s.tracked || 0} component(s) — a component has to look healthy for
+           ${esc(fmtDur(s.baseline_seconds))} before a failure counts as
+           "it <i>was</i> working". State lives in <code>${esc(st.state_file || "")}</code>.</p>`}`;
+      $("#aall").onchange = e => {
+        localStorage.setItem("niflow.alertsall", e.target.checked ? "1" : "0"); render(); };
     }
 
     if (active === "bulletins") {
@@ -623,7 +1163,8 @@ async function render() {
         <table><tr><th>When</th><th>Level</th><th>Source</th><th>Message</th></tr>
         ${rows.map(b => `<tr><td class="muted">${esc(b.time ?? b.timestamp ?? "")}</td>
           <td class="state-${b.level === "ERROR" ? "INVALID" : "DISABLED"}">${esc(b.level ?? "")}</td>
-          <td>${esc(b.source ?? b.source_name ?? "")}</td><td>${esc(b.message ?? "")}</td></tr>`).join("")}
+          <td>${compLink(b.group_id, b.source_id, b.source ?? b.source_name ?? "")}</td>
+          <td>${esc(b.message ?? "")}</td></tr>`).join("")}
         </table>` : `<p class="muted">No bulletins${group === "*" ? "" : " for this flow"}.</p>`);
       bindFlowSelect();
     }
@@ -636,20 +1177,24 @@ async function render() {
         <div class="bar">${flowSelect(tops, group)}
           <span class="pill">${rows.length} / ${items.length}</span></div>` + (rows.length ? `
         <table><tr><th>Component</th><th>Problem</th></tr>
-        ${rows.map(e => `<tr><td>${esc(e.path ? e.path + "/" : "")}${esc(e.name ?? "")}</td>
+        ${rows.map(e => `<tr><td>${esc(e.path ? e.path + "/" : "")}<b>${compLink(e.group_id, e.id, e.name ?? "", "open " + (e.name ?? "") + " in NiFi")}</b></td>
           <td>${esc((e.errors ?? [e.message]).join("; "))}</td></tr>`).join("")}
         </table>` : `<p class="muted">No validation errors${group === "*" ? " — every processor is happy" : " for this flow"}.</p>`);
       bindFlowSelect();
     }
 
     if (active === "explain") {
-      // One doc per group (any depth), generated by the configured LLM and
-      // saved to docs/explanations/ — the fingerprint tells fresh from stale.
+      // One doc per group down to the chosen depth (default: just the
+      // selected group, nested groups summarised in a line each), generated
+      // by the configured LLM and saved to docs/explanations/ — the
+      // fingerprint tells fresh from stale, and the plan pill says how many
+      // documents/LLM calls the button is about to spend.
       const groups = await api("/api/groups");
       const paths = ["", ...groups.map(g => g.path)];
       let sel = localStorage.getItem("niflow.explaingroup") ?? "";
       if (!paths.includes(sel)) sel = "";
-      const st = await api(`/api/explain?group=${encodeURIComponent(sel || "root")}`);
+      const depth = localStorage.getItem("niflow.explaindepth") ?? "1";
+      const st = await api(`/api/explain?group=${encodeURIComponent(sel || "root")}&depth=${encodeURIComponent(depth)}`);
       const badge = !st.exists
         ? `<span class="pill">not generated yet</span>`
         : st.outdated
@@ -661,17 +1206,27 @@ async function render() {
           <select id="eg" title="which group to explain">
             ${paths.map(p => `<option value="${esc(p)}"${p === sel ? " selected" : ""}>${p ? esc(p) : "(root canvas)"}</option>`).join("")}
           </select>
+          <select id="ed" title="how deep to document (deeper = one file and one LLM call per nested group)">
+            ${[["1", "this group only"], ["2", "+ 1 level down"], ["3", "+ 2 levels down"], ["0", "everything below"]]
+              .map(([v, t]) => `<option value="${v}"${v === depth ? " selected" : ""}>${t}</option>`).join("")}
+          </select>
           ${badge}
+          <span class="pill" title="what the button will spend">${st.documents} doc(s), ${st.llm_calls} LLM call(s)${st.summarised_groups ? ` — ${st.summarised_groups} deeper group(s) summarised in one line` : ""}</span>
+          ${st.backend ? `<span class="pill" title="which LLM generates these docs">${esc(st.backend)}</span>` : ""}
           <span style="flex:1"></span>
-          ${st.configured ? `<button class="op" onclick="explainGen(${fresh})">${st.exists ? "Regenerate" : "Generate explanation"}</button>` : ""}
+          ${st.configured ? `<button class="op" onclick="explainGen(${fresh}, ${st.documents}, ${st.llm_calls})">${st.exists ? "Regenerate" : "Generate explanation"}</button>` : ""}
         </div>
-        ${st.configured ? "" : `<p class="muted">LLM off — easiest: put <code>GOOGLE_API_KEY=…</code> in <code>.env</code>
-           (git-ignored) and niflow uses Gemini's cheapest model. Or point <code>NIFLOW_LLM_URL</code> +
-           <code>NIFLOW_LLM_MODEL</code> at any endpoint (local Ollama: <code>http://localhost:11434/v1</code>).</p>`}
+        ${st.configured ? "" : `<p class="muted">LLM off — with the <b>Claude Code</b> CLI installed and logged in,
+           no key is needed: niflow finds <code>claude</code> on PATH (pin it with
+           <code>NIFLOW_LLM_PROVIDER=claude-code</code>). With a key instead: put <code>GOOGLE_API_KEY=…</code> in
+           <code>.env</code> (git-ignored) and niflow uses Gemini's cheapest model. Or point
+           <code>NIFLOW_LLM_URL</code> + <code>NIFLOW_LLM_MODEL</code> at any endpoint (local Ollama:
+           <code>http://localhost:11434/v1</code>).</p>`}
         ${st.doc ? `<article class="doc">${md(st.doc)}</article>`
                  : st.configured ? `<p class="muted">No explanation for this group yet — a saved plain-English
                      walkthrough appears here once you generate it.</p>` : ""}`;
       $("#eg").onchange = e => { localStorage.setItem("niflow.explaingroup", e.target.value); render(); };
+      $("#ed").onchange = e => { localStorage.setItem("niflow.explaindepth", e.target.value); render(); };
     }
 
     if (active === "flows") {
@@ -691,6 +1246,40 @@ async function render() {
   } catch (err) {
     view.innerHTML = `<pre>Error: ${esc(err.message)}</pre>`;
   }
+}
+
+function openQueue(i) {
+  const c = window._qRows[i];
+  inspector = {connId: c.id, groupId: c.group_id, uuid: null,
+               label: `${c.source} → ${c.destination}`};
+  render();
+}
+
+// Purge one queue. `i` indexes the rendered queue rows; -1 means "the queue
+// the inspector is currently showing".
+async function purgeQueue(i) {
+  const c = i < 0 ? {id: inspector.connId, label: inspector.label} : window._qRows[i];
+  const label = c.label || `${c.source} → ${c.destination}`;
+  if (!ask(`Drop every FlowFile queued in ${label}?\n\nThis cannot be undone.`)) return;
+  status(`purging ${label}…`);
+  try { const r = await post(`/api/queues/${c.id}/purge`);
+        status(`purged ${label} ✓ — dropped ${r.dropped || "nothing"}`); }
+  catch (e) { status(`purge failed: ${e.message}`); }
+  render();
+}
+
+// Purge every queue in the flow the dropdown has selected — never the whole
+// instance while the user is looking at one flow.
+async function purgeFlow() {
+  const g = localStorage.getItem(FLOWKEY) ?? "*";
+  const whole = g === "*" || g === "";
+  const scope = whole ? "EVERY queue in this NiFi" : `every queue in ${g}`;
+  if (!ask(`Drop the contents of ${scope}?\n\nThis cannot be undone.`)) return;
+  status(`purging ${whole ? "all queues" : g}…`);
+  try { const r = await post("/api/group/purge", {group: whole ? "root" : g});
+        status(`purge ✓ — dropped ${r.dropped || "nothing"}`); }
+  catch (e) { status(`purge failed: ${e.message}`); }
+  render();
 }
 
 async function queueOp(connId, which) {
@@ -723,6 +1312,53 @@ async function hopContent(i, dir) {
     status("");
   } catch (e) { status(`content failed: ${e.message}`); }
 }
+// --- Follow tab actions ----------------------------------------------
+// Every one of them posts, reports the outcome in the status line, and
+// re-renders; the hops the action produced are flashed (followFlash).
+async function followAct(what, body) {
+  status(`${what}…`);
+  try {
+    const r = await post(`/api/follow/${what}`, body || {});
+    followFlash = r.fresh || [];
+    const o = r.outcome || {};
+    const bits = [];
+    if (o.status) bits.push(o.status);
+    if (o.runs > 1) bits.push(`ran ${o.runs}x`);
+    if (o.message) bits.push(o.message);
+    status(bits.join(" — ") || `${what} ✓`);
+  } catch (e) { status(`${what} failed: ${e.message}`); }
+  render();
+}
+function followStep() { followAct("step"); }
+async function followStart(i) {
+  const tops = await flowTops();
+  const sel = currentFlow(tops);
+  const group = (sel === "*" || sel === "") ? "root" : sel;
+  if (i < 0) return followAct("start", {group, resume: true});
+  const entry = window._entries[i];
+  const premute = ($("#premute") || {}).value || "";
+  if (!ask(`Start stepping at ${entry.label}?\n\n${group} will be STOPPED so nothing
+races the stepper (End & restore puts it back).`)) return;
+  followAct("start", {group, entry,
+                      mutes: premute.split(",").map(x => x.trim()).filter(Boolean)});
+}
+function followSwitch(i) { followAct("switch", {uuid: window._branches[i].uuid}); }
+function followMuteBranch(i) { followAct("mute", {spec: "uuid:" + window._branches[i].uuid}); }
+function followUnmute(spec) { followAct("unmute", {spec}); }
+function followMute() {
+  const spec = ($("#mspec") || {}).value.trim();
+  if (spec) followAct("mute", {spec});
+}
+async function followStop(restore) {
+  status("ending session…");
+  try {
+    const r = await post("/api/follow/stop", {restore});
+    status(restore ? `session ended — restarted ${r.restored} processor(s)`
+                   : "session ended — the group is left stopped");
+  } catch (e) { status(`stop failed: ${e.message}`); }
+  render();
+}
+
 function tidyDir() { return localStorage.getItem("niflow.tidydir") || "horizontal"; }
 async function tidyCanvas() {
   // Selected flow -> tidy that flow (and its children). "All flows" -> the
@@ -730,7 +1366,7 @@ async function tidyCanvas() {
   const g = localStorage.getItem(FLOWKEY) ?? "*";
   const target = g === "*" || g === "" ? "root" : g;
   const scope = g === "*" ? "the whole canvas" : g === "" ? "the top-level canvas" : g;
-  if (!confirm(`Auto-arrange ${scope}? Hand-placed positions will be overwritten.`)) return;
+  if (!ask(`Auto-arrange ${scope}? Hand-placed positions will be overwritten.`)) return;
   status(`tidying ${scope}…`);
   try { const r = await post("/api/tidy", {group: target, layout: tidyDir(), recurse: g !== ""});
         status(`tidy ✓ moved ${r.moved} component(s) — refresh the NiFi canvas to see it`); }
@@ -759,13 +1395,18 @@ function md(src) {
   flush(); endList();
   return out.join("\n");
 }
-async function explainGen(fresh) {
-  // Missing/outdated -> regenerate whatever's stale in the subtree; already
-  // up to date -> force just this group's doc (children summaries reused).
+async function explainGen(fresh, docs, calls) {
+  // Missing/outdated -> regenerate whatever's stale in scope; already up to
+  // date -> force a rewrite of every document in scope. Scope is the depth
+  // select, and anything past it is a one-line summary, not a document —
+  // confirm the count first, because deep canvases used to spider.
   const g = localStorage.getItem("niflow.explaingroup") || "";
-  status("generating explanation… (LLM call — this can take a minute)");
+  const d = localStorage.getItem("niflow.explaindepth") ?? "1";
+  const n = fresh ? docs : calls;  // forcing rewrites the current ones too
+  if (n > 1 && !confirm(`Generate ${n} document(s) with ${n} LLM call(s)?`)) return;
+  status(`generating explanation… (${n} LLM call(s) — this can take a minute)`);
   try {
-    const r = await post("/api/explain", {group: g || "root", force: fresh, recurse: !fresh});
+    const r = await post("/api/explain", {group: g || "root", force: fresh, depth: Number(d)});
     const done = r.results.filter(x => x.status === "generated").length;
     status(`explanation ✓ — ${done} document(s) written`);
   } catch (e) { status(`explain failed: ${e.message}`); }
@@ -787,7 +1428,6 @@ async function procOp(id, op) {
   render();
 }
 async function groupOp(op) {
-  if ((op === "purge") && !confirm("Drop the contents of EVERY queue?")) return;
   status(`${op}…`);
   try { const r = await post(`/api/group/${op}`);
         status(`${op} ✓${r.dropped ? " — dropped " + r.dropped : ""}`); }
@@ -805,29 +1445,141 @@ async function planFlow(file) {
   } catch (e) { status(`plan failed: ${e.message}`); }
 }
 async function pushFlow(file) {
-  if (!confirm(`Apply changes from ${file} to the live group?`)) return;
+  if (!ask(`Apply changes from ${file} to the live group?`)) return;
   status("pushing…");
+  window._procIx = null;  // a push can renumber components — drop the id cache
   try { const r = await post("/api/push", {file, update: true});
         status(`push ✓ — ${r.applied} change(s) applied`); }
   catch (e) { status(`push failed: ${e.message}`); }
 }
 
-let timer = null;
-$("#auto").onchange = e => {
-  if (e.target.checked) timer = setInterval(render, 3000);
-  else { clearInterval(timer); timer = null; }
-};
+// --- alerts ----------------------------------------------------------
+// The sentence these cards exist to say: "this was healthy, you changed
+// nothing, it broke at 14:02, and the cause was outside NiFi."
+function fmtDur(sec) {
+  if (sec == null) return "?";
+  sec = Math.max(0, Math.round(sec));
+  if (sec < 60) return sec + "s";
+  if (sec < 3600) return Math.floor(sec / 60) + "m";
+  if (sec < 86400) return Math.floor(sec / 3600) + "h" + String(Math.floor(sec % 3600 / 60)).padStart(2, "0") + "m";
+  return Math.floor(sec / 86400) + "d";
+}
+const clock = ts => ts ? new Date(ts * 1000).toLocaleTimeString() : "?";
+function alertCard(a) {
+  const cls = `${a.category || "unknown"}${a.state !== "active" ? " resolved" : ""}${a.acknowledged ? " acked" : ""}`;
+  const badge = {external: "EXTERNAL — not NiFi, not your flow",
+                 internal: "INTERNAL — something on our side",
+                 unknown: "UNKNOWN — not enough evidence to say"}[a.category] || a.category;
+  const was = a.healthy_for
+    ? `was healthy for <b>${esc(a.healthy_for)}</b>` : "was healthy";
+  const proc = a.last_processed
+    ? ` (last processed ${clock(a.last_processed)})`
+    : (a.ever_processed ? "" : " (running, but no FlowFiles seen through it)");
+  return `<div class="alert ${cls}">
+    <h3>${compLink(a.group_id, a.component_id, a.component || "(component)", "open in NiFi")}
+      <span class="muted">${esc(a.path ? a.path + " · " : "")}${esc(a.component_type || "")}</span>
+      <span class="pill">${esc(badge)}</span>
+      ${a.state !== "active" ? `<span class="pill" style="color:var(--ok)">recovered ${clock(a.resolved_at)}${a.down_for ? " after " + esc(a.down_for) : ""}</span>` : ""}
+      ${a.occurrences > 1 ? `<span class="pill">${a.occurrences}×</span>` : ""}
+    </h3>
+    <div>${was}${esc(proc)}, <b>broke at ${clock(a.broke_at)}</b></div>
+    <div class="why">${esc(a.summary || "")}</div>
+    ${a.hint ? `<div class="hint">→ ${esc(a.hint)}</div>` : ""}
+    ${a.confidence && a.confidence !== "high"
+      ? `<div class="hint">confidence: ${esc(a.confidence)}${a.pattern ? ` (pattern ${esc(a.pattern)})` : ""} — signal: ${esc(a.signal || "")}</div>` : ""}
+    ${(a.evidence || []).length ? `<div class="ev">${(a.evidence || []).map(esc).join("\n")}</div>` : ""}
+    <div class="bar" style="margin:.5rem 0 0">
+      <button class="op" onclick="alertAck('${esc(a.id)}',${a.acknowledged ? "false" : "true"})">
+        ${a.acknowledged ? "Un-acknowledge" : "Acknowledge"}</button>
+      <button class="op" onclick="alertDismiss('${esc(a.id)}')">Dismiss</button>
+    </div>
+  </div>`;
+}
+async function alertAck(id, on) {
+  try { await post("/api/alerts/ack", {id, on}); } catch (e) { status(e.message); }
+  alertPoll(); render();
+}
+async function alertDismiss(id) {
+  if (!ask("Dismiss this alert? (it can fire again if the component breaks anew)")) return;
+  try { await post("/api/alerts/dismiss", {id}); } catch (e) { status(e.message); }
+  alertPoll(); render();
+}
+async function alertsClear() {
+  try { const r = await post("/api/alerts/clear", {}); status(`cleared ${r.cleared} resolved alert(s)`); }
+  catch (e) { status(e.message); }
+  render();
+}
+async function alertsCheck() {
+  status("checking…");
+  try { await post("/api/alerts/check", {}); status("checked"); } catch (e) { status(e.message); }
+  alertPoll(); render();
+}
+async function alertsWatch(on) {
+  try { await post("/api/alerts/watch", {on}); } catch (e) { status(e.message); }
+  render();
+}
+// The badge/banner poll runs on EVERY tab (and even with auto-refresh off):
+// nobody sits on the Alerts tab waiting for something to break. It is a
+// read of the watcher's in-memory counters, not a NiFi call.
+async function alertPoll() {
+  try {
+    const s = await api("/api/alerts/summary");
+    const n = s.unacknowledged || 0;
+    const bar = $("#alertbar");
+    if (n) {
+      const cat = s.external ? "ext" : s.internal ? "int" : "unk";
+      bar.className = "on " + cat;
+      bar.innerHTML = `<b>${n} alert${n > 1 ? "s" : ""}</b>` +
+        `<span>${esc(s.newest_component || "")}: ${esc(s.newest_summary || "")}</span>` +
+        `<span style="flex:1"></span><span>click to open Alerts</span>`;
+    } else {
+      bar.className = "";
+      bar.innerHTML = "";
+    }
+    if (n !== window._alertCount) { window._alertCount = n; nav(); }
+  } catch (e) { /* server restarting — try again next tick */ }
+}
+
+// Auto-refresh: on unless this browser turned it off, and skipped whenever a
+// tick would fight the user or pointlessly hammer NiFi.
+const AUTOKEY = "niflow.autorefresh";
+const AUTO_MS = 3000;
+// Tabs that poll badly: Trace runs a provenance query per tick (create →
+// poll → delete, plus one fetch per event), Explain re-fingerprints the flow
+// to date its doc, and Flows is a static directory listing. All three stay
+// on-demand; the cheap status reads (processors, queues, bulletins, errors)
+// are what the 3s tick is for.
+// Follow joins them: stepping is deliberate (one run-once per click) and a
+// 3s re-render would re-play the attribute flash the user is reading.
+const NO_POLL = new Set(["trace", "follow", "explain", "flows"]);
+function autoOn() { return (localStorage.getItem(AUTOKEY) ?? "1") === "1"; }
+function autoTick() {
+  if (!autoOn() || document.hidden) return;
+  if (inflight || modal) return;          // mid-mutation / mid-confirm
+  if (NO_POLL.has(active)) return;        // expensive or static tabs
+  if (inspector) return;                  // don't yank a drill-down away
+  const el = document.activeElement;      // mid-typing / dropdown open
+  if (el && ["INPUT", "SELECT", "TEXTAREA"].includes(el.tagName)) return;
+  render();
+}
 
 (async () => {
-  nav(); render();
   try {
     const a = await api("/api/about");
+    window._uiBase = a.ui || "";  // deep links need this before the first paint
     $("#about").textContent = `NiFi ${a.version} @ ${a.base} (auth: ${a.auth})`;
     if (a.reload) setInterval(async () => {   // dev mode: follow server restarts
       try { if ((await api("/api/about")).boot !== a.boot) location.reload(); }
       catch (e) {} // server mid-restart — try again next tick
     }, 1500);
   } catch (e) { $("#about").textContent = `not connected: ${e.message}`; }
+  $("#auto").checked = autoOn();
+  $("#auto").onchange = e =>
+    localStorage.setItem(AUTOKEY, e.target.checked ? "1" : "0");
+  nav(); render();
+  setInterval(autoTick, AUTO_MS);
+  alertPoll();
+  setInterval(alertPoll, AUTO_MS);   // badge + banner, every tab, always on
 })();
 </script>
 </body>

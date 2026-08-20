@@ -10,6 +10,23 @@ from niflow.rest.common import (
     NiFiApiError,
 )
 
+# NiFi answers a provenance query with an arbitrary subset once it hits
+# maxResults (see _provenance_newest), so the cap is escalated by this factor
+# until the answer is complete — never past the ceiling, which exists so a
+# component with a million events cannot turn one click into a heavy query.
+_PROV_ESCALATION = 10
+_PROV_RESULT_CEILING = 5000
+
+
+def _event_order(event: dict) -> int:
+    """Provenance event ids are monotonic integers — and event *times* are
+    lossy strings, so ordering must go through the id. Non-numeric ids (only
+    ever seen in fixtures) sort last rather than raising."""
+    try:
+        return int(event.get("eventId"))
+    except (TypeError, ValueError):
+        return 1 << 62
+
 
 class InspectMixin:
     def walk_processors(self, group: str = "root") -> Iterator[Tuple[str, str, dict]]:
@@ -117,9 +134,29 @@ class InspectMixin:
 
         Uses NiFi's ``RUN_ONCE`` run-status (1.13+ and 2.x). The stop first
         makes this idempotent whether the processor was running or not.
+
+        Callers should check :meth:`processor_validation` first: NiFi accepts
+        RUN_ONCE on an **invalid** processor with a 200 and does nothing —
+        and on 2.7.2 it then wedges in ``RUN_ONCE``, where ``RUNNING`` 409s
+        and a config change is refused with "cannot modify … while the
+        Processor is running". Running one blindly can therefore lock the
+        very property that needs fixing.
         """
         self.stop_processor(proc_id)
         self._set_processor_state(proc_id, "RUN_ONCE")
+
+    def processor_validation(self, proc_id: str) -> dict:
+        """One processor's ``{"state", "status", "errors"}`` in a single call.
+
+        ``validation_errors`` walks a whole group; this asks about one
+        component, which is what a step needs before it runs anything.
+        """
+        comp = self._get_json(f"/processors/{proc_id}")["component"]
+        return {
+            "state": comp.get("state", ""),
+            "status": comp.get("validationStatus", ""),
+            "errors": [str(e) for e in comp.get("validationErrors") or []],
+        }
 
     def connection_end(self, conn_id: str, which: str) -> dict:
         """One end of a connection: the raw ``source``/``destination`` ref.
@@ -130,6 +167,17 @@ class InspectMixin:
         snapshot, which carries endpoint names but not ids.
         """
         return self._get_json(f"/connections/{conn_id}")["component"].get(which) or {}
+
+    def connection_relationships(self, conn_id: str) -> List[str]:
+        """The relationships a connection carries (``selectedRelationships``).
+
+        The stepper needs this because NiFi's CLONE/FORK events carry no
+        relationship (verified on 1.24 and 2.7.2): a fork child's branch name
+        — the "failure" an analyst thinks in — is a property of the connection
+        it landed in, not of the event that spawned it.
+        """
+        comp = self._get_json(f"/connections/{conn_id}")["component"]
+        return list(comp.get("selectedRelationships") or [])
 
     def run_queue_endpoint_once(self, conn_id: str, which: str) -> str:
         """Run-once the processor at one end of a queue; returns its name.
@@ -192,8 +240,13 @@ class InspectMixin:
         ).json()
         return entity["id"]
 
-    def drain_connection(self, conn_id: str) -> None:
-        """Drop every FlowFile queued in one connection (async drop-request)."""
+    def drain_connection(self, conn_id: str) -> str:
+        """Drop every FlowFile queued in one connection (async drop-request).
+
+        Returns NiFi's summary of what went, e.g. ``"12 / 4.2 KB"`` — the same
+        ``dropped`` figure :meth:`_empty_queues` reports for a whole group, so
+        callers can tell the user how much they just destroyed.
+        """
         req = self._request(
             "POST", f"/flowfile-queues/{conn_id}/drop-requests"
         ).json()["dropRequest"]
@@ -209,6 +262,7 @@ class InspectMixin:
                 )["dropRequest"]
         finally:
             self._request("DELETE", f"/flowfile-queues/{conn_id}/drop-requests/{req_id}")
+        return req.get("dropped", "")
 
     def list_queues(self, group: str = "root") -> List[dict]:
         """Every connection (queue) under ``group``, with its queued counts.
@@ -216,6 +270,13 @@ class InspectMixin:
         Each dict carries ``id`` (the connection id, used to list contents),
         ``source``/``destination`` names, the group ``path``, and ``queued``
         (FlowFile count) / ``queued_label`` (NiFi's "n / size" string).
+
+        It also carries the ids needed to deep-link into the NiFi canvas:
+        ``group_id`` (the group the connection is drawn in) plus
+        ``source_id``/``destination_id`` and their own
+        ``source_group_id``/``destination_group_id`` — an endpoint can live in
+        a *different* group from the connection (a child group's port), and
+        the status snapshot doesn't say, so those fall back to ``group_id``.
 
         One recursive-status call when the server supports it; per-group
         walk otherwise.
@@ -226,6 +287,7 @@ class InspectMixin:
             def visit_snap(snap: dict, prefix: str) -> None:
                 for wrapper in snap.get("connectionStatusSnapshots", []):
                     conn = wrapper.get("connectionStatusSnapshot") or {}
+                    group_id = conn.get("groupId", "")
                     out.append({
                         "id": conn["id"],
                         "source": conn.get("sourceName", ""),
@@ -233,6 +295,11 @@ class InspectMixin:
                         "path": prefix,
                         "queued": conn.get("flowFilesQueued", 0),
                         "queued_label": conn.get("queued", ""),
+                        "group_id": group_id,
+                        "source_id": conn.get("sourceId", ""),
+                        "source_group_id": group_id,
+                        "destination_id": conn.get("destinationId", ""),
+                        "destination_group_id": group_id,
                     })
                 for wrapper in snap.get("processGroupStatusSnapshots", []):
                     child = wrapper.get("processGroupStatusSnapshot") or {}
@@ -246,15 +313,54 @@ class InspectMixin:
             flow = self._get_json(f"/flow/process-groups/{pg_id}")["processGroupFlow"]["flow"]
             for entity in flow.get("connections", []):
                 comp = entity.get("component", {})
+                src = comp.get("source") or {}
+                dst = comp.get("destination") or {}
+                group_id = comp.get("parentGroupId", "") or pg_id
                 snap = (entity.get("status") or {}).get("aggregateSnapshot") or {}
                 out.append({
                     "id": entity["id"],
-                    "source": (comp.get("source") or {}).get("name", ""),
-                    "destination": (comp.get("destination") or {}).get("name", ""),
+                    "source": src.get("name", ""),
+                    "destination": dst.get("name", ""),
                     "path": prefix,
                     "queued": snap.get("flowFilesQueued", 0),
                     "queued_label": snap.get("queued", ""),
+                    "group_id": group_id,
+                    "source_id": src.get("id", ""),
+                    "source_group_id": src.get("groupId", "") or group_id,
+                    "destination_id": dst.get("id", ""),
+                    "destination_group_id": dst.get("groupId", "") or group_id,
                 })
+            for child in flow.get("processGroups", []):
+                c = child["component"]
+                path = f"{prefix}/{c['name']}" if prefix else c["name"]
+                visit(c["id"], path)
+
+        visit(self.resolve_group(group), "")
+        return out
+
+    def list_ports(self, group: str = "root") -> List[dict]:
+        """Input and output ports under ``group``, depth-first.
+
+        Each dict carries ``kind`` (``input_port``/``output_port``),
+        ``id``/``name``/``state``, the group ``path`` and the ``group_id`` the
+        port lives in. Ports are the other way a FlowFile enters a group, so
+        the stepper's start-point menu lists them beside source processors.
+        """
+        out: List[dict] = []
+
+        def visit(pg_id: str, prefix: str) -> None:
+            flow = self._get_json(f"/flow/process-groups/{pg_id}")["processGroupFlow"]["flow"]
+            for kind, key in (("input_port", "inputPorts"), ("output_port", "outputPorts")):
+                for entity in flow.get(key, []):
+                    comp = entity.get("component", {})
+                    out.append({
+                        "kind": kind,
+                        "id": comp.get("id", entity.get("id", "")),
+                        "name": comp.get("name", ""),
+                        "state": comp.get("state", ""),
+                        "path": prefix,
+                        "group_id": pg_id,
+                    })
             for child in flow.get("processGroups", []):
                 c = child["component"]
                 path = f"{prefix}/{c['name']}" if prefix else c["name"]
@@ -297,8 +403,17 @@ class InspectMixin:
         """Snapshot of the FlowFiles currently queued in a connection.
 
         Drives NiFi's async listing-request (create → poll → delete). Each dict
-        has ``uuid`` (to fetch detail), ``filename``, ``size`` (bytes), and
-        ``position`` in the queue.
+        has ``uuid`` (to fetch detail), ``filename``, ``size`` (bytes),
+        ``position`` in the queue (**1-based**, as NiFi reports it) and
+        ``penalized``/``penalty_expires_in`` — a penalised FlowFile is skipped
+        by the scheduler, so it is why a run-once can look like it did
+        nothing.
+
+        **NiFi caps this listing at 100 FlowFiles per queue and the cap is not
+        negotiable** — verified live on 1.24.0: a request body asking for
+        ``maxResults: 500`` still comes back with ``maxResults: 100``. A queue
+        holding thousands therefore shows only its first hundred, which is
+        why :meth:`locate_flowfile` exists.
         """
         base = f"/flowfile-queues/{connection_id}/listing-requests"
         req = self._request("POST", base).json()["listingRequest"]
@@ -319,9 +434,39 @@ class InspectMixin:
                 "filename": s.get("filename", ""),
                 "size": s.get("size", 0),
                 "position": s.get("position", 0),
+                "penalized": bool(s.get("penalized")),
+                "penalty_expires_in": s.get("penaltyExpiresIn", 0) or 0,
             }
             for s in summaries[:max_results]
         ]
+
+    def locate_flowfile(self, connection_id: str, uuid: str) -> Optional[dict]:
+        """Is ``uuid`` in this queue? Works past the 100-file listing cap.
+
+        NiFi will not list more than 100 FlowFiles from a queue, but it *will*
+        answer for one by id: ``GET /flowfile-queues/{id}/flowfiles/{uuid}``
+        resolves a FlowFile at any depth (verified live on 1.24.0 against a
+        queue of 200, on a file the listing could not see). Returns the same
+        shape :meth:`list_flowfiles` yields — minus ``position``, which the
+        single-FlowFile DTO does not carry — or ``None`` when the queue does
+        not hold it (NiFi answers 404).
+        """
+        try:
+            ff = self._get_json(
+                f"/flowfile-queues/{connection_id}/flowfiles/{uuid}"
+            )["flowFile"]
+        except NiFiApiError as exc:
+            if getattr(exc, "status", None) in (404, 400):
+                return None
+            raise
+        return {
+            "uuid": ff.get("uuid", uuid),
+            "filename": ff.get("filename", ""),
+            "size": ff.get("size", 0),
+            "position": None,  # unknown: NiFi only reports it in a listing
+            "penalized": bool(ff.get("penalized")),
+            "penalty_expires_in": ff.get("penaltyExpiresIn", 0) or 0,
+        }
 
     def flowfile_detail(self, connection_id: str, uuid: str) -> dict:
         """A queued FlowFile's attributes *and* content payload, in one call."""
@@ -355,12 +500,27 @@ class InspectMixin:
             return f"(content unavailable: {exc})"
         return getattr(resp, "text", "") or ""
 
-    def _provenance_query(self, search_terms: dict, max_results: int, what: str) -> List[dict]:
-        """Run one async provenance query (create → poll → delete); raw DTOs."""
+    def _provenance_query(self, search_terms: dict, max_results: int, what: str,
+                          summarize: bool = True,
+                          totals: Optional[dict] = None) -> List[dict]:
+        """Run one async provenance query (create → poll → delete); raw DTOs.
+
+        ``summarize=False`` asks NiFi for the *whole* event DTO — attributes,
+        parent/child uuids, content availability — which is everything
+        :meth:`_hop_from_event` needs, so a journey costs one query instead of
+        one query plus a GET per event (verified on 1.24.0: the non-summarized
+        payload carries ``attributes``/``parentUuids``/``childUuids``/
+        ``contentEqual``/``inputContentAvailable``).
+
+        ``totals`` (a dict the caller passes in) is filled with NiFi's
+        ``total``/``totalCount`` so the caller can tell a complete answer from
+        a capped one — NiFi reports ``total`` as the string ``"100+"`` when it
+        hit ``maxResults``.
+        """
         body = {"provenance": {"request": {
             "searchTerms": search_terms,
             "maxResults": max_results,
-            "summarize": True,
+            "summarize": summarize,
         }}}
         prov = self._request("POST", "/provenance", json=body).json()["provenance"]
         prov_id = prov["id"]
@@ -371,9 +531,48 @@ class InspectMixin:
                     raise NiFiApiError(408, f"provenance query for {what} timed out")
                 time.sleep(_POLL_INTERVAL_S)
                 prov = self._get_json(f"/provenance/{prov_id}")["provenance"]
-            return ((prov.get("results") or {}).get("provenanceEvents")) or []
+            results = prov.get("results") or {}
+            if totals is not None:
+                totals["total"] = results.get("total", "")
+                totals["total_count"] = results.get("totalCount", 0) or 0
+                totals["oldest_event"] = results.get("oldestEvent", "")
+            return results.get("provenanceEvents") or []
         finally:
             self._request("DELETE", f"/provenance/{prov_id}")
+
+    def _provenance_newest(self, search_terms: dict, max_results: int, what: str,
+                           summarize: bool = True,
+                           ceiling: int = _PROV_RESULT_CEILING,
+                           ) -> Tuple[List[dict], bool]:
+        """The *newest* ``max_results`` matching events, ascending, + capped?
+
+        **NiFi's ``maxResults`` does not mean "the newest N".** Measured on
+        1.24.0 against a component with 800 events: asking for 10 returned
+        event ids 932-1071 — from the previous day — while the newest was
+        133249; asking for 250 returned a set with a hole in the middle. The
+        cap is applied per index shard, so a capped answer is an arbitrary
+        subset presented as if it were the whole story. That is why "recent
+        events" could show ancient ones, and why a stepper polling a capped
+        uuid query can see nothing new and call it an indexing lag.
+
+        The fix is to stop asking for a capped answer: NiFi flags a capped
+        result by reporting ``total`` as ``"N+"``, so the cap is raised until
+        the answer is complete (or the ceiling is reached) and the newest
+        ``max_results`` are then taken here, where the ordering is knowable.
+        """
+        cap = max(1, max_results)
+        events: List[dict] = []
+        capped = False
+        while True:
+            totals: dict = {}
+            events = self._provenance_query(
+                search_terms, cap, what, summarize=summarize, totals=totals)
+            capped = str(totals.get("total") or "").endswith("+")
+            if not capped or cap >= ceiling:
+                break
+            cap = min(cap * _PROV_ESCALATION, ceiling)
+        events.sort(key=_event_order)
+        return (events[-max_results:] if max_results else events), capped
 
     def recent_events(self, component_id: str, max_results: int = 25) -> List[dict]:
         """Recent provenance events for a component, newest first.
@@ -382,10 +581,11 @@ class InspectMixin:
         meant to replace — scoped to one component via a provenance query
         (create → poll → delete).
         """
-        events = self._provenance_query(
+        events, _capped = self._provenance_newest(
             {"ProcessorID": {"value": component_id, "inverse": False}},
             max_results, component_id,
         )
+        events.reverse()   # newest first, as the caller (and NiFi's UI) show it
         return [
             {
                 "event_id": e["eventId"],
@@ -416,12 +616,11 @@ class InspectMixin:
             ),
         }
 
-    def trace_flowfile(self, uuid: str, max_events: int = 100) -> dict:
+    def trace_flowfile(self, uuid: str, max_events: int = 1000) -> dict:
         """One FlowFile's provenance journey as ordered hops with attribute diffs.
 
         Events come from a ``FlowFileUUID`` provenance query, oldest first
-        (event ids are monotonic, event *times* are lossy strings). The trace
-        is uuid-scoped: a fork/clone child has its own uuid, so each hop
+        (event ids are monotonic, event *times* are lossy strings). Each hop
         carries ``parents``/``children`` for callers to jump traces along a
         branch instead of silently merging them.
 
@@ -430,20 +629,50 @@ class InspectMixin:
         ``previousValue`` for those, and sends ``previousValue == value`` for
         untouched ones), the ``relationship`` taken, and whether each payload
         side is still fetchable via :meth:`event_content`.
+
+        **The query is a lineage query, not a uuid filter.** Verified live on
+        1.24.0: asking for a split child's uuid also returns the *parent's*
+        FORK event and the *merged* file's JOIN event, because they are on the
+        same lineage. Every hop therefore carries ``flowfile_uuid`` (the
+        FlowFile the event is really about) and ``own`` (``False`` when it
+        belongs to a relative). Callers must not treat a relative's event as
+        this file's own hop — it is how a merge is discovered, not something
+        that happened to this FlowFile.
+
+        Returns ``{"uuid", "hops", "truncated"}``. ``truncated`` is True when
+        the journey is longer than ``max_events`` — the hops are then the
+        **newest** ``max_events`` (see :meth:`_provenance_newest`; NiFi's own
+        cap does not mean that, which is why the query is widened first).
+        ``max_events`` defaults high because a whole journey is the point of a
+        trace: 800 events came back in one round trip in 0.6s on 1.24.0.
         """
-        return {"uuid": uuid,
-                "hops": self.flowfile_events_since(uuid, -1, max_events)}
+        totals: dict = {}
+        hops = self.flowfile_events_since(uuid, -1, max_events, totals=totals)
+        return {"uuid": uuid, "hops": hops,
+                "truncated": bool(totals.get("capped")) or len(hops) >= max_events > 0}
 
     @staticmethod
-    def _hop_from_event(ev: dict) -> dict:
-        """A provenance-event DTO as the flat "hop" dict trace/follow render."""
+    def _hop_from_event(ev: dict, of_uuid: str = "") -> dict:
+        """A provenance-event DTO as the flat "hop" dict trace/follow render.
+
+        ``of_uuid`` is the FlowFile the caller asked about; it decides ``own``.
+        A ``FlowFileUUID`` query is a *lineage* query, so a fork parent's FORK
+        event and a merge child's JOIN event come back too, describing a
+        different FlowFile entirely.
+        """
         attrs = ev.get("attributes") or []
+        ff_uuid = ev.get("flowFileUuid", "") or ""
         return {
+            "flowfile_uuid": ff_uuid,
+            "own": (not of_uuid) or (not ff_uuid) or ff_uuid == of_uuid,
             "event_id": ev.get("eventId"),
             "event_type": ev.get("eventType", ""),
             "time": ev.get("eventTime", ""),
             "component": ev.get("componentName", ""),
             "component_id": ev.get("componentId", ""),
+            # NiFi omits groupId once a component leaves the flow; the deep
+            # link degrades to "select this id" rather than breaking.
+            "group_id": ev.get("groupId", ""),
             "component_type": ev.get("componentType", ""),
             "relationship": ev.get("relationship") or "",
             "size": ev.get("fileSizeBytes", 0) or 0,
@@ -461,11 +690,11 @@ class InspectMixin:
         }
 
     def flowfile_events_since(
-        self, uuid: str, after_event_id: int = -1, max_events: int = 100
+        self, uuid: str, after_event_id: int = -1, max_events: int = 100,
+        totals: Optional[dict] = None,
     ) -> List[dict]:
-        """Hops for ``uuid`` whose event id is above ``after_event_id``,
-        oldest first (event ids are monotonic; event *times* are lossy
-        strings).
+        """Hops for ``uuid``'s lineage above ``after_event_id``, oldest first
+        (event ids are monotonic; event *times* are lossy strings).
 
         With the default ``-1`` this is the FlowFile's whole recorded journey
         (what :meth:`trace_flowfile` wraps). The live stepper calls it with
@@ -473,20 +702,27 @@ class InspectMixin:
         ask what just happened — provenance indexing is effectively instant
         (<0.2s live on 1.24 and 2.7.2), so new events show up on the first or
         second poll.
+
+        The query asks for un-summarized events, so one round trip returns
+        everything a hop needs. Servers that answer a non-summarized query
+        without attributes still work: those events fall back to a per-event
+        detail fetch.
         """
-        events = self._provenance_query(
-            {"FlowFileUUID": {"value": uuid, "inverse": False}}, max_events, uuid
+        events, capped = self._provenance_newest(
+            {"FlowFileUUID": {"value": uuid, "inverse": False}}, max_events, uuid,
+            summarize=False,
         )
-        events.sort(key=lambda e: int(e["eventId"]))
-        return [
-            self._hop_from_event(
-                self._get_json(
-                    f"/provenance-events/{summary['eventId']}"
-                )["provenanceEvent"]
-            )
-            for summary in events[:max_events]
-            if int(summary["eventId"]) > after_event_id
-        ]
+        if totals is not None:
+            totals["capped"] = capped
+        hops = []
+        for event in events[:max_events]:
+            if int(event["eventId"]) <= after_event_id:
+                continue
+            if "attributes" not in event:  # summarized-only server: ask for detail
+                event = self._get_json(
+                    f"/provenance-events/{event['eventId']}")["provenanceEvent"]
+            hops.append(self._hop_from_event(event, of_uuid=uuid))
+        return hops
 
     def event_content(self, event_id, direction: str = "output") -> str:
         """One side of a provenance event's payload; ``input`` or ``output``.

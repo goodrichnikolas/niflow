@@ -75,6 +75,16 @@ class FakeNiFi:
             self.deleted.append("lr-1")
             return FakeResponse(200, {})
 
+        # --- drop-request lifecycle (per-queue purge) ---
+        if (method, path) == ("POST", "/flowfile-queues/c1/drop-requests"):
+            return FakeResponse(200, {"dropRequest": {"id": "dr-1", "finished": False}})
+        if (method, path) == ("GET", "/flowfile-queues/c1/drop-requests/dr-1"):
+            return FakeResponse(200, {"dropRequest": {"id": "dr-1", "finished": True,
+                                                      "dropped": "2 / 1.5 KB"}})
+        if (method, path) == ("DELETE", "/flowfile-queues/c1/drop-requests/dr-1"):
+            self.deleted.append("dr-1")
+            return FakeResponse(200, {})
+
         # --- flowfile detail + content ---
         if (method, path) == ("GET", "/flowfile-queues/c1/flowfiles/ff-1"):
             return FakeResponse(200, {"flowFile": {"uuid": "ff-1", "filename": "a.json",
@@ -122,6 +132,7 @@ class FakeNiFi:
                 "eventId": 10, "eventType": "ATTRIBUTES_MODIFIED",
                 "eventTime": "12:00:01", "componentName": "Update",
                 "componentId": "u1", "componentType": "UpdateAttribute",
+                "groupId": "root-id",
                 "fileSizeBytes": 9, "inputContentAvailable": True,
                 "outputContentAvailable": True, "contentEqual": True,
                 "attributes": [
@@ -166,7 +177,18 @@ def test_list_queues_walks_the_tree(client):
     assert queues == [{
         "id": "c1", "source": "Gen1", "destination": "Sink",
         "path": "", "queued": 2, "queued_label": "2 / 1.5 KB",
+        # ids for the GUIs' NiFi deep links; endpoints fall back to the
+        # connection's own group when the DTO doesn't say where they live
+        "group_id": "root-id",
+        "source_id": "g1", "source_group_id": "root-id",
+        "destination_id": "p1", "destination_group_id": "root-id",
     }]
+
+
+def test_drain_connection_reports_what_it_dropped(client):
+    # The GUI purge buttons tell the user how much they just destroyed.
+    assert client.drain_connection("c1") == "2 / 1.5 KB"
+    assert "dr-1" in client.session.deleted  # request cleaned up either way
 
 
 def test_list_sinks_are_processors_that_feed_nothing(client):
@@ -178,7 +200,8 @@ def test_list_sinks_are_processors_that_feed_nothing(client):
 def test_list_flowfiles_polls_and_cleans_up(client):
     files = client.list_flowfiles("c1")
     assert [f["uuid"] for f in files] == ["ff-1", "ff-2"]
-    assert files[0] == {"uuid": "ff-1", "filename": "a.json", "size": 9, "position": 0}
+    assert files[0] == {"uuid": "ff-1", "filename": "a.json", "size": 9,
+                        "position": 0, "penalized": False, "penalty_expires_in": 0}
     assert "lr-1" in client.session.deleted
 
 
@@ -222,6 +245,9 @@ def test_trace_orders_hops_and_diffs_attributes(client):
         {"name": "fresh", "before": None, "after": "x"},
     ]
     assert hops[0]["attributes"] == {"a": "2", "filename": "a.json", "fresh": "x"}
+    # the group the component lives in — the GUIs deep-link the hop with it
+    assert hops[0]["group_id"] == "root-id"
+    assert hops[1]["group_id"] == ""  # NiFi omits it for components gone from the flow
     assert hops[1]["relationship"] == "unmatched"
     assert hops[1]["children"] == ["ff-9"]
     assert not hops[1]["output_available"]

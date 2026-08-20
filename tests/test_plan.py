@@ -311,3 +311,83 @@ def test_auto_terminate_order_is_ignored():
     live.processors[1].auto_terminate = ["success", "failure"]
     desired.processors[1].auto_terminate = ["failure", "success"]
     assert diff_flows(live, desired) == []
+
+
+# --- things that must never drift forever (fuzz "cries wolf" cluster) --------
+#
+# `niflow drift` is meant for cron/CI: a plan against a freshly-pushed,
+# unmodified flow must be empty, or a real divergence hides in the noise.
+
+
+def _service_flow(**service_kwargs) -> Flow:
+    flow = Flow("Svc")
+    flow.add_controller_service(
+        ControllerService(name="Reader", type="org.apache.nifi.json.JsonTreeReader",
+                          **service_kwargs)
+    )
+    return flow
+
+
+def test_unstated_service_enabled_is_not_drift():
+    # NiFi imports every service DISABLED whatever the snapshot asked for, so
+    # the model's `enabled=True` default must not plan a change forever.
+    live = _service_flow(enabled=False)  # what a pulled flow looks like
+    assert diff_flows(live, _service_flow()) == []
+
+
+def test_explicitly_enabled_service_still_plans_when_live_is_disabled():
+    live = _service_flow(enabled=False)
+    changes = diff_flows(live, _service_flow(enabled=True))
+    assert [c.fields["enabled"] for c in changes] == [(False, True)]
+
+
+def test_deliberately_disabled_service_stays_pushable():
+    live = _service_flow(enabled=True)
+    changes = diff_flows(live, _service_flow(enabled=False))
+    assert [c.fields["enabled"] for c in changes] == [(True, False)]
+
+
+def test_service_enabled_assigned_after_construction_counts_as_stated():
+    live = _service_flow(enabled=True)
+    desired = _service_flow()
+    desired.controller_services[0].enabled = False
+    assert [c.fields["enabled"] for c in diff_flows(live, desired)] == [(True, False)]
+
+
+def _one_processor(type_str: str, **kwargs) -> Flow:
+    flow = Flow("P")
+    flow.add_processor(Processor(name="A", type=type_str, **kwargs))
+    return flow
+
+
+PRIMARY_ONLY = "org.apache.nifi.processors.standard.ListFTP"
+NORMAL = "org.apache.nifi.processors.attributes.UpdateAttribute"
+
+
+def test_primary_node_only_type_does_not_drift_to_all():
+    # NiFi forces executionNode=PRIMARY on @PrimaryNodeOnly types and refuses
+    # ALL, so the model default cannot be drift.
+    live = _one_processor(PRIMARY_ONLY, execution_node="PRIMARY")
+    assert diff_flows(live, _one_processor(PRIMARY_ONLY)) == []
+    # ...even when the flow file says ALL: that value is unreachable.
+    assert diff_flows(live, _one_processor(PRIMARY_ONLY, execution_node="ALL")) == []
+
+
+def test_execution_node_still_diffs_for_ordinary_types():
+    live = _one_processor(NORMAL, execution_node="PRIMARY")
+    changes = diff_flows(live, _one_processor(NORMAL))
+    assert [c.fields["execution_node"] for c in changes] == [("PRIMARY", "ALL")]
+
+
+def test_int_and_bool_property_values_match_their_server_strings():
+    live = _one_processor(NORMAL, properties={"n": "10", "b": "true", "f": "1.5"})
+    desired = _one_processor(NORMAL)
+    # Assigned post-construction, so the model normaliser never saw them.
+    desired.processors[0].properties = {"n": 10, "b": True, "f": 1.5}
+    assert diff_flows(live, desired) == []
+
+
+def test_a_genuinely_different_number_still_drifts():
+    live = _one_processor(NORMAL, properties={"n": "10"})
+    desired = _one_processor(NORMAL, properties={"n": 11})
+    assert [c.fields["properties[n]"] for c in diff_flows(live, desired)] == [("10", "11")]

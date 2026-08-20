@@ -38,6 +38,7 @@ from niflow.core import (
     Port,
     Processor,
     ProcessGroup,
+    nifi_property_value,
 )
 from niflow.layout import compute_layout
 from niflow.processors.bundles import default_bundle
@@ -839,13 +840,20 @@ def _emit_processor(
 
 
 def _emit_properties(props: dict, identifiers: Dict[int, str]) -> dict:
-    """Render properties: ControllerService instances become their identifier."""
+    """Render properties: services become their identifier, values become strings.
+
+    NiFi's property map is a ``Map<String,String>``; models normalise their
+    own values at construction (:func:`niflow.core.nifi_property_values`), but
+    a dict edited in place afterwards would still emit a JSON number or
+    boolean here — which NiFi stores stringified, so the flow would drift
+    against its own snapshot on the very next plan.
+    """
     out: Dict[str, Any] = {}
     for key, value in props.items():
         if isinstance(value, ControllerService):
             out[key] = identifiers[id(value)]
         else:
-            out[key] = value
+            out[key] = nifi_property_value(value)
     return out
 
 

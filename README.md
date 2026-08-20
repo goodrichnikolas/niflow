@@ -16,12 +16,14 @@ niflow push flows/prod_flow.py --update      # apply just that delta in place
 niflow diff flows/prod_flow.py               # raw JSON diff vs the live canvas
 niflow test flows/prod_flow.py               # inject FlowFiles, assert what comes out
 niflow trace <flowfile-uuid>                 # replay one file's journey, attr diffs per hop
+niflow follow "Prod Flow (copy)"             # step ONE file hop by hop, like a debugger
 niflow push flows/prod_flow.py --start       # or: full replace and start
 
 niflow pull --all -o flows/                  # mirror EVERY top-level group
 niflow drift                                 # exit 1 if code and canvas diverged
 niflow push --all flows/ --update            # reconcile the whole directory
 
+niflow validate flows/prod_flow.py           # static checks + the 1.24 compat baseline
 niflow validate flows/prod_flow.py --live    # NiFi's own validation, via a sandbox
 niflow push flows/prod_flow.py --env prod    # per-environment parameter values
 niflow diagram flows/prod_flow.py -o doc.md  # Mermaid flowchart for PR review
@@ -117,6 +119,27 @@ instance. `niflow plan --all flows/` and `niflow push --all flows/ --update`
 iterate the directory; `niflow drift` prints one `ok`/`DRIFT` line per flow
 and exits non-zero on any divergence, made for cron or CI.
 
+## Hunt bugs in bulk (`niflow fuzz`)
+
+Real flows find niflow's bugs one painful workday at a time. `niflow fuzz`
+finds them in batch: it generates thousands of tiny flows — one processor, one
+`A -> B` hop, property and shape variations across the whole harvested catalog
+— and runs each through niflow's own pipeline, classifying every failure as
+*niflow's bug*, *NiFi's rejection*, or *passed*.
+
+```bash
+make fuzz                       # tier 1: 3.4k cases, ~7s, no NiFi needed
+make fuzz TIER=2 COUNT=200      # + NiFi's own validation, in a sandbox
+make fuzz TIER=3 COUNT=100      # + live push -> pull -> plan convergence
+niflow fuzz --replay <case-id>  # re-run one case with the full traceback
+```
+
+Runs are seeded and case ids are content-derived, so a finding replays exactly;
+results stream to `.niflow-fuzz/results.jsonl` (`--resume` continues an
+interrupted sweep), every finding writes a standalone runnable repro flow under
+`.niflow-fuzz/repro/<case-id>/`, and the report groups findings by root-cause
+signature so 172 failures read as one bug.
+
 ## What's supported
 
 - **Processors** — curated factories (`GetFile`, `PutFile`, `InvokeHTTP`, …), the
@@ -189,6 +212,18 @@ command — CLI, both GUIs, library — connects the same way:
 | `NIFLOW_NIFI_CLIENT_CERT` / `NIFLOW_NIFI_CLIENT_KEY` | PEM client certificate -> mTLS (token login skipped) |
 | `NIFLOW_NIFI_CA_BUNDLE` | CA/server PEM to trust (beats `VERIFY_SSL`) |
 | `NIFLOW_NIFI_VERIFY_SSL` | `false` for self-signed dev certs |
+| `NIFLOW_MIN_NIFI_VERSION` | compatibility baseline — oldest NiFi line your flows must still run on (default `1.24`; `none` disables) |
+
+The **compatibility baseline** is the one setting that is not about connecting.
+You author against 2.x, but if 1.24 is what production runs then a flow that
+cannot survive 1.24 is broken — so `niflow validate` checks every flow against
+the baseline with no flag and **exits non-zero** when a property cannot land
+there (on the server that failure is silent: NiFi files an unknown key away as
+an inert *dynamic* property and runs the real one at its default). `push` is
+never blocked by it — pushing 2.x-only properties to a 2.x server is
+legitimate — it warns instead, and `niflow doctor` states the baseline and
+names any flow under `flows/` that violates it. See
+[docs/version-compat.md](docs/version-compat.md).
 
 **`niflow doctor`** diagnoses an unknown server step by step — reachability,
 TLS trust, which auth mode the server wants, whether your credentials work —
@@ -245,7 +280,10 @@ make test-integration-v1             # integration tests against 1.24
   `http://127.0.0.1:7777`, zero extra dependencies: processor list with
   run-once/start/stop, queue browser with FlowFile attribute+content
   inspection, a Trace tab that replays one FlowFile's provenance journey hop
-  by hop (attribute before/after, relationship taken, payload on demand),
+  by hop (attribute before/after, relationship taken, payload on demand), a
+  Follow tab that steps a live FlowFile through a quiesced group one hop at a
+  time (changed/added/removed attributes flash; fork branches you don't care
+  about can be muted — they keep running in NiFi, they're just not followed),
   bulletins/error panels, and plan-preview + incremental push for
   `flows/*.py`. Under WSL it opens the *Windows* default browser.
 - **`niflow-gui`** (`make gui`) — the PyQt6 desktop helper (`pip install -e
@@ -305,6 +343,7 @@ niflow/
   testing.py       # flow-test harness: sandbox + inject + assert (niflow test)
   backup.py        # pre-push snapshots + rollback
   validate.py      # static rulebook validation (harvested from a live NiFi)
+  fuzz/            # bug-hunting harness (niflow fuzz): cases / checks / runner
   mermaid.py       # Mermaid flowchart rendering (niflow diagram)
   doctor.py        # connection/auth/catalog diagnostician (niflow doctor)
   layout.py        # auto-placement along the connection graph

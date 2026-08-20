@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import json
 from pathlib import Path
 
 from niflow import Flow
@@ -224,3 +225,45 @@ def test_unrepresentable_components_produce_pull_warnings():
 def test_clean_snapshot_has_no_pull_warnings():
     flow = Flow.from_json(FIXTURE)
     assert flow.pull_warnings == []
+
+
+# --- emitter guards ---------------------------------------------------------
+
+
+def test_empty_process_group_emits_an_importable_module():
+    """A placeholder group must not produce `with ...:` with no body."""
+    flow = Flow("F")
+    flow.process_group("Empty")
+    src = flow.to_python()
+    ast.parse(src)  # was: IndentationError: expected an indented block
+    ns: dict = {}
+    exec(compile(src, "<test>", "exec"), ns)
+    reparsed = ns["flow"]
+    assert [g.name for g in reparsed.process_groups] == ["Empty"]
+    # ...and the round trip is stable, not just parseable.
+    assert reparsed.to_python() == src
+
+
+def test_group_holding_only_an_empty_child_emits_both_bodies():
+    flow = Flow("F")
+    outer = flow.process_group("Outer")
+    outer.process_group("Inner")
+    src = flow.to_python()
+    ast.parse(src)
+    ns: dict = {}
+    exec(compile(src, "<test>", "exec"), ns)
+    assert ns["flow"].process_groups[0].process_groups[0].name == "Inner"
+
+
+def test_emitted_property_values_are_strings():
+    from niflow.core import Processor
+
+    flow = Flow("F")
+    proc = Processor(name="A", type="org.apache.nifi.processors.attributes.UpdateAttribute")
+    flow.add_processor(proc)
+    # Edited in place after construction, so the model normaliser never saw it:
+    # NiFi would still store "7"/"true" and the flow would drift against its
+    # own snapshot on the next plan.
+    proc.properties = {"n": 7, "b": True, "u": None}
+    emitted = json.loads(flow.to_json())["flowContents"]["processors"][0]["properties"]
+    assert emitted == {"n": "7", "b": "true", "u": None}

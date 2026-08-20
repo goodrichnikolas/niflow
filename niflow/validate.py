@@ -11,10 +11,14 @@ When the processor type's rulebook has been harvested into the catalog
 (``make catalog``, see :mod:`niflow.processors.rules`), this checks:
 
 * **relationships**, precisely — catching ``failure`` left dangling even while
-  ``success`` is wired, and relationships you didn't know existed. Types whose
-  dynamic properties create relationships (RouteOnAttribute and friends, see
-  ``rules.DYNAMIC_RELATIONSHIP_TYPES``) have those counted as real
-  relationships — valid to connect, and flagged when left unhandled; and
+  ``success`` is wired, and relationships you didn't know existed. The set is
+  the one the *target* NiFi line has (an explicit ``target_version``, else the
+  declared baseline), and it accounts for relationships a property switches on:
+  ``UpdateAttribute`` with ``Store State`` = "Store state locally" grows a
+  ``set state fail`` relationship, and NiFi will not start the processor until
+  it is handled. Types whose dynamic properties create relationships
+  (RouteOnAttribute and friends) have those counted as real relationships —
+  valid to connect, and flagged when left unhandled; and
 * **properties** — required properties left unset (honouring defaults and
   ``dependencies``), and values outside a property's allowable set.
 
@@ -149,8 +153,44 @@ def _property_issues(proc, label: str) -> List[dict]:
     return out
 
 
-def validate_flow(flow: Flow) -> List[dict]:
-    """Return a list of ``{"component", "message"}`` issues, empty if clean."""
+def validate_flow(
+    flow: Flow, target_version: object = None, *, baseline: bool = True
+) -> List[dict]:
+    """Return a list of ``{"component", "message"}`` issues, empty if clean.
+
+    Two cross-version modes, and they are mutually exclusive:
+
+    ``target_version`` ("1.24", "1", 1, ...) is the *ad-hoc* check: judge this
+    flow against that NiFi line, using the generated cross-version map
+    (:mod:`niflow.compat`) — properties and types that do not exist there,
+    values outside that line's allowable set, properties it makes mandatory.
+
+    With no ``target_version``, the flow is checked against the declared
+    **compatibility baseline** instead (``NIFLOW_MIN_NIFI_VERSION`` in
+    ``.niflow.env``, default 1.24). That is on by default on purpose: the
+    oldest line the estate runs is a standing requirement, not something to
+    remember to pass a flag for, and a property that cannot land there fails
+    silently on the server. Pass ``baseline=False`` (or set the baseline to
+    ``none``) when only the newest line matters.
+
+    Either way this is the check that catches, on your laptop, the property
+    that would have silently become an inert dynamic property at work.
+    """
+    from niflow.compat import baseline_major, parse_major
+
+    # Which NiFi line will actually run this flow. Relationships are judged
+    # against *that* line's harvested set, not the catalog's: a 1.24 server has
+    # relationships 2.x does not (``UpdateAttribute``'s ``set state fail``) and
+    # it is the server that refuses to start the processor. With no explicit
+    # target the declared baseline (default 1.24) answers, for the same reason
+    # the cross-version property check uses it.
+    if target_version is not None:
+        target_major = parse_major(str(target_version))
+    elif baseline:
+        target_major = baseline_major()
+    else:
+        target_major = None
+
     issues: List[dict] = [
         # Name-based identity means same-kind duplicates in one group would
         # silently merge or clobber each other on push — always an error.
@@ -194,14 +234,20 @@ def validate_flow(flow: Flow) -> List[dict]:
                                f"auto-terminated (NiFi rejects this)",
                 })
 
-            known = relationships_for(proc.type)
+            props = proc.properties or {}
+            known = relationships_for(proc.type, props, target_major)
             if known is not None:
-                # Precise: we know the full relationship set for this type.
+                # Precise: we know the full relationship set for this type, on
+                # the target line and for the property values actually set.
                 # Dynamic-relationship types (RouteOnAttribute, ...) extend it
                 # with one relationship per dynamic property; those must be
                 # handled just like the static ones.
-                dynamic = dynamic_relationships_for(proc.type, proc.properties or {})
-                known_set = set(known) | set(dynamic or ())
+                dynamic = dynamic_relationships_for(proc.type, props, target_major)
+                # "Must be handled" is the target line's set; "exists at all" is
+                # the union of both lines, so validating against 1.24 never
+                # calls a relationship that 2.x really has non-existent.
+                known_set = set(known) | set(dynamic or ()) | set(
+                    relationships_for(proc.type, props) or ())
                 handled = connected | auto
                 for rel in list(known) + sorted(set(dynamic or ()) - set(known)):
                     if rel not in handled:
@@ -214,7 +260,8 @@ def validate_flow(flow: Flow) -> List[dict]:
                 # be confirmed active (strategy switched or set via EL) has an
                 # unknowable relationship set — skip existence checks rather
                 # than risk false positives.
-                if dynamic is not None or not supports_dynamic_relationships(proc.type):
+                if dynamic is not None or not supports_dynamic_relationships(
+                        proc.type, target_major):
                     for rel in sorted(auto - known_set):
                         issues.append({
                             "component": label,
@@ -242,4 +289,15 @@ def validate_flow(flow: Flow) -> List[dict]:
             visit(child, path)
 
     visit(flow, "")
+
+    if target_version is not None:
+        from niflow.compat import flow_issues, parse_major
+
+        target_major = parse_major(str(target_version))
+        if target_major is not None:
+            issues.extend(flow_issues(flow, target_major))
+    elif baseline:
+        from niflow.compat import baseline_issues
+
+        issues.extend(baseline_issues(flow))
     return issues

@@ -128,3 +128,47 @@ def test_cert_auth_skips_token_login(tmp_path):
     assert all(
         "Authorization" not in kw.get("headers", {}) for *_ignore, kw in session.calls
     )
+
+
+# --- TLS trust pinning (T5) -------------------------------------------------
+# requests merges *environment* settings into every call: with trust_env on
+# (the default), REQUESTS_CA_BUNDLE / CURL_CA_BUNDLE replace session.verify
+# unless the call passes verify= itself. That is why session.verify alone was
+# not being honoured on the work machine.
+def test_every_request_pins_the_configured_verify(tmp_path):
+    ca = _write(tmp_path, "ca.pem", "dummy")
+    session = _RecordingSession()
+    client = NiFiClient(NiFiConfig(ca_bundle=ca, password="pw"), session=session)
+    client.version()
+    assert session.calls, "no requests were made"
+    assert all(kw.get("verify") == ca for _m, _url, kw in session.calls)
+    # including the token login, which bypasses _request
+    assert any("/access/token" in url for _m, url, _kw in session.calls)
+
+
+def test_verify_false_is_pinned_too(tmp_path):
+    """NIFLOW_NIFI_VERIFY_SSL=false must survive; an env CA bundle would flip it on."""
+    session = _RecordingSession()
+    client = NiFiClient(NiFiConfig(verify_ssl=False, password=""), session=session)
+    client.version()
+    assert all(kw.get("verify") is False for _m, _url, kw in session.calls)
+
+
+def test_injected_session_keeps_its_own_trust_material():
+    session = _RecordingSession()
+    session.verify = "/caller/own-ca.pem"
+    client = NiFiClient(NiFiConfig(ca_bundle=None, password=""), session=session)
+    client.version()
+    assert all(kw.get("verify") == "/caller/own-ca.pem" for _m, _url, kw in session.calls)
+
+
+def test_environment_ca_bundle_cannot_override_our_verify(tmp_path, monkeypatch):
+    """Regression for the work quirk, checked against real requests merging."""
+    ca = _write(tmp_path, "ca.pem", "dummy")
+    monkeypatch.setenv("REQUESTS_CA_BUNDLE", "/etc/corp/corp-ca.pem")
+    client = NiFiClient(NiFiConfig(ca_bundle=ca, password=""))
+    merge = client.session.merge_environment_settings
+    # What requests would have used with no explicit verify= (the old behaviour):
+    assert merge("https://nifi/", {}, None, None, None)["verify"] == "/etc/corp/corp-ca.pem"
+    # What it uses now that every call pins client._verify:
+    assert merge("https://nifi/", {}, None, client._verify, None)["verify"] == ca

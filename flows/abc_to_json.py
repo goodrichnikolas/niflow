@@ -92,7 +92,14 @@ abcjson = Processor(
         'Destination': 'flowfile-content',
         'Null Value': 'false',
         'Attributes List': 'a,b,c',
-        'Pretty Print': 'false',
+        # NOT 'Pretty Print': AttributesToJSON only grew that property on NiFi
+        # 2.x, and on the 1.24 baseline the key lands as an inert dynamic
+        # property instead of erroring. It was set to 'false' here, which is
+        # also 2.x's default, so dropping it changes nothing and lets this flow
+        # pass `niflow validate` on the baseline. (Not a rename: 1.24's
+        # AttributesToJSON has no pretty-print property under any name.
+        # JsonRecordSetWriter's similar-sounding 'Pretty Print JSON' is a
+        # different component and exists on both lines.)
         'Include Core Attributes': 'true',
         'JSON Handling Strategy': 'ESCAPED',
     },

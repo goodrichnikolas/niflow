@@ -266,3 +266,23 @@ def test_emitter_1x_target_omits_unsupported_keys(caplog):
 def test_emitter_1x_target_dynamic_keys_pass_through():
     proc = _emitted_processor({"my.dynamic": "v"}, target_major=1)
     assert proc["properties"]["my.dynamic"] == "v"
+
+
+def test_curated_rename_normalises_a_pulled_1x_key():
+    """A flow pulled from 1.24 keys curated renames by their old names.
+
+    `canonical_properties` folds every known rename in reverse, so the pulled
+    key normalises to the catalog's 2.x name and does not show as phantom
+    drift against the same flow written by hand. Covers a controller service
+    as well as a processor — the services rulebook was the blind spot.
+    """
+    from niflow.processors.rules import canonical_properties
+
+    assert canonical_properties(
+        "org.apache.nifi.processors.standard.ExecuteSQL",
+        {"SQL select query": "select 1"},
+    ) == {"SQL Query": "select 1"}
+    assert canonical_properties(
+        "org.apache.nifi.dbcp.DBCPConnectionPool",
+        {"dbcp-max-conn-lifetime": "-1"},
+    ) == {"Maximum Connection Lifetime": "-1"}

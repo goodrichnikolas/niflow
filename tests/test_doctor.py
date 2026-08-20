@@ -23,14 +23,16 @@ class FakeResponse:
 class FakeSession:
     """Route by path; raise per-path exceptions when configured."""
 
-    def __init__(self, routes=None, raises=None, supports_login=True):
+    def __init__(self, routes=None, raises=None, supports_login=True, verify=False):
         self.routes = routes or {}
         self.raises = raises or {}
         self.supports_login = supports_login
-        self.verify = False
+        self.verify = verify
         self.cert = None
+        self.calls = []  # (method, url, kwargs)
 
     def request(self, method, url, **kw):
+        self.calls.append((method, url, kw))
         path = url.split("/nifi-api", 1)[-1]
         for fragment, exc in self.raises.items():
             if fragment in path:
@@ -141,3 +143,49 @@ def test_catalog_check_matches_and_mismatches():
     assert ok.status == OK and "matches" in ok.detail
     warn = _catalog_check("0.0.0-other")
     assert warn.status == WARN and "make catalog" in warn.detail
+
+
+# --- TLS trust material (T5) ------------------------------------------------
+def test_trust_material_names_the_ca_bundle(tmp_path):
+    ca = tmp_path / "ca.pem"
+    ca.write_text("dummy")
+    session = FakeSession(verify=str(ca))
+    checks = run_checks(NiFiConfig(password="pw", ca_bundle=str(ca)), session=session)
+    by = _by_title(checks)
+    assert by["trust material"].status == OK
+    assert str(ca) in by["trust material"].detail
+
+
+def test_trust_material_warns_when_verification_is_off():
+    checks = run_checks(NiFiConfig(password="pw"), session=FakeSession())
+    by = _by_title(checks)
+    assert by["trust material"].status == WARN
+    assert "NIFLOW_NIFI_CA_BUNDLE" in by["trust material"].detail
+
+
+def test_environment_ca_bundle_is_reported(monkeypatch):
+    """The diagnostic that explains the work machine: requests reads these."""
+    monkeypatch.setenv("REQUESTS_CA_BUNDLE", "/etc/corp/corp-ca.pem")
+    checks = run_checks(NiFiConfig(password="pw"), session=FakeSession())
+    by = _by_title(checks)
+    assert by["trust environment"].status == WARN
+    assert "REQUESTS_CA_BUNDLE=/etc/corp/corp-ca.pem" in by["trust environment"].detail
+    # ...and it tells you what to do about it when niflow has no bundle of its own.
+    assert "NIFLOW_NIFI_CA_BUNDLE" in by["trust environment"].detail
+
+
+def test_no_environment_check_when_nothing_is_set(monkeypatch):
+    for name in ("REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "SSL_CERT_FILE"):
+        monkeypatch.delenv(name, raising=False)
+    checks = run_checks(NiFiConfig(password="pw"), session=FakeSession())
+    assert "trust environment" not in _by_title(checks)
+
+
+def test_reachability_probe_pins_verify(tmp_path):
+    """The /access/config probe goes through the client, with our trust material."""
+    ca = tmp_path / "ca.pem"
+    ca.write_text("dummy")
+    session = FakeSession(verify=str(ca))
+    run_checks(NiFiConfig(password="pw", ca_bundle=str(ca)), session=session)
+    probes = [kw for _m, url, kw in session.calls if "/access/config" in url]
+    assert probes and all(kw["verify"] == str(ca) for kw in probes)

@@ -15,14 +15,16 @@ class TransportMixin:
     def __init__(self, config: Optional[NiFiConfig] = None, session: Any = None):
         self.config = config or NiFiConfig.from_env()
         self.base = self.config.host.rstrip("/")
+        # ONE stored trust decision, pinned onto every request (see _request).
+        # A CA bundle path beats the verify boolean (work servers have real
+        # certs signed by an internal CA; export it and point
+        # NIFLOW_NIFI_CA_BUNDLE at the PEM).
+        self._verify: Any = self.config.ca_bundle or self.config.verify_ssl
         if session is None:
             import requests
 
             session = requests.Session()
-            # A CA bundle path beats the verify boolean (work servers have
-            # real certs signed by an internal CA; export it and point
-            # NIFLOW_NIFI_CA_BUNDLE at the PEM).
-            session.verify = self.config.ca_bundle or self.config.verify_ssl
+            session.verify = self._verify
             if self.config.client_cert:
                 session.cert = (
                     (self.config.client_cert, self.config.client_key)
@@ -33,6 +35,11 @@ class TransportMixin:
                 import urllib3
 
                 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        elif hasattr(session, "verify"):
+            # A caller-supplied session (tests, the GUI's per-thread pool)
+            # brings its own trust material — adopt it instead of overriding,
+            # so what we pin per request matches what the session was given.
+            self._verify = session.verify
         self.session = session
         self._token: Optional[str] = None
         self._root_id: Optional[str] = None
@@ -56,6 +63,7 @@ class TransportMixin:
             f"{self.base}/access/token",
             data={"username": self.config.username, "password": self.config.password},
             timeout=30,
+            verify=self._verify,
         )
         token = resp.text.strip()
         # NiFi can return an HTML error page (e.g. host-header rejection) with
@@ -75,6 +83,16 @@ class TransportMixin:
         if self._token:
             headers["Authorization"] = f"Bearer {self._token}"
         kwargs.setdefault("timeout", 60)
+        # Pin the trust material on every call. requests merges *environment*
+        # settings into each request, and with trust_env on (the default)
+        # REQUESTS_CA_BUNDLE / CURL_CA_BUNDLE replace session.verify whenever
+        # the call itself doesn't pass verify= — so a corporate image that
+        # exports one silently beats NIFLOW_NIFI_CA_BUNDLE, and even flips
+        # NIFLOW_NIFI_VERIFY_SSL=false back on. Passing verify= explicitly is
+        # what makes the session-level setting stick. (`niflow doctor` reports
+        # when such a variable is set.) Proxy env vars are left alone —
+        # corporate proxies are usually how you reach the server at all.
+        kwargs.setdefault("verify", self._verify)
         resp = self.session.request(method, f"{self.base}{path}", headers=headers, **kwargs)
         if resp.status_code == 401 and self._token is not None:
             # Token expired mid-session — refresh once and retry.
@@ -84,6 +102,17 @@ class TransportMixin:
         if resp.status_code >= 400:
             raise NiFiApiError(resp.status_code, f"{method} {path}: {resp.text}")
         return resp
+
+    def probe(self, path: str, method: str = "GET", **kwargs: Any) -> Any:
+        """Raw request with our trust material — no login, no error raising.
+
+        `niflow doctor` needs to see the bare response (or the TLS exception)
+        *before* authentication enters the picture, but it must still use the
+        same CA bundle / client cert / verify setting the real calls use.
+        """
+        kwargs.setdefault("timeout", 30)
+        kwargs.setdefault("verify", self._verify)
+        return self.session.request(method, f"{self.base}{path}", **kwargs)
 
     def _get_json(self, path: str) -> dict:
         return self._request("GET", path).json()

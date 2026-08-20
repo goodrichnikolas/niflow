@@ -126,10 +126,12 @@ def test_in_place_push_preserves_version_control(versioned):
     )["processGroupFlow"]["flow"]
     convert = next(p["component"] for p in live["processors"]
                    if p["component"]["name"] == "ConvertB")
-    refs = {k: v for k, v in convert["config"]["properties"].items()
-            if k in ("Record Reader", "Record Writer")}
-    assert refs and all(v in svc_ids for v in refs.values()), \
-        "processor must be wired to the recreated group-level services"
+    # Matched by *value*, not by property name: the two lines disagree on the
+    # key ("Record Reader" on 2.x, "record-reader" on 1.24), and the wiring —
+    # the property pointing at the recreated service's id — is what matters.
+    refs = {k: v for k, v in convert["config"]["properties"].items() if v in svc_ids}
+    assert len(refs) == 2, \
+        f"processor must be wired to both recreated services, got {refs}"
 
 
 def test_push_to_unversioned_group_still_recreates(nifi_client):

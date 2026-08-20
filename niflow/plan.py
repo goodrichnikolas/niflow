@@ -34,6 +34,7 @@ from niflow.core import (
     Port,
     ProcessGroup,
     Processor,
+    nifi_property_value,
 )
 
 # Processor fields worth diffing (position/bundle/name/type excluded: the
@@ -92,12 +93,79 @@ class Change:
         return "/".join(self.path) or "."
 
 
-def diff_flows(live: ProcessGroup, desired: ProcessGroup) -> List[Change]:
-    """Return the ordered change plan turning ``live`` into ``desired``."""
+def diff_flows(
+    live: ProcessGroup,
+    desired: ProcessGroup,
+    target_major: Optional[int] = None,
+) -> List[Change]:
+    """Return the ordered change plan turning ``live`` into ``desired``.
+
+    ``target_major`` is the NiFi major version the live side came from. Property
+    emission has been server-version-aware since the cross-version fidelity fix;
+    the diff side was not, so a property that exists only on the target's line —
+    ``QueryRecord``'s ``cache-schema``, ``ConsumeJMS``'s ``Session Cache size`` —
+    had no descriptor to read a default from, was judged against ``None``, and
+    planned as an unset on every run forever. Left ``None`` it is inferred from
+    the live snapshot's own property keys (:func:`_infer_target_major`), so
+    callers that never knew the version get the fix too.
+    """
+    if target_major is None:
+        target_major = _infer_target_major(live)
     changes: List[Change] = []
-    _diff_group(live, desired, (), changes)
+    _diff_group(live, desired, (), changes, target_major)
     _annotate_renames(changes)
     return changes
+
+
+def _infer_target_major(live: ProcessGroup) -> Optional[int]:
+    """Which NiFi line the live snapshot was pulled from, read off its own keys.
+
+    A live component carries its server's full materialised property map, and a
+    pull already rewrites every *renamed* key into the catalog's namespace. So a
+    key that survives canonicalization while belonging to the 1.x namespace and
+    not the 2.x one had no 2.x counterpart to be rewritten into — which only a
+    1.x server can have produced. That residue is the evidence; the 2.x-looking
+    keys are not, because canonicalization manufactures them on both lines.
+
+    Only "this is 1.x" is ever concluded. ``None`` means "judge with the catalog
+    alone", which is both the old behaviour and the right answer for 2.x, so
+    there is nothing to gain from guessing further. Evidence is pooled across
+    the tree — one server serves the whole snapshot — at the cost of one
+    far-fetched corner: a *dynamic* property on a 2.x server whose name happens
+    to equal a 1.x-only real property of the same type would read as 1.x.
+    """
+    from niflow.processors.rules import (
+        _compat_entry, canonical_properties, property_names_for,
+    )
+
+    def judge(type_str: str, props: Dict[str, Any]) -> bool:
+        if not props:
+            return False
+        catalog_names = property_names_for(type_str)
+        v1_names = _compat_entry("PROPERTY_NAMES", type_str)
+        if v1_names is None:
+            return False
+        if catalog_names is None:
+            # The 1.x harvest knows this type and the 2.x catalog does not, so
+            # only a 1.x server can be running it (ListHDFS, GetJMSTopic, ...).
+            # That is the strongest evidence there is, and every one of its
+            # properties would otherwise be judged against no descriptor at all.
+            return True
+        catalog_set, v1_set = set(catalog_names), set(v1_names)
+        return any(
+            key in v1_set and key not in catalog_set
+            for key in canonical_properties(type_str, props)
+        )
+
+    def visit(group: ProcessGroup) -> bool:
+        return (
+            any(judge(p.type, p.properties or {}) for p in group.processors)
+            or any(judge(s.type, s.properties or {})
+                   for s in group.controller_services)
+            or any(visit(child) for child in group.process_groups)
+        )
+
+    return 1 if visit(live) else None
 
 
 # ---------------------------------------------------------------- internals
@@ -108,6 +176,7 @@ def _diff_group(
     desired: ProcessGroup,
     path: Tuple[str, ...],
     changes: List[Change],
+    target_major: Optional[int] = None,
 ) -> None:
     # Group-level settings (variables, comment, parameter-context binding).
     settings: Dict[str, Tuple[Any, Any]] = {}
@@ -127,13 +196,15 @@ def _diff_group(
 
     _diff_named(
         live.controller_services, desired.controller_services,
-        "controller_service", path, changes, _diff_service_fields,
+        "controller_service", path, changes,
+        lambda a, b: _diff_service_fields(a, b, target_major),
     )
     _diff_named(live.input_ports, desired.input_ports, "input_port", path, changes)
     _diff_named(live.output_ports, desired.output_ports, "output_port", path, changes)
     _diff_named(
         live.processors, desired.processors,
-        "processor", path, changes, _diff_processor_fields,
+        "processor", path, changes,
+        lambda a, b: _diff_processor_fields(a, b, target_major),
     )
 
     # Funnels are anonymous, so they're identified by connection topology
@@ -179,7 +250,8 @@ def _diff_group(
             changes.append(Change("remove", "process_group", path, name, live=child))
     for name, child in desired_children.items():
         if name in live_children:
-            _diff_group(live_children[name], child, path + (name,), changes)
+            _diff_group(live_children[name], child, path + (name,), changes,
+                        target_major)
         else:
             changes.append(Change("add", "process_group", path, name, desired=child))
 
@@ -236,20 +308,52 @@ def _closest_index(bucket: List[Any], desired: Any, field_differ) -> int:
     return costs.index(min(costs))
 
 
-def _diff_processor_fields(live: Processor, desired: Processor) -> Dict[str, Tuple[Any, Any]]:
-    fields = _diff_properties(live.properties, desired.properties, desired.type)
+def _diff_processor_fields(
+    live: Processor, desired: Processor, target_major: Optional[int] = None
+) -> Dict[str, Tuple[Any, Any]]:
+    fields = _diff_properties(
+        live.properties, desired.properties, desired.type, target_major)
     for name in _PROCESSOR_FIELDS:
         a, b = getattr(live, name), getattr(desired, name)
-        if _normalise_field(name, a) != _normalise_field(name, b):
+        if _normalise_field(name, a, desired.type) != _normalise_field(name, b, desired.type):
+            # A live RUNNING processor is not drift against a model that never
+            # said anything about run state: the live read now reports RUNNING
+            # (it used to be sanitised to ENABLED), and proposing to *stop*
+            # every running processor because the field defaults to ENABLED
+            # would turn a plan into an outage. Written down — either value —
+            # it is an assertion again, and stays diffed.
+            if (name == "scheduled_state" and a == "RUNNING" and b == "ENABLED"
+                    and "scheduled_state" not in desired.model_fields_set):
+                continue
             fields[name] = (a, b)
     return fields
 
 
 def _diff_service_fields(
-    live: ControllerService, desired: ControllerService
+    live: ControllerService,
+    desired: ControllerService,
+    target_major: Optional[int] = None,
 ) -> Dict[str, Tuple[Any, Any]]:
-    fields = _diff_properties(live.properties, desired.properties, desired.type)
+    """Service drift. ``enabled`` counts only when the model actually states it.
+
+    NiFi imports every controller service of a pushed flow DISABLED — the
+    snapshot's ``scheduledState`` is ignored on create — so the model's
+    ``enabled=True`` *default* is a promise no push keeps, and diffing it
+    reported drift on every service-bearing flow immediately after a clean
+    push, forever. Same rule as :func:`_diff_properties`: a side that states
+    nothing takes the other's value instead of proposing a change. An
+    explicit ``enabled=True``/``False`` (pulled flows always carry one) is an
+    assertion, stays diffed, and ``push --update`` enables/disables to match.
+    The live side is only as good as the pull: NiFi's flow-definition download
+    sanitises run state (services always read DISABLED, processors never read
+    RUNNING), so a stated ``enabled=True`` re-plans until the live read is
+    taught to ask the controller-services endpoint for the real state.
+    """
+    fields = _diff_properties(
+        live.properties, desired.properties, desired.type, target_major)
     for name in _SERVICE_FIELDS:
+        if name == "enabled" and "enabled" not in desired.model_fields_set:
+            continue
         a, b = getattr(live, name), getattr(desired, name)
         if a != b:
             fields[name] = (a, b)
@@ -272,35 +376,56 @@ def _diff_connection_fields(live: Connection, desired: Connection) -> Dict[str, 
 
 
 def _diff_properties(
-    live: Dict[str, Any], desired: Dict[str, Any], type_str: str = ""
+    live: Dict[str, Any],
+    desired: Dict[str, Any],
+    type_str: str = "",
+    target_major: Optional[int] = None,
 ) -> Dict[str, Tuple[Any, Any]]:
-    """Property drift, judged on *effective* values.
+    """Property drift, judged on *effective* values, in the target's namespace.
 
     Both sides are canonicalized first (display-name keys -> server keys), and
     a side that leaves a property unset effectively holds the descriptor
     default — NiFi materialises defaults on the live side, so comparing raw
     dicts would propose unsetting every default back to ``None`` forever.
+
+    ``target_major`` decides *whose* defaults those are. Read from the 2.x
+    catalog alone, a property that exists only on a 1.x server has no descriptor
+    at all, so its materialised value was compared against ``None`` and planned
+    as an unset on every run — the diff-side twin of the cross-version emission
+    bug. With the target's own descriptors, a 1.x-only property sitting at its
+    1.x default is what the model asking for nothing *means* there, and no
+    change is proposed. A value that is NOT the default is still real drift: a
+    property the user actually removed from a pulled flow still plans as an
+    unset, which is the distinction this has to keep.
     """
-    from niflow.processors.rules import canonical_properties, descriptors_for
+    from niflow.processors.rules import canonical_properties, descriptors_for_target
 
     live = canonical_properties(type_str, live)
     desired = canonical_properties(type_str, desired)
-    descriptors = descriptors_for(type_str) or {}
+    descriptors = descriptors_for_target(type_str, target_major)
     fields: Dict[str, Tuple[Any, Any]] = {}
     for key in sorted(set(live) | set(desired)):
         a, b = live.get(key), desired.get(key)
+        allowable = (descriptors.get(key) or {}).get("allowable")
         default = (descriptors.get(key) or {}).get("default")
-        a_eff = default if a is None else _normalise_prop(a)
-        b_eff = default if b is None else _normalise_prop(b)
+        a_eff = default if a is None else _normalise_prop(a, allowable)
+        b_eff = default if b is None else _normalise_prop(b, allowable)
         if a_eff != b_eff:
             fields[f"properties[{key}]"] = (_display_prop(a), _display_prop(b))
     return fields
 
 
-def _normalise_prop(value: Any) -> Any:
+def _normalise_prop(value: Any, allowable: Any = None) -> Any:
+    """Compare property values the way NiFi stores them: as strings.
+
+    A model built through :class:`~niflow.core.Processor` is already
+    normalised, but one whose ``properties`` dict was edited in place after
+    construction is not — and NiFi returns ``"10"`` for a Python ``10``
+    either way, so the differ does its own coercion rather than trusting it.
+    """
     if isinstance(value, ControllerService):
         return f"@service:{value.name}"
-    return value
+    return nifi_property_value(value, allowable)
 
 
 def _display_prop(value: Any) -> Any:
@@ -309,9 +434,25 @@ def _display_prop(value: Any) -> Any:
     return value
 
 
-def _normalise_field(name: str, value: Any) -> Any:
+def _normalise_field(name: str, value: Any, type_str: str = "") -> Any:
+    """The comparable form of a component field.
+
+    Relationship lists are sets to NiFi, so order can't be drift. And
+    ``execution_node`` has a per-type effective default: NiFi forces
+    ``PRIMARY`` on ``@PrimaryNodeOnly`` types (ListFTP, ListSFTP, ...) and
+    rejects anything else, so the model's ``ALL`` default — and even an
+    explicit ``ALL`` — means PRIMARY there. Without this, every flow holding
+    one of those types planned ``execution_node: 'PRIMARY' -> 'ALL'`` after a
+    clean push, forever. The primary-node-only set is harvested from the live
+    server (``ProcessorDTO.executionNodeRestricted``) into the catalog.
+    """
     if isinstance(value, list):
         return sorted(value)
+    if name == "execution_node" and type_str:
+        from niflow.processors.rules import primary_node_only
+
+        if primary_node_only(type_str):
+            return "PRIMARY"
     return value
 
 

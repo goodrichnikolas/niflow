@@ -16,8 +16,11 @@ def _proc(name, type=UNKNOWN):
 def known_relationships(monkeypatch):
     """Pretend the catalog harvested relationships for type 'Known'."""
     table = {"Known": ["success", "failure"]}
+    # validate now asks for the set on a specific NiFi line, and for the
+    # property values actually set (relationships can be conditional).
     monkeypatch.setattr(
-        "niflow.validate.relationships_for", lambda t: table.get(t)
+        "niflow.validate.relationships_for",
+        lambda t, props=None, major_version=None: table.get(t),
     )
 
 
@@ -32,7 +35,8 @@ def known_descriptors(monkeypatch):
             {"property": "Compression", "values": ["gzip"]}]},
     }}
     # All 'Known' processors have their relationships handled in these tests.
-    monkeypatch.setattr("niflow.validate.relationships_for", lambda t: None)
+    monkeypatch.setattr("niflow.validate.relationships_for",
+                        lambda t, props=None, major_version=None: None)
     monkeypatch.setattr("niflow.validate.descriptors_for", lambda t: table.get(t))
 
 
