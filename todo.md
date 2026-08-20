@@ -519,7 +519,9 @@ by ticket number, not priority; the priority axis is "things that hurt at work".
         A step now re-runs the destination until *our* file moves (capped at
         `run_attempts`, stopping early once it leaves the queue) and reports
         "ran X 3x, 2 FlowFile(s) were ahead of it".
-- [ ] **T16 — "It wasn't us" alerting.** Analysts burn 45 minutes discovering that an
+- [x] **T16 — "It wasn't us" alerting.** Shipped 2026-08-19 as `niflow watch`
+      (niflow/watch.py, `.niflow-watch/` baselines, tests/test_watch.py).
+      Original ask: Analysts burn 45 minutes discovering that an
       external endpoint started 404ing. Want a background watcher that notices
       "this was healthy, nothing changed, now it's failing" and pops it on screen
       (no email) with the external cause called out.
@@ -1183,21 +1185,42 @@ on both lines).
 
 ### Found while here — not trace/follow, for whoever owns those files
 
-- [ ] **MergeContent's `max-bin-age` is not in the rename map.** 2.x key
-      `max-bin-age`, 1.24 key `Max Bin Age`. `niflow validate` passed it
-      clean and the push landed it on 1.24 as an inert **dynamic** property,
-      which also made the processor **invalid**
-      (`'max-bin-age' … is not a supported property`). Repro: set
-      `"max-bin-age": "10 sec"` on MergeContent, push to 1.24, read
-      `validation_errors`. T13/T17 territory — the matcher refused the pair
-      because key *and* display name both moved, and MergeContent was not in
-      the curated list.
-- [ ] **`push --update` reports removing a property and does not remove it.**
-      Same repro: after deleting `max-bin-age` from the flow, the plan printed
-      `properties[max-bin-age]: '10 sec' -> None` and said "Applied", but the
-      dynamic property was **still on the server** and the processor still
-      invalid. A hand-rolled `PUT /processors/{id}` with
-      `{"properties": {"max-bin-age": null}}` removed it immediately, so NiFi
-      is fine with the removal — the applier is not sending it. Suspicion:
-      version-aware emission omits the unsupported key from the desired
-      state, so the removal the plan computed never reaches the request.
+- [x] **`max-bin-age` was never a rename — and nothing caught it.** *(fixed
+      2026-08-20)* Both lines key it `Max Bin Age` (2.7.2 and 1.24.0 agree;
+      the map's MergeContent renames are `Header/Footer/Demarcator File`,
+      `Maximum number of Bins` and `mergecontent-metadata-strategy`), so
+      `max-bin-age` is a property of *neither* namespace — NiFi files any
+      unrecognised key under dynamic properties, does nothing with it, and
+      marks the processor invalid. No rename could have helped; the missing
+      piece was a local check.
+      `rules.near_miss_properties()` flags a key that is a property of neither
+      line but normalises (case, `-`, `_`, space — deliberately **not** `.`,
+      so attribute-style dynamic keys are never touched) onto exactly one real
+      property of the same type, in both directions. `validate` reports it:
+      "property 'max-bin-age' is not a property of this type — did you mean
+      'Max Bin Age'?". Deliberately a report, not a silent rewrite: this repo
+      does not guess values onto properties.
+      While there: **validate never looked at controller services at all** —
+      the same blind spot the cross-version work found — so required
+      properties, allowable values and near-miss keys now run on services too
+      (`_typed_entry` already covered both catalogs). Verified: a
+      DBCPConnectionPool written with `database-connection-url` now names
+      `Database Connection URL`.
+- [x] **`push --update` reported removing a property and did not remove it.**
+      *(fixed 2026-08-20, verified live on 1.24.0)* Not the emitter — NiFi
+      **merges** the properties map on `PUT /processors/{id}` and
+      `PUT /controller-services/{id}`: a key the request does not mention is
+      left exactly as it was, and only a key sent as `null` is removed (a
+      dynamic property) or reset to its default (a real one). The applier sent
+      the model's properties, which by definition no longer contain the
+      dropped key, so every removal was a silent no-op.
+      `PlanApplier._property_removals()` now derives the nulls from the plan's
+      own `properties[...]` fields — so what apply sends cannot drift from what
+      the plan promised — and puts them back through `properties_for_target`,
+      because the plan speaks the catalog namespace and a 1.x server may not.
+      Controller services had the identical bug and the identical fix.
+      Live repro on 1.24: push with `max-bin-age`, drop it, `push --update` —
+      the property is gone from the server and
+      `'max-bin-age' … is not a supported property` is gone with it. Unit
+      cover in tests/test_apply_unit.py (processor, service, and "a property
+      the flow still sets is never nulled").

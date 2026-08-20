@@ -13,6 +13,7 @@ without write access) simply has no ``RELATIONSHIPS`` map, and lookups return
 """
 from __future__ import annotations
 
+import re
 from typing import Dict, List, Optional, Tuple
 
 
@@ -687,6 +688,65 @@ def _unsupported_on_target(type_str: str, major_version: int) -> Optional[set]:
     if entry is None:
         return None
     return set(entry.get("only_new") or ())
+
+
+_KEY_SEPARATORS = re.compile(r"[-_ ]+")
+
+
+def _normalised_key(key: str) -> str:
+    """A property key with case and ``-``/``_``/space separators removed.
+
+    Deliberately *not* ``.``: attribute-style dynamic keys (``mime.type`` on an
+    UpdateAttribute) are the user's own names and must never be mistaken for a
+    real property (``Mime Type``) they merely resemble.
+    """
+    return _KEY_SEPARATORS.sub("", key).lower()
+
+
+def near_miss_properties(type_str: str, props: Dict[str, object]) -> Dict[str, str]:
+    """``{key written: property it almost certainly means}`` for one component.
+
+    ``max-bin-age`` is not a MergeContent property on *either* line — both key
+    it ``Max Bin Age`` — so NiFi accepts it as a **dynamic** property, does
+    nothing with it, and marks the processor invalid ("'max-bin-age' ... is not
+    a supported property"). `niflow validate` passed it clean, which is how it
+    reached a work server; the same shape catches any key carried over from an
+    older NiFi, a hand-edit, or a doc that kebab-cased a display name.
+
+    A key qualifies only when it is a property of neither namespace (2.x
+    catalog or 1.x compat) and normalises onto *exactly one* real property of
+    the same type in both directions — so a genuine dynamic property, which
+    resembles nothing the type declares, is never flagged. Un-harvested types
+    answer ``{}``: nothing is known about them, and guessing there would be the
+    false positive that teaches people to ignore the check.
+    """
+    if not props:
+        return {}
+    catalog_names = set(property_names_for(type_str) or ())
+    v1_names = set(_compat_entry("PROPERTY_NAMES", type_str) or ())
+    known = catalog_names | v1_names
+    if not known:
+        return {}
+    by_norm: Dict[str, List[str]] = {}
+    for name in sorted(known):
+        by_norm.setdefault(_normalised_key(name), []).append(name)
+    written = [key for key in props if key not in known]
+    out: Dict[str, str] = {}
+    for key in written:
+        norm = _normalised_key(key)
+        candidates = by_norm.get(norm) or []
+        # Two names normalising the same way across the two namespaces are the
+        # same property under two spellings (2.x "Maximum Number of Bins" vs
+        # 1.x "Maximum number of Bins") — suggest the catalog's, which is what
+        # the flow should say. Two *within* one namespace would be genuine
+        # ambiguity, and nothing is suggested there.
+        preferred = [name for name in candidates if name in catalog_names] or candidates
+        # 1:1 the other way too — two keys in the flow normalising onto the
+        # same property means the flow, not the catalog, needs reading.
+        if len(preferred) == 1 and sum(
+                1 for other in written if _normalised_key(other) == norm) == 1:
+            out[key] = preferred[0]
+    return out
 
 
 def unsupported_properties(

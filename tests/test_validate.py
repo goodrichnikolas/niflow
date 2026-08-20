@@ -335,3 +335,71 @@ def test_primary_node_incoming_from_funnel_counts():
     flow.add_connection(gen >> fun, fun >> audit)
     assert any("PRIMARY" in i["message"] and i["component"] == "f/Audit"
                for i in validate_flow(flow))
+
+
+# --- keys that will silently become dynamic properties -----------------------
+
+MERGE = "org.apache.nifi.processors.standard.MergeContent"
+
+
+def _merge(properties):
+    return Processor(name="Merge", type=MERGE, properties=properties,
+                     auto_terminate=["merged", "original", "failure"])
+
+
+def test_kebab_cased_key_that_is_no_property_on_either_line_is_flagged():
+    """The `max-bin-age` repro: valid-looking, inert on the server.
+
+    Both 2.7.2 and 1.24 key it `Max Bin Age`, so NiFi files the written key
+    under dynamic properties, does nothing with it, and marks the processor
+    invalid — after the push, on the server.
+    """
+    flow = Flow("F")
+    flow.add(_merge({"max-bin-age": "10 sec"}))
+    messages = [i["message"] for i in validate_flow(flow)]
+    assert any("'max-bin-age'" in m and "'Max Bin Age'" in m for m in messages)
+
+
+def test_the_real_key_passes():
+    flow = Flow("F")
+    flow.add(_merge({"Max Bin Age": "10 sec"}))
+    assert validate_flow(flow) == []
+
+
+def test_the_1x_spelling_of_a_renamed_property_passes():
+    """`Header File` is 1.24's name for 2.x's `Header` — a real property, not a typo."""
+    flow = Flow("F")
+    flow.add(_merge({"Header File": "/tmp/h"}))
+    assert validate_flow(flow) == []
+
+
+def test_a_genuine_dynamic_property_is_not_flagged():
+    flow = Flow("F")
+    flow.add(_merge({"my.own.attribute": "x"}))
+    assert validate_flow(flow) == []
+
+
+def test_two_spellings_of_one_property_are_left_to_the_reader():
+    """Ambiguity gets no guess — the flow, not the catalog, needs reading."""
+    flow = Flow("F")
+    flow.add(_merge({"max-bin-age": "10 sec", "max_bin_age": "20 sec"}))
+    assert validate_flow(flow) == []
+
+
+def test_unharvested_types_are_never_guessed_at():
+    flow = Flow("F")
+    flow.add(Processor(name="X", type=UNKNOWN, properties={"any-key": "1"},
+                       auto_terminate=["success"]))
+    messages = [i["message"] for i in validate_flow(flow)]
+    assert not any("did you mean" in m for m in messages)
+
+
+def test_controller_service_properties_are_validated_too():
+    from niflow.core import ControllerService
+
+    flow = Flow("F")
+    flow.add(ControllerService(
+        name="Pool", type="org.apache.nifi.dbcp.DBCPConnectionPool",
+        properties={"database-connection-url": "jdbc:h2:mem:x"}))
+    messages = [i["message"] for i in validate_flow(flow)]
+    assert any("did you mean" in m for m in messages), messages

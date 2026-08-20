@@ -126,6 +126,28 @@ def _targeted_issues(proc, label: str) -> List[dict]:
     return out
 
 
+def _near_miss_issues(component, label: str) -> List[dict]:
+    """Keys that will land as an inert dynamic property instead of the real one.
+
+    This is the check that was missing when ``max-bin-age`` reached a work
+    1.24: NiFi takes any unrecognised key as a dynamic property, so nothing
+    rejects it locally, the value does nothing, and the processor goes invalid
+    on a server you then have to go and read. See
+    :func:`niflow.processors.rules.near_miss_properties` for what qualifies.
+    """
+    from niflow.processors.rules import near_miss_properties
+
+    return [
+        {"component": label,
+         "message": f"property {key!r} is not a property of this type — "
+                    f"did you mean {suggestion!r}? As written NiFi keeps it as "
+                    f"a dynamic property, the value has no effect, and the "
+                    f"component is invalid"}
+        for key, suggestion in sorted(
+            near_miss_properties(component.type, component.properties or {}).items())
+    ]
+
+
 def _property_issues(proc, label: str) -> List[dict]:
     """Required-property and allowable-value checks from harvested descriptors."""
     descriptors = descriptors_for(proc.type)
@@ -283,7 +305,18 @@ def validate_flow(
                 })
 
             issues.extend(_property_issues(proc, label))
+            issues.extend(_near_miss_issues(proc, label))
             issues.extend(_targeted_issues(proc, label))
+
+        # Controller services were never checked here at all, which is the
+        # same blind spot the cross-version work found: a service's properties
+        # go through the identical descriptor tables (``_typed_entry`` covers
+        # both catalogs), and a mistyped key on a service is *harder* to spot
+        # on the canvas than one on a processor.
+        for service in group.controller_services:
+            label = f"{path}/{service.name}"
+            issues.extend(_property_issues(service, label))
+            issues.extend(_near_miss_issues(service, label))
 
         for child in group.process_groups:
             visit(child, path)
