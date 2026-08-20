@@ -154,6 +154,9 @@ class FlowsMixin:
                 statuses = [
                     comp.get("validationStatus")
                     for _, _, comp in self.walk_processors(pg_id)
+                ] + [
+                    comp.get("validationStatus")
+                    for _, _, comp in self.walk_services(pg_id)
                 ]
                 if "VALIDATING" not in statuses or time.monotonic() > deadline:
                     break

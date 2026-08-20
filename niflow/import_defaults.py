@@ -20,6 +20,13 @@ and reading back what the server made of it. Regenerate per line::
     NIFLOW_NIFI_HOST=https://host:8443/nifi-api python -m niflow.codegen --import-defaults
 
 ``IMPORT_DEFAULTS`` is keyed by NiFi major version, then type, then property.
+
+``IMPORT_SERVICES`` records the other half of the same behaviour: types whose
+import *creates a controller service* and wires it into a required property
+(NiFi 2.x moved the AWS processors' inline credentials into one). The model
+never mentioned that component, so the differ planned to delete it and unset
+the reference on every run. Keyed by major version, then processor type, then
+property, holding the service type the import creates.
 """
 from __future__ import annotations
 
@@ -29,5 +36,42 @@ IMPORT_DEFAULTS = {
     2: {
         "org.apache.nifi.json.JsonRecordSetWriter": {"Allow Scientific Notation": "true"},
         "org.apache.nifi.processors.aws.credentials.provider.service.AWSCredentialsProviderControllerService": {"Use Anonymous Credentials": "true"},
+    },
+}
+
+IMPORT_SERVICES = {
+    1: {
+    },
+    2: {
+        "org.apache.nifi.processors.aws.cloudwatch.PutCloudWatchMetric": {"AWS Credentials Provider Service": "org.apache.nifi.processors.aws.credentials.provider.service.AWSCredentialsProviderControllerService"},
+        "org.apache.nifi.processors.aws.dynamodb.DeleteDynamoDB": {"AWS Credentials Provider Service": "org.apache.nifi.processors.aws.credentials.provider.service.AWSCredentialsProviderControllerService"},
+        "org.apache.nifi.processors.aws.dynamodb.GetDynamoDB": {"AWS Credentials Provider Service": "org.apache.nifi.processors.aws.credentials.provider.service.AWSCredentialsProviderControllerService"},
+        "org.apache.nifi.processors.aws.dynamodb.PutDynamoDB": {"AWS Credentials Provider Service": "org.apache.nifi.processors.aws.credentials.provider.service.AWSCredentialsProviderControllerService"},
+        "org.apache.nifi.processors.aws.dynamodb.PutDynamoDBRecord": {"AWS Credentials Provider Service": "org.apache.nifi.processors.aws.credentials.provider.service.AWSCredentialsProviderControllerService"},
+        "org.apache.nifi.processors.aws.kinesis.firehose.PutKinesisFirehose": {"AWS Credentials Provider Service": "org.apache.nifi.processors.aws.credentials.provider.service.AWSCredentialsProviderControllerService"},
+        "org.apache.nifi.processors.aws.kinesis.stream.ConsumeKinesisStream": {"AWS Credentials Provider Service": "org.apache.nifi.processors.aws.credentials.provider.service.AWSCredentialsProviderControllerService"},
+        "org.apache.nifi.processors.aws.kinesis.stream.PutKinesisStream": {"AWS Credentials Provider Service": "org.apache.nifi.processors.aws.credentials.provider.service.AWSCredentialsProviderControllerService"},
+        "org.apache.nifi.processors.aws.lambda.PutLambda": {"AWS Credentials Provider Service": "org.apache.nifi.processors.aws.credentials.provider.service.AWSCredentialsProviderControllerService"},
+        "org.apache.nifi.processors.aws.ml.polly.GetAwsPollyJobStatus": {"AWS Credentials Provider Service": "org.apache.nifi.processors.aws.credentials.provider.service.AWSCredentialsProviderControllerService"},
+        "org.apache.nifi.processors.aws.ml.polly.StartAwsPollyJob": {"AWS Credentials Provider Service": "org.apache.nifi.processors.aws.credentials.provider.service.AWSCredentialsProviderControllerService"},
+        "org.apache.nifi.processors.aws.ml.textract.GetAwsTextractJobStatus": {"AWS Credentials Provider Service": "org.apache.nifi.processors.aws.credentials.provider.service.AWSCredentialsProviderControllerService"},
+        "org.apache.nifi.processors.aws.ml.textract.StartAwsTextractJob": {"AWS Credentials Provider Service": "org.apache.nifi.processors.aws.credentials.provider.service.AWSCredentialsProviderControllerService"},
+        "org.apache.nifi.processors.aws.ml.transcribe.GetAwsTranscribeJobStatus": {"AWS Credentials Provider Service": "org.apache.nifi.processors.aws.credentials.provider.service.AWSCredentialsProviderControllerService"},
+        "org.apache.nifi.processors.aws.ml.transcribe.StartAwsTranscribeJob": {"AWS Credentials Provider Service": "org.apache.nifi.processors.aws.credentials.provider.service.AWSCredentialsProviderControllerService"},
+        "org.apache.nifi.processors.aws.ml.translate.GetAwsTranslateJobStatus": {"AWS Credentials Provider Service": "org.apache.nifi.processors.aws.credentials.provider.service.AWSCredentialsProviderControllerService"},
+        "org.apache.nifi.processors.aws.ml.translate.StartAwsTranslateJob": {"AWS Credentials Provider Service": "org.apache.nifi.processors.aws.credentials.provider.service.AWSCredentialsProviderControllerService"},
+        "org.apache.nifi.processors.aws.s3.CopyS3Object": {"AWS Credentials Provider Service": "org.apache.nifi.processors.aws.credentials.provider.service.AWSCredentialsProviderControllerService"},
+        "org.apache.nifi.processors.aws.s3.DeleteS3Object": {"AWS Credentials Provider Service": "org.apache.nifi.processors.aws.credentials.provider.service.AWSCredentialsProviderControllerService"},
+        "org.apache.nifi.processors.aws.s3.FetchS3Object": {"AWS Credentials Provider Service": "org.apache.nifi.processors.aws.credentials.provider.service.AWSCredentialsProviderControllerService"},
+        "org.apache.nifi.processors.aws.s3.GetS3ObjectMetadata": {"AWS Credentials Provider Service": "org.apache.nifi.processors.aws.credentials.provider.service.AWSCredentialsProviderControllerService"},
+        "org.apache.nifi.processors.aws.s3.GetS3ObjectTags": {"AWS Credentials Provider Service": "org.apache.nifi.processors.aws.credentials.provider.service.AWSCredentialsProviderControllerService"},
+        "org.apache.nifi.processors.aws.s3.ListS3": {"AWS Credentials Provider Service": "org.apache.nifi.processors.aws.credentials.provider.service.AWSCredentialsProviderControllerService"},
+        "org.apache.nifi.processors.aws.s3.PutS3Object": {"AWS Credentials Provider Service": "org.apache.nifi.processors.aws.credentials.provider.service.AWSCredentialsProviderControllerService"},
+        "org.apache.nifi.processors.aws.s3.TagS3Object": {"AWS Credentials Provider Service": "org.apache.nifi.processors.aws.credentials.provider.service.AWSCredentialsProviderControllerService"},
+        "org.apache.nifi.processors.aws.sns.PutSNS": {"AWS Credentials Provider Service": "org.apache.nifi.processors.aws.credentials.provider.service.AWSCredentialsProviderControllerService"},
+        "org.apache.nifi.processors.aws.sqs.DeleteSQS": {"AWS Credentials Provider Service": "org.apache.nifi.processors.aws.credentials.provider.service.AWSCredentialsProviderControllerService"},
+        "org.apache.nifi.processors.aws.sqs.GetSQS": {"AWS Credentials Provider Service": "org.apache.nifi.processors.aws.credentials.provider.service.AWSCredentialsProviderControllerService"},
+        "org.apache.nifi.processors.aws.sqs.PutSQS": {"AWS Credentials Provider Service": "org.apache.nifi.processors.aws.credentials.provider.service.AWSCredentialsProviderControllerService"},
+        "org.apache.nifi.processors.elasticsearch.PutElasticsearchRecord": {"Result Record Writer": "org.apache.nifi.json.JsonRecordSetWriter"},
     },
 }

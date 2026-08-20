@@ -734,6 +734,13 @@ and reading back what the server made of it. Regenerate per line::
     NIFLOW_NIFI_HOST=https://host:8443/nifi-api python -m niflow.codegen --import-defaults
 
 ``IMPORT_DEFAULTS`` is keyed by NiFi major version, then type, then property.
+
+``IMPORT_SERVICES`` records the other half of the same behaviour: types whose
+import *creates a controller service* and wires it into a required property
+(NiFi 2.x moved the AWS processors' inline credentials into one). The model
+never mentioned that component, so the differ planned to delete it and unset
+the reference on every run. Keyed by major version, then processor type, then
+property, holding the service type the import creates.
 """
 from __future__ import annotations
 
@@ -792,6 +799,40 @@ def _probe_divergences(client: Any, group_id: str) -> dict:
     return out
 
 
+def _probe_created_services(client: Any, group_id: str) -> dict:
+    """``{processor type: {property: service type}}`` for services the *import*
+    created by itself.
+
+    NiFi 2.x moved the AWS processors' inline credentials into a controller
+    service, and its import migration creates one and wires it into the
+    required property — a component the pushed model never mentioned. The
+    differ then planned to remove the service and unset the reference, on every
+    run, which would have left the processor invalid if it ever applied.
+
+    Only meaningful for a probe group whose flow declared **no** services, so
+    anything present was made by the server.
+    """
+    services = client._get_json(
+        f"/flow/process-groups/{group_id}/controller-services"
+    ).get("controllerServices", [])
+    by_id = {
+        (entity.get("component") or {}).get("id"): (entity.get("component") or {}).get("type", "")
+        for entity in services
+    }
+    if not by_id:
+        return {}
+    out: dict = {}
+    processors = client._get_json(f"/process-groups/{group_id}/processors").get(
+        "processors", [])
+    for entity in processors:
+        component = entity.get("component") or {}
+        config = component.get("config") or {}
+        for key, value in (config.get("properties") or {}).items():
+            if value in by_id:
+                out.setdefault(component.get("type", ""), {})[key] = by_id[value]
+    return out
+
+
 def harvest_import_defaults(config: Optional[NiFiConfig] = None) -> Tuple[int, str]:
     """Push one instance of every type and record what the import made of it.
 
@@ -819,6 +860,7 @@ def harvest_import_defaults(config: Optional[NiFiConfig] = None) -> Tuple[int, s
     )
 
     found: dict = {}
+    created: dict = {}
     batches = [
         (proc_named[i:i + _IMPORT_PROBE_BATCH], [])
         for i in range(0, len(proc_named), _IMPORT_PROBE_BATCH)
@@ -835,6 +877,10 @@ def harvest_import_defaults(config: Optional[NiFiConfig] = None) -> Tuple[int, s
         try:
             group_id = client.push_flow(_import_probe_flow(name, proc_batch, svc_batch))
             found.update(_probe_divergences(client, group_id))
+            if not svc_batch:
+                # Only a services-free batch can attribute a live service to
+                # the import rather than to the flow that was pushed.
+                created.update(_probe_created_services(client, group_id))
         except Exception as exc:
             logger.warning("Import probe batch %d/%d failed: %s", n, len(batches), exc)
         finally:
@@ -845,30 +891,42 @@ def harvest_import_defaults(config: Optional[NiFiConfig] = None) -> Tuple[int, s
         logger.info("  probe batch %d/%d — %d type(s) with divergence so far",
                     n, len(batches), len(found))
 
-    blocks = _existing_import_defaults()
-    blocks[major] = found
-    body = ["IMPORT_DEFAULTS = {"]
-    for line_major in sorted(blocks):
-        body.append(f"    {line_major}: {{")
-        for type_str in sorted(blocks[line_major]):
-            entries = blocks[line_major][type_str]
-            rendered = ", ".join(
-                f"{_json.dumps(k)}: {_json.dumps(v)}" for k, v in sorted(entries.items()))
-            body.append(f"        {_json.dumps(type_str)}: {{{rendered}}},")
-        body.append("    },")
-    body.append("}")
+    defaults_blocks, service_blocks = _existing_import_defaults()
+    defaults_blocks[major] = found
+    service_blocks[major] = created
+
+    def render(name: str, blocks: dict) -> str:
+        body = [f"{name} = {{"]
+        for line_major in sorted(blocks):
+            body.append(f"    {line_major}: {{")
+            for type_str in sorted(blocks[line_major]):
+                entries = blocks[line_major][type_str]
+                rendered = ", ".join(
+                    f"{_json.dumps(k)}: {_json.dumps(v)}"
+                    for k, v in sorted(entries.items()))
+                body.append(f"        {_json.dumps(type_str)}: {{{rendered}}},")
+            body.append("    },")
+        body.append("}")
+        return "\n".join(body) + "\n"
+
     IMPORT_DEFAULTS_PATH.write_text(
-        _IMPORT_DEFAULTS_HEADER + "\n".join(body) + "\n")
-    return len(found), version
+        _IMPORT_DEFAULTS_HEADER
+        + render("IMPORT_DEFAULTS", defaults_blocks)
+        + "\n" + render("IMPORT_SERVICES", service_blocks)
+    )
+    return len(found) + len(created), version
 
 
-def _existing_import_defaults() -> dict:
+def _existing_import_defaults() -> Tuple[dict, dict]:
     """The blocks already committed, so harvesting one line keeps the other."""
     try:
-        from niflow.import_defaults import IMPORT_DEFAULTS
+        from niflow.import_defaults import IMPORT_DEFAULTS, IMPORT_SERVICES
     except Exception:
-        return {}
-    return {int(k): dict(v) for k, v in IMPORT_DEFAULTS.items()}
+        return {}, {}
+    return (
+        {int(k): dict(v) for k, v in IMPORT_DEFAULTS.items()},
+        {int(k): dict(v) for k, v in IMPORT_SERVICES.items()},
+    )
 
 
 def harvest_rulebook(config: Optional[NiFiConfig] = None) -> dict:

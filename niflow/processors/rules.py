@@ -312,6 +312,34 @@ def import_defaults_for(type_str: str, major_version: Optional[int]) -> Dict[str
     return dict((IMPORT_DEFAULTS.get(major_version) or {}).get(type_str) or {})
 
 
+def import_created_properties(
+    type_str: str, major_version: Optional[int]
+) -> Dict[str, str]:
+    """``{property: service type}`` the import fills in for this type by itself."""
+    if major_version is None:
+        return {}
+    try:
+        from niflow.import_defaults import IMPORT_SERVICES
+    except Exception:
+        return {}
+    return dict((IMPORT_SERVICES.get(major_version) or {}).get(type_str) or {})
+
+
+def import_created_service_types(major_version: Optional[int]) -> set:
+    """Every controller-service type this NiFi line creates for itself on import."""
+    if major_version is None:
+        return set()
+    try:
+        from niflow.import_defaults import IMPORT_SERVICES
+    except Exception:
+        return set()
+    return {
+        service_type
+        for by_property in (IMPORT_SERVICES.get(major_version) or {}).values()
+        for service_type in by_property.values()
+    }
+
+
 def _with_import_defaults(
     descriptors: Dict[str, dict], type_str: str, major_version: Optional[int]
 ) -> Dict[str, dict]:

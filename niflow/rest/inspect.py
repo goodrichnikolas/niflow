@@ -9,6 +9,9 @@ from niflow.rest.common import (
     _POLL_TIMEOUT_S,
     NiFiApiError,
 )
+from niflow.utils import get_logger
+
+logger = get_logger()
 
 # NiFi answers a provenance query with an arbitrary subset once it hits
 # maxResults (see _provenance_newest), so the cap is escalated by this factor
@@ -69,22 +72,78 @@ class InspectMixin:
         ]
 
     def validation_errors(self, group: str = "root") -> List[dict]:
-        """Processors under ``group`` with validation errors (yellow triangles).
+        """Components under ``group`` with validation errors (yellow triangles).
 
-        Each entry carries ``id``/``name``/``path`` plus the ``errors`` list
-        NiFi shows in the component tooltip.
+        Each entry carries ``id``/``name``/``path``/``kind`` plus the ``errors``
+        list NiFi shows in the component tooltip.
+
+        **Controller services count.** They were missing here, which meant a
+        service that cannot start — the single most common reason a whole flow
+        sits idle — was invisible to the Errors panel, to ``validate --live``
+        and to the fuzz harness (which then read niflow's own, correct,
+        complaint about it as a false positive).
         """
-        return [
+        out = [
             {
                 "id": comp["id"],
                 "name": comp.get("name", ""),
                 "path": path,
                 "group_id": group_id,
+                "kind": "processor",
                 "errors": list(comp.get("validationErrors") or []),
             }
             for path, group_id, comp in self.walk_processors(group)
             if comp.get("validationErrors")
         ]
+        out.extend(
+            {
+                "id": comp["id"],
+                "name": comp.get("name", ""),
+                "path": path,
+                "group_id": group_id,
+                "kind": "controller_service",
+                "errors": list(comp.get("validationErrors") or []),
+            }
+            for path, group_id, comp in self.walk_services(group)
+            if comp.get("validationErrors")
+        )
+        return out
+
+    def walk_services(self, group: str = "root") -> Iterator[Tuple[str, str, dict]]:
+        """Yield ``(group_path, group_id, component)`` for every controller
+        service under ``group``, depth-first — the service twin of
+        :meth:`walk_processors`.
+
+        Services are not part of ``ProcessGroupFlowDTO``, so each group needs
+        its own ``/flow/process-groups/{id}/controller-services`` read. The
+        endpoint reports services from ancestor groups too (they are in scope
+        for the group), so anything whose own ``parentGroupId`` is elsewhere is
+        skipped — otherwise a root-level service is reported once per group
+        beneath it.
+        """
+
+        def visit(pg_id: str, prefix: str) -> Iterator[Tuple[str, str, dict]]:
+            try:
+                services = self._get_json(
+                    f"/flow/process-groups/{pg_id}/controller-services"
+                ).get("controllerServices", [])
+            except Exception as exc:
+                # A user with no read permission on services (or an older
+                # endpoint) must not take the whole Errors panel down with it.
+                logger.debug("No controller services readable for %s: %s", pg_id, exc)
+                services = []
+            for entity in services:
+                comp = entity.get("component") or {}
+                if comp.get("parentGroupId") not in (None, pg_id):
+                    continue
+                yield prefix, pg_id, comp
+            flow = self._get_json(f"/flow/process-groups/{pg_id}")["processGroupFlow"]["flow"]
+            for child in flow.get("processGroups", []):
+                child_comp = child["component"]
+                path = f"{prefix}/{child_comp['name']}" if prefix else child_comp["name"]
+                yield from visit(child_comp["id"], path)
+
+        yield from visit(self.resolve_group(group), "")
 
     def bulletins(self, limit: int = 100) -> List[dict]:
         """Recent bulletins across the instance, newest first, as flat dicts.

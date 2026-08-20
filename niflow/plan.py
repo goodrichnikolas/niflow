@@ -194,8 +194,15 @@ def _diff_group(
                    fields=settings, desired=desired, live=live)
         )
 
+    # A service the *import* created (NiFi 2.x makes an
+    # AWSCredentialsProviderControllerService for the AWS processors and wires
+    # it into their required credentials property) is on the canvas without
+    # ever having been in the model. Removing it is not "cleaning up": it is
+    # deleting the thing the processor requires, on every plan, forever. It is
+    # not ours to manage, so it is not diffed — write it in the flow and it
+    # becomes a normal, fully diffed service again.
     _diff_named(
-        live.controller_services, desired.controller_services,
+        _managed_services(live, desired, target_major), desired.controller_services,
         "controller_service", path, changes,
         lambda a, b: _diff_service_fields(a, b, target_major),
     )
@@ -254,6 +261,28 @@ def _diff_group(
                         target_major)
         else:
             changes.append(Change("add", "process_group", path, name, desired=child))
+
+
+def _managed_services(
+    live: ProcessGroup, desired: ProcessGroup, target_major: Optional[int]
+) -> List[Any]:
+    """Live services minus the ones this NiFi line creates for itself on import.
+
+    Only services the desired model does not name are ever dropped from the
+    comparison, and only when their type is one the harvested
+    ``IMPORT_SERVICES`` table says the import creates (see
+    ``python -m niflow.codegen --import-defaults``).
+    """
+    from niflow.processors.rules import import_created_service_types
+
+    created = import_created_service_types(target_major)
+    if not created:
+        return live.controller_services
+    named = {service.name for service in desired.controller_services}
+    return [
+        service for service in live.controller_services
+        if service.name in named or service.type not in created
+    ]
 
 
 def _diff_named(live_items, desired_items, kind, path, changes, field_differ=None):
@@ -398,14 +427,21 @@ def _diff_properties(
     property the user actually removed from a pulled flow still plans as an
     unset, which is the distinction this has to keep.
     """
-    from niflow.processors.rules import canonical_properties, descriptors_for_target
+    from niflow.processors.rules import (
+        canonical_properties, descriptors_for_target, import_created_properties,
+    )
 
     live = canonical_properties(type_str, live)
     desired = canonical_properties(type_str, desired)
     descriptors = descriptors_for_target(type_str, target_major)
     fields: Dict[str, Tuple[Any, Any]] = {}
+    server_managed = import_created_properties(type_str, target_major)
     for key in sorted(set(live) | set(desired)):
         a, b = live.get(key), desired.get(key)
+        if key in server_managed and b is None and a is not None:
+            # The import wired a service it created into this property; the
+            # model saying nothing is not a request to unset it.
+            continue
         allowable = (descriptors.get(key) or {}).get("allowable")
         default = (descriptors.get(key) or {}).get("default")
         a_eff = _effective_prop(a, default, allowable)

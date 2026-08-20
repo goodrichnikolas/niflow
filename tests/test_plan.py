@@ -391,3 +391,57 @@ def test_a_genuinely_different_number_still_drifts():
     live = _one_processor(NORMAL, properties={"n": "10"})
     desired = _one_processor(NORMAL, properties={"n": 11})
     assert [c.fields["properties[n]"] for c in diff_flows(live, desired)] == [("10", "11")]
+
+
+# --- components the server creates for itself on import ----------------------
+
+AWS_PUT_S3 = "org.apache.nifi.processors.aws.s3.PutS3Object"
+AWS_CREDS = ("org.apache.nifi.processors.aws.credentials.provider.service."
+             "AWSCredentialsProviderControllerService")
+
+
+def _aws_pair():
+    """(live, desired) where the live side has what NiFi's 2.x import added."""
+    from niflow.core import ControllerService, Flow, Processor
+
+    desired = Flow("F")
+    desired.add(Processor(name="Put", type=AWS_PUT_S3, auto_terminate=["success",
+                                                                       "failure"]))
+    live = Flow("F")
+    creds = ControllerService(name="AWSCredentialsProviderControllerService",
+                              type=AWS_CREDS)
+    live.add(creds)
+    live.add(Processor(name="Put", type=AWS_PUT_S3,
+                       properties={"AWS Credentials Provider Service": creds},
+                       auto_terminate=["success", "failure"]))
+    return live, desired
+
+
+def test_a_service_the_import_created_is_not_planned_for_removal():
+    """NiFi 2.x makes an AWS credentials service and wires it in by itself.
+
+    Removing it is not tidying up — it deletes the thing the processor
+    requires, on every plan, forever.
+    """
+    live, desired = _aws_pair()
+    assert diff_flows(live, desired, 2) == []
+
+
+def test_writing_the_service_in_the_flow_makes_it_diffable_again():
+    from niflow.core import ControllerService
+
+    live, desired = _aws_pair()
+    desired.add(ControllerService(name="AWSCredentialsProviderControllerService",
+                                  type=AWS_CREDS, comments="ours now"))
+    changes = diff_flows(live, desired, 2)
+    assert [(c.op, c.kind) for c in changes] == [("update", "controller_service")]
+
+
+def test_a_service_the_import_does_not_create_is_still_removed():
+    from niflow.core import ControllerService, Flow
+
+    live, desired = Flow("F"), Flow("F")
+    live.add(ControllerService(name="Pool", type="org.apache.nifi.dbcp.DBCPConnectionPool"))
+    changes = diff_flows(live, desired, 2)
+    assert [(c.op, c.kind, c.name) for c in changes] == [
+        ("remove", "controller_service", "Pool")]

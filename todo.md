@@ -834,6 +834,31 @@ all produce a non-empty plan in both directions.
       referenced types today), a case kind for parameter contexts with real
       secrets, and `apply.py` failure injection (the incremental applier is only
       covered through the live tier).
+## Fuzz round two — offline and live sweeps are clean (2026-08-20)
+Tier 3 against 2.7.2: **120 cases, 0 findings** (was 10 `live_push_update` +
+2 `validate_false_positive` when the day started). Three things closed it:
+
+* **NiFi 2.x creates components of its own on import.** The AWS processors'
+  inline credentials became a controller service in 2.x, and the import
+  migration *creates* an `AWSCredentialsProviderControllerService` and wires it
+  into the required property — a component the pushed model never mentioned.
+  The differ planned to delete it and unset the reference on every run, which
+  would have left the processor invalid the moment it applied. Harvested into
+  `IMPORT_SERVICES` (30 types on 2.7.2: every AWS processor plus
+  `PutElasticsearchRecord`'s `Result Record Writer`; **none** on 1.24.0) and
+  taught to the differ: a live service of a type the import creates, which the
+  model does not name, is not ours to manage. Write it in the flow and it is a
+  normal, fully diffed service again.
+* **`validation_errors` never looked at controller services.** A service that
+  cannot start is the commonest reason a whole flow sits idle, and it was
+  invisible to the Errors panel, to `validate --live`, and to the harness —
+  which then read niflow's own (correct) complaint about a required service
+  property as a false positive. `walk_services()` is the service twin of
+  `walk_processors()`; entries now carry `kind`.
+* **The harness judged a round trip with no target line.** `diff_flows(pulled,
+  flow)` inferred `None` on 2.x, so none of the version-aware rules applied.
+  It passes `client._major_version()` now.
+
 ## Fuzz round two — offline sweep is clean (2026-08-20)
 Same seed and case set as round one: **3,419 cases, 0 findings** (round one
 closed at 40 failing / 5 signatures). The five that were left belonged to the

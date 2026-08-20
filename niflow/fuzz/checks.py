@@ -830,7 +830,11 @@ def check_live_roundtrip(case: Case, client: Any) -> CaseResult:
             return result
 
         pulled = client.pull_flow(pg_id)
-        changes = diff_flows(pulled, flow)
+        # Judge the round trip on the line it actually happened on: the server
+        # adds components of its own on import (2.x creates an AWS credentials
+        # service and wires it in), and those are not drift for a model that
+        # never mentioned them.
+        changes = diff_flows(pulled, flow, client._major_version())
         if changes:
             result.add(_finding(
                 "live_roundtrip_plan",
