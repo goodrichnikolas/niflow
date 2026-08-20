@@ -77,6 +77,8 @@ class StubClient:
         self.port_states = []  # (kind, port id, state) PUTs, in order
         self.on_port_start = {}   # port id -> side-effect callable
         self.proc_states = {}     # processor id -> run state
+        self.proc_types = {}      # processor id -> FQCN
+        self.proc_properties = {}  # processor id -> materialised property map
         self.cap = 100            # how many FlowFiles a listing will show
 
     # --- the client surface the follower uses ---
@@ -116,6 +118,11 @@ class StubClient:
         effect = self.on_port_start.get(port_id)
         if effect and state == "RUNNING":
             effect()
+
+    def processor_config(self, proc_id):
+        return {"type": self.proc_types.get(proc_id, "org.x.P"),
+                "name": proc_id,
+                "properties": dict(self.proc_properties.get(proc_id) or {})}
 
     def processor_validation(self, proc_id):
         return {"state": self.proc_states.get(proc_id, "STOPPED"),
@@ -1224,3 +1231,99 @@ def test_cli_trace_is_quiet_when_the_journey_is_complete(monkeypatch, capsys):
     assert cli.cmd_trace(argparse.Namespace(uuid="u1", full=False, max_events=1000)) == 1
     out = capsys.readouterr().out
     assert "No provenance events" in out and "aged out" in out
+
+
+def test_a_merging_destination_says_it_is_binning_not_stuck(stub):
+    """T7c: 'stalled' at a MergeContent sends people hunting the wrong thing.
+
+    The step is correct — 49 files really are missing — but the reader cannot
+    tell that from "no provenance event yet", which reads as an indexing lag.
+    """
+    stub.dests["c1"] = {"id": "merge-1", "name": "Merge", "type": "PROCESSOR"}
+    stub.proc_properties["merge-1"] = {
+        "Minimum Number of Entries": "50", "Max Bin Age": "10 sec"}
+    f = follower(stub)
+    f.pick_flowfile()
+    stub.events["ff-1"] = []          # run-once produced nothing: the bin isn't full
+    outcome = f.step()
+
+    assert outcome["status"] == "stalled"
+    assert "binning, not stuck" in outcome["message"]
+    assert "needs 50" in outcome["message"] and "49 more" in outcome["message"]
+    assert "10 sec" in outcome["message"]
+
+
+def test_a_record_merger_says_records_not_flowfiles(stub):
+    stub.dests["c1"] = {"id": "merge-1", "name": "MergeRecord", "type": "PROCESSOR"}
+    stub.proc_properties["merge-1"] = {"min-records": "1000"}   # 1.24 keys it kebab-case
+    f = follower(stub)
+    f.pick_flowfile()
+    stub.events["ff-1"] = []
+    assert "by *records*" in f.step()["message"]
+
+
+def test_a_plain_processor_still_gets_the_run_once_explanation(stub):
+    """Nothing changes for a destination that does not declare a bin."""
+    f = follower(stub)
+    f.pick_flowfile()
+    stub.events["ff-1"] = []
+    message = f.step()["message"]
+    assert "has not moved" in message and "binning" not in message
+
+
+def _wide_fork(stub, count=50):
+    """One CLONE hop that spawns `count` children on the same relationship."""
+    children = [f"ff-c{i}" for i in range(count)]
+    stub.rels["c2"] = ["split"]
+    stub.dests["c2"] = {"id": "merge-1", "name": "Merge", "type": "PROCESSOR"}
+
+    def run_mid():
+        stub.take("c1", "ff-1")
+        for child in children:
+            stub.put("c2", child)
+        stub.events["ff-1"].append(hop(2, "CLONE", "Split", children=children))
+
+    stub.on_run_once = {"mid": run_mid}
+    return children
+
+
+def test_a_wide_fork_folds_into_one_group_row(stub, capsys):
+    """T7b: 50 rows for what is one branch fifty times over is unusable."""
+    from niflow.follow import _show_branches
+
+    children = _wide_fork(stub)
+    f = follower(stub)
+    f.pick_flowfile()
+    f.step()
+    assert len(f.branches()) >= len(children)
+
+    groups = f.branch_groups()
+    fork = [g for g in groups if g["relationship"] == "split"]
+    assert len(fork) == 1
+    assert fork[0]["total"] == len(children)
+    assert fork[0]["live"] == len(children)
+    assert len(fork[0]["sample"]) == 3          # enough to act on, not 50 rows
+
+    lines = []
+    _show_branches(f, lines.append)
+    printed = "\n".join(lines)
+    assert "group(s)" in printed and "`b all` lists every one" in printed
+    assert "mute all: m dest:" in printed
+    assert printed.count("ff-c") <= 6           # samples only
+
+    lines = []
+    _show_branches(f, lines.append, "all")
+    assert "\n".join(lines).count("ff-c") >= len(children)
+
+
+def test_a_narrow_fork_still_prints_every_branch(stub):
+    from niflow.follow import _show_branches
+
+    _wide_fork(stub, count=3)
+    f = follower(stub)
+    f.pick_flowfile()
+    f.step()
+    lines = []
+    _show_branches(f, lines.append)
+    assert "group(s)" not in "\n".join(lines)
+    assert "\n".join(lines).count("ff-c") == 3

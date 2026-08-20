@@ -1365,6 +1365,15 @@ class FlowFollower:
                 + " — NiFi accepts run-once on an invalid processor and silently "
                 "does nothing (1.24). Fix it, then step again.")
             return outcome
+        # A merging destination has not failed to run — it ran and correctly
+        # emitted nothing, because its bin is not full. Saying "ran it 8x and
+        # nothing moved" there sends the reader hunting an indexing problem.
+        binning = self._binning_note(end, queue)
+        if binning:
+            outcome["runs"] = runs
+            outcome["retryable"] = False
+            outcome["message"] = binning
+            return outcome
         deep = ahead == -1
         behind = ("" if not ahead else (
             " — it is still behind other FlowFiles in the queue"
@@ -1419,9 +1428,80 @@ class FlowFollower:
             "dropped": dropped,
             "retryable": not hops,
             "message": "" if hops else (
+                self._binning_note(processor, queue) or
                 "no provenance event yet — NiFi indexes provenance "
                 "asynchronously (1.24 can lag under load); retry the poll"),
         }
+
+    # "This processor bins FlowFiles before it emits anything", in both key
+    # namespaces — a 1.x server keys MergeRecord's thresholds in kebab-case
+    # while MergeContent uses the same display names on both lines.
+    _BIN_ENTRY_KEYS = ("Minimum Number of Entries",)
+    _BIN_RECORD_KEYS = ("Minimum Number of Records", "min-records")
+    _BIN_AGE_KEYS = ("Max Bin Age", "max-bin-age")
+
+    def _binning_note(self, processor: Optional[dict],
+                      queue: Optional[dict]) -> str:
+        """Why a merging destination did nothing: it is waiting for its bin.
+
+        Following one child into a 50-entry ``MergeContent`` bin, the step
+        run-onces the merger, nothing happens — correctly, 49 files are still
+        missing — and "stalled" sends the reader hunting a provenance
+        indexing problem that isn't there. Naming the threshold is the whole
+        fix.
+
+        Deliberately property-driven rather than type-driven: any processor
+        that declares a minimum-entries/records threshold bins, including the
+        ones work wrote themselves, and no curated list has to be maintained.
+        """
+        proc_id = (processor or {}).get("id")
+        if not proc_id:
+            return ""
+        try:
+            config = self.client.processor_config(proc_id)
+        except Exception as exc:  # never let an explanation break a step
+            logger.debug("Could not read %s for a binning check: %s", proc_id, exc)
+            return ""
+        properties = config.get("properties") or {}
+
+        def number(keys) -> Optional[int]:
+            for key in keys:
+                raw = properties.get(key)
+                try:
+                    if raw is not None and str(raw).strip():
+                        return int(str(raw).strip())
+                except ValueError:
+                    return None  # an EL/parameter reference — unknowable here
+            return None
+
+        def text(keys) -> str:
+            for key in keys:
+                raw = properties.get(key)
+                if raw:
+                    return str(raw)
+            return ""
+
+        name = (processor or {}).get("name") or config.get("name") or "the destination"
+        queued = int((queue or {}).get("queued") or 0)
+        age = text(self._BIN_AGE_KEYS)
+        age_note = f", or {age} passes" if age else ""
+        minimum = number(self._BIN_ENTRY_KEYS)
+        if minimum and minimum > queued:
+            return (
+                f"{name!r} is binning, not stuck: its queue holds {queued} "
+                f"FlowFile(s) and it needs {minimum} before it emits anything "
+                f"({minimum - queued} more{age_note}). Send more files in, or "
+                f"follow another branch — stepping again will not move this one."
+            )
+        records = number(self._BIN_RECORD_KEYS)
+        if records:
+            return (
+                f"{name!r} is binning by *records*, not FlowFiles: it needs "
+                f"{records} record(s) before it emits{age_note}, and the queue "
+                f"holds {queued} FlowFile(s). Stepping again will not move it "
+                f"until enough records have arrived."
+            )
+        return ""
 
     def _await_hops(self, timeout: Optional[float] = None) -> List[dict]:
         deadline = time.monotonic() + (
@@ -1571,6 +1651,36 @@ class FlowFollower:
         return [dict(self.session.branches[u], current=(u == self.uuid))
                 for u in self.session.order]
 
+    def branch_groups(self) -> List[dict]:
+        """Branches folded by (relationship, destination) — the wide-fork view.
+
+        A 50-way split registers 50 branches correctly and then prints 50
+        rows, which is technically fine and practically unusable: they are the
+        *same* branch fifty times over, and the one thing worth knowing is
+        "50 went to Merge on 'split', none are muted". Each group keeps the
+        branch numbers `s`/`m` take, so nothing is lost by collapsing.
+        """
+        groups: Dict[Tuple[str, str], dict] = {}
+        for index, branch in enumerate(self.branches(), 1):
+            key = (branch.get("relationship") or "", branch.get("destination") or "")
+            group = groups.get(key)
+            if group is None:
+                group = groups[key] = {
+                    "relationship": key[0], "destination": key[1],
+                    "queue": branch.get("queue") or "", "total": 0,
+                    "live": 0, "muted": 0, "done": 0, "current": False,
+                    "indexes": [], "sample": [],
+                }
+            group["total"] += 1
+            state = branch.get("state", "")
+            if state in ("live", "muted", "done"):
+                group[state] += 1
+            group["current"] = group["current"] or bool(branch.get("current"))
+            group["indexes"].append(index)
+            if len(group["sample"]) < 3:
+                group["sample"].append({"index": index, "uuid": branch["uuid"]})
+        return list(groups.values())
+
     def mute(self, spec: str) -> dict:
         """Stop following/rendering a branch. **Never touches NiFi.**
 
@@ -1679,7 +1789,7 @@ _REASON_LINES: Dict[str, str] = {
     "max-hops": "Hop cap reached (--max-hops) — stopping.",
 }
 
-_KEYS = ("Enter=step  r=retry poll  b=branches  s=switch N  m=mute SPEC  "
+_KEYS = ("Enter=step  r=retry poll  b=branches [all]  s=switch N  m=mute SPEC  "
          "u=unmute SPEC  h=history [N]  a=attrs  c=content  q=quit")
 
 
@@ -1702,6 +1812,29 @@ def format_branch(index: int, branch: dict) -> str:
     return (f" {mark}{index:>3}. {branch['uuid']}  {origin:<28} "
             f"{branch.get('queue') or '-':<34} {state:<22} "
             f"{len(branch.get('hops') or [])} hop(s)")
+
+
+def format_branch_group(group: dict) -> str:
+    """One folded row: how many went this way, and how to act on all of them."""
+    mark = "*" if group.get("current") else " "
+    indexes = group.get("indexes") or []
+    span = (f"{indexes[0]}" if len(indexes) == 1
+            else f"{indexes[0]}-{indexes[-1]}" if indexes == list(
+                range(indexes[0], indexes[-1] + 1))
+            else f"{indexes[0]}…{indexes[-1]}")
+    where = " -> ".join(x for x in (group.get("relationship"),
+                                    group.get("destination")) if x) or "start"
+    states = ", ".join(
+        f"{group[state]} {state}" for state in ("live", "muted", "done")
+        if group.get(state))
+    spec = (f"dest:{group['destination']}" if group.get("destination")
+            else f"rel:{group['relationship']}" if group.get("relationship")
+            else "")
+    tail = f"   mute all: m {spec}" if spec and group["total"] > 1 else ""
+    sample = ", ".join(f"#{s['index']} {s['uuid'][:8]}…"
+                       for s in group.get("sample") or [])
+    return (f" {mark}{span:>9}. {group['total']:>3} branch(es)  {where:<34} "
+            f"{states:<26}{tail}\n              {sample}")
 
 
 def follow_command(
@@ -1948,7 +2081,7 @@ def _interactive(
             _show_content(follower, client, last_hop, print_fn)
             continue
         if key == "b":
-            _show_branches(follower, print_fn)
+            _show_branches(follower, print_fn, arg)
             continue
         if key == "h":
             _show_history(follower, arg, print_fn)
@@ -2025,15 +2158,28 @@ def _show_content(follower: FlowFollower, client: Any,
         print_fn("(content no longer available for the last event)")
 
 
+# Above this many branches the per-branch table stops being readable and the
+# grouped view takes over (`b all` still prints every row).
+_BRANCH_TABLE_LIMIT = 12
+
+
 def _show_branches(follower: FlowFollower,
-                   print_fn: Callable[[str], None]) -> None:
+                   print_fn: Callable[[str], None], arg: str = "") -> None:
     branches = follower.branches()
     if not branches:
         print_fn("No branches yet.")
         return
-    print_fn("Branches (* = current):")
-    for i, branch in enumerate(branches, 1):
-        print_fn(format_branch(i, branch))
+    full = arg.lower() in ("all", "full", "*")
+    if full or len(branches) <= _BRANCH_TABLE_LIMIT:
+        print_fn("Branches (* = current):")
+        for i, branch in enumerate(branches, 1):
+            print_fn(format_branch(i, branch))
+    else:
+        groups = follower.branch_groups()
+        print_fn(f"Branches: {len(branches)} in {len(groups)} group(s) "
+                 f"(* = current; `b all` lists every one):")
+        for group in groups:
+            print_fn(format_branch_group(group))
     active = follower.mutes.describe()
     print_fn(f"Mutes: {active or 'none'} — muted branches keep running in "
              "NiFi, they are just not followed.")

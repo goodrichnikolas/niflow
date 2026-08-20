@@ -204,6 +204,21 @@ class InspectMixin:
         self.stop_processor(proc_id)
         self._set_processor_state(proc_id, "RUN_ONCE")
 
+    def processor_config(self, proc_id: str) -> dict:
+        """One processor's ``{"type", "name", "properties"}`` as the server has it.
+
+        The properties are the *materialised* map — every descriptor default
+        NiFi filled in, not just what was pushed — which is what a caller
+        reasoning about the component's behaviour needs (the stepper asks
+        whether a destination is binning FlowFiles, and at what threshold).
+        """
+        comp = self._get_json(f"/processors/{proc_id}")["component"]
+        return {
+            "type": comp.get("type", ""),
+            "name": comp.get("name", ""),
+            "properties": dict((comp.get("config") or {}).get("properties") or {}),
+        }
+
     def processor_validation(self, proc_id: str) -> dict:
         """One processor's ``{"state", "status", "errors"}`` in a single call.
 
@@ -576,6 +591,19 @@ class InspectMixin:
         a capped one — NiFi reports ``total`` as the string ``"100+"`` when it
         hit ``maxResults``.
         """
+        if not search_terms:
+            # Verified on 2.7.2: with no search term, events belonging to
+            # since-deleted process groups are counted in totalCount but never
+            # returned, so the same unfiltered query answered total "0" at
+            # maxResults 100 and 500 and "106" at 1000. An unfiltered
+            # "what happened recently" is therefore not a question NiFi can be
+            # trusted to answer, and silently returning a fraction of the
+            # events is worse than refusing.
+            raise ValueError(
+                f"refusing an unfiltered provenance query for {what} — NiFi 2.x "
+                "under-reports events when searchTerms is empty; filter by "
+                "FlowFileUUID, ProcessorID or Component ID"
+            )
         body = {"provenance": {"request": {
             "searchTerms": search_terms,
             "maxResults": max_results,

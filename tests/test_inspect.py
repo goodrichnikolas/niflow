@@ -259,3 +259,22 @@ def test_event_content_fetches_only_available_sides(client):
     # The fake asserts the output endpoint is never hit: NiFi already said
     # the claim is gone, so the client returns "" without asking.
     assert client.event_content(11, "output") == ""
+
+
+def test_an_unfiltered_provenance_query_is_refused():
+    """T7e: NiFi 2.x under-reports events when searchTerms is empty.
+
+    Observed on 2.7.2: events of since-deleted process groups are counted in
+    totalCount but never returned, so one unfiltered query answered total '0'
+    at maxResults 100 and 500 and '106' at 1000. Refusing beats silently
+    returning a fraction.
+    """
+    import pytest
+
+    from niflow.client import NiFiClient
+
+    client = NiFiClient.__new__(NiFiClient)
+    with pytest.raises(ValueError) as caught:
+        client._provenance_query({}, 100, "recent events")
+    assert "unfiltered provenance query" in str(caught.value)
+    assert "FlowFileUUID" in str(caught.value)
