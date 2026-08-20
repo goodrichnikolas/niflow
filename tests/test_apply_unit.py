@@ -392,3 +392,53 @@ def test_preflight_rejects_dangling_endpoint_before_any_mutation():
     with pytest.raises(ApplyError, match="nothing was changed"):
         PlanApplier(client, "root-pg", live, desired).apply(changes)
     assert client.ops == []
+
+
+def test_dropped_property_is_sent_as_an_explicit_null():
+    """NiFi merges the properties map — a removal has to be sent as null.
+
+    The plan promises ``properties[max-bin-age]: '10 sec' -> None``; before
+    this, apply simply omitted the key, NiFi kept it, and the processor stayed
+    invalid with an inert dynamic property nobody could see the origin of.
+    """
+    live, desired = _pair()
+    live.processors[0].properties["max-bin-age"] = "10 sec"
+    client = FakeClient()
+    client.seed_processor("p-gen", state="STOPPED")
+    changes = _apply(client, live, desired)
+
+    planned = next(c for c in changes if c.kind == "processor" and c.op == "update")
+    assert planned.fields["properties[max-bin-age]"] == ("10 sec", None)
+    put = next(op for op in client.ops if op.startswith("PUT /processors/p-gen"))
+    assert '"max-bin-age": null' in put
+    assert '"a": "1"' in put  # the properties it still wants are untouched
+
+
+def test_dropped_service_property_is_sent_as_an_explicit_null():
+    def build(props: dict) -> Flow:
+        flow = Flow("S")
+        flow.add(ControllerService(name="Svc", type="org.x.Svc", properties=props))
+        return flow
+
+    live, desired = build({"p": "1", "gone": "x"}), build({"p": "1"})
+    live.nifi_id = "root-pg"
+    live.controller_services[0].nifi_id = "s-1"
+    client = FakeClient()
+    client.seed_service("s-1", state="ENABLED")
+    _apply(client, live, desired)
+
+    put = next(op for op in client.ops if op.startswith("PUT /controller-services/s-1"))
+    assert '"gone": null' in put
+
+
+def test_a_property_the_flow_still_sets_is_never_nulled():
+    live, desired = _pair()
+    live.processors[0].properties["a"] = "1"
+    desired.processors[0].properties["a"] = "2"
+    client = FakeClient()
+    client.seed_processor("p-gen", state="STOPPED")
+    _apply(client, live, desired)
+
+    put = next(op for op in client.ops if op.startswith("PUT /processors/p-gen"))
+    assert '"a": "2"' in put
+    assert "null" not in put

@@ -479,9 +479,18 @@ def _emit_group_body(
         if child.layout != "horizontal":
             extra += f", layout={child.layout!r}"
         out.write(f"{indent}with {pg_var}.process_group({child.name!r}{extra}) as {child_var}:\n")
+        before = out.tell()
         _emit_group_body(
             child, child_var, varnames, indent + "    ", out, is_top_level=False
         )
+        if out.tell() == before:
+            # A group with nothing of its own (a placeholder, or one holding
+            # only child groups that are themselves empty) writes no body, and
+            # a ``with`` block with no body is a SyntaxError — every `niflow
+            # pull` of a canvas containing one produced a module that would
+            # not import. ``pass`` is the whole statement the group needs; the
+            # group itself is already created by the header line.
+            out.write(f"{indent}    pass\n")
 
     # Connections last so all endpoints are defined (including ports of nested
     # groups, which the parent flow's connections may reference).

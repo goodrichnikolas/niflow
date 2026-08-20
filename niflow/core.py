@@ -35,6 +35,55 @@ class Bundle(BaseModel):
     version: str = ""
 
 
+def nifi_property_value(value: Any, allowable: Any = None) -> Any:
+    """One property value in the form NiFi actually stores it: a string.
+
+    NiFi's component property map is a ``Map<String,String>``, so anything a
+    Python author naturally writes — ``{"Batch Size": 10}``, ``{"Pretty
+    Print": True}`` — comes back from the server as ``"10"`` / ``"true"`` and
+    would otherwise register as drift on every single plan. Booleans use
+    NiFi's lower-case spelling (``str(True)`` would produce ``"True"``, which
+    lands as an unrecognised value rather than an error); everything else is
+    ``str()``.
+
+    ``allowable`` (a descriptor's allowable-value list, when known) settles
+    the spelling: the handful of properties whose enum really is
+    ``["True", "False"]`` get the capitalised form back. ``None`` means
+    "unset" and is preserved, as are strings and
+    :class:`ControllerService` references (resolved to ids at emit time).
+    """
+    if value is None or isinstance(value, str):
+        return value
+    if isinstance(value, bool):
+        text = "true" if value else "false"
+    elif isinstance(value, (int, float)):
+        text = str(value)
+    else:
+        return value
+    for candidate in allowable or ():
+        if isinstance(candidate, str) and candidate.lower() == text.lower():
+            return candidate
+    return text
+
+
+def nifi_property_values(type_str: str, properties: dict) -> dict:
+    """:func:`nifi_property_value` over a whole property map of *type_str*."""
+    if not properties or all(
+        v is None or isinstance(v, str) for v in properties.values()
+    ):
+        return properties
+    try:
+        from niflow.processors.rules import descriptors_for
+
+        descriptors = descriptors_for(type_str) or {}
+    except Exception:  # pragma: no cover - catalog is optional
+        descriptors = {}
+    return {
+        key: nifi_property_value(value, (descriptors.get(key) or {}).get("allowable"))
+        for key, value in properties.items()
+    }
+
+
 class NiFiComponent(BaseModel):
     """Base for everything that ends up on the NiFi canvas."""
 
@@ -131,6 +180,18 @@ class ControllerService(NiFiComponent):
     Set ``False`` to just create the service on the canvas without enabling —
     useful when you only want to verify creation (the catalog test does this),
     or when properties aren't filled in yet so enable would fail validation.
+
+    It is a *deploy intent*, and only a stated one is diffed: NiFi imports
+    every service of a pushed flow DISABLED whatever the snapshot asks for, so
+    diffing the mere default would report drift on every service-bearing flow
+    forever (activation is what ``push --start`` / ``niflow start`` is for).
+    Write ``enabled`` explicitly — either value — and it becomes an assertion
+    the plan diffs and ``push --update`` applies (it really does enable the
+    live service). Note NiFi's flow-definition download reports every service
+    as DISABLED whatever its runtime state, so a *stated* ``enabled=True``
+    keeps planning until that live read learns to ask
+    ``/flow/process-groups/{id}/controller-services``. See
+    :func:`niflow.plan._diff_service_fields`.
     """
 
     type: str
@@ -139,6 +200,13 @@ class ControllerService(NiFiComponent):
     comments: str = ""
     # NAR coordinates; None means "standard bundle" (resolved by NiFi on import).
     bundle: Optional[Bundle] = None
+
+    @model_validator(mode="after")
+    def _nifi_property_values(self) -> "ControllerService":
+        # Values are strings to NiFi; normalise once, at construction, so a
+        # model written in Python never drifts against its own pushed state.
+        self.properties = nifi_property_values(self.type, self.properties)
+        return self
 
 
 class Processor(NiFiComponent):
@@ -181,6 +249,14 @@ class Processor(NiFiComponent):
         # order can never masquerade as drift (in plans or emitted JSON).
         self.auto_terminate = sorted(self.auto_terminate)
         self.retried_relationships = sorted(self.retried_relationships)
+        return self
+
+    @model_validator(mode="after")
+    def _nifi_property_values(self) -> "Processor":
+        # Property values are strings to NiFi; ``{"Batch Size": 10}`` is the
+        # natural thing to write in Python, so normalise it here (same reason
+        # as the sorting above: declaration form must never look like drift).
+        self.properties = nifi_property_values(self.type, self.properties)
         return self
 
 
@@ -430,11 +506,19 @@ class Flow(ProcessGroup):
 
         return _to_python(self, module_docstring=module_docstring)
 
-    def validate(self) -> List[dict]:
-        """Static pre-push checks; ``[]`` if clean. See :mod:`niflow.validate`."""
+    def validate(self, target_version: Any = None, *, baseline: bool = True) -> List[dict]:
+        """Static pre-push checks; ``[]`` if clean. See :mod:`niflow.validate`.
+
+        With no ``target_version`` the flow is also checked against the
+        declared compatibility baseline (``NIFLOW_MIN_NIFI_VERSION``, default
+        NiFi 1.24) — the oldest line it has to keep working on. Pass
+        ``target_version`` (e.g. ``"1.24"``) to check some other line instead,
+        or ``baseline=False`` to skip the cross-version check entirely. No
+        server required either way.
+        """
         from niflow.validate import validate_flow
 
-        return validate_flow(self)
+        return validate_flow(self, target_version, baseline=baseline)
 
     @classmethod
     def from_xml(cls, source: Any) -> "Flow":
@@ -453,6 +537,72 @@ class Flow(ProcessGroup):
 # Resolve the forward reference in ProcessGroup.process_groups.
 ProcessGroup.model_rebuild()
 Flow.model_rebuild()
+
+
+def find_unregistered_components(group: ProcessGroup) -> List[Tuple[str, str]]:
+    """Components that are *wired* into a flow but were never added to it.
+
+    Two hand-editing mistakes with the same ugly ending — a bare ``KeyError``
+    carrying a memory address, thrown from the middle of an emit, after the
+    push has already started:
+
+    * a :class:`ControllerService` used as a property value but never
+      ``add_controller_service``'d, so it has no identifier to reference;
+    * a connection whose source or destination was never added to its group,
+      so the endpoint points at a component the snapshot does not contain.
+
+    Registration is checked across the **whole tree**, not per group: NiFi
+    resolves a controller service from any ancestor group, and a connection
+    between groups is a separate (real) problem that
+    :func:`niflow.validate.validate_flow` reports on its own.
+
+    Returns ``(group_path, message)`` pairs, empty when everything is wired to
+    something the flow actually contains.
+    """
+    registered: set = set()
+    services: set = set()
+
+    def collect(g: ProcessGroup) -> None:
+        registered.add(id(g))
+        for member in (list(g.processors) + list(g.input_ports)
+                       + list(g.output_ports) + list(g.funnels)):
+            registered.add(id(member))
+        for service in g.controller_services:
+            registered.add(id(service))
+            services.add(id(service))
+        for child in g.process_groups:
+            collect(child)
+
+    collect(group)
+    problems: List[Tuple[str, str]] = []
+
+    def visit(g: ProcessGroup, path: str) -> None:
+        owners = [("processor", p) for p in g.processors]
+        owners += [("controller service", s) for s in g.controller_services]
+        for kind, owner in owners:
+            for key, value in (owner.properties or {}).items():
+                if isinstance(value, ControllerService) and id(value) not in services:
+                    problems.append((
+                        path,
+                        f"{kind} {owner.name!r} property {key!r} references "
+                        f"controller service {value.name!r}, which was never "
+                        f"added to the flow — add_controller_service() it "
+                        f"(in this group or an ancestor)",
+                    ))
+        for conn in g.connections:
+            for role, end in (("source", conn.source), ("destination", conn.target)):
+                if id(end) not in registered:
+                    problems.append((
+                        path,
+                        f"connection {role} {getattr(end, 'name', end)!r} is not "
+                        f"part of the flow — add it to a group before "
+                        f"connecting it",
+                    ))
+        for child in g.process_groups:
+            visit(child, f"{path}/{child.name}")
+
+    visit(group, group.name or ".")
+    return problems
 
 
 def find_identity_collisions(group: ProcessGroup) -> List[Tuple[str, str]]:

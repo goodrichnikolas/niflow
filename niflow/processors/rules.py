@@ -13,6 +13,7 @@ without write access) simply has no ``RELATIONSHIPS`` map, and lookups return
 """
 from __future__ import annotations
 
+import re
 from typing import Dict, List, Optional, Tuple
 
 
@@ -22,6 +23,30 @@ def _catalog_table(name: str):
     except Exception:  # pragma: no cover - catalog import should never fail
         return None
     return getattr(catalog, name, None) or None
+
+
+def _service_catalog_table(name: str):
+    """The same table from the generated *controller-service* catalog."""
+    try:
+        from niflow.services import catalog as service_catalog
+    except Exception:  # pragma: no cover - catalog import should never fail
+        return None
+    return getattr(service_catalog, name, None) or None
+
+
+def _typed_entry(name: str, type_str: str):
+    """A generated table's entry for *type_str*, processors or services.
+
+    Processor and controller-service FQCNs are disjoint, so a single lookup
+    across both catalogs is unambiguous — and it means every property helper
+    here works for services, which previously fell straight through to "not
+    harvested" and skipped the compat join entirely.
+    """
+    for getter in (_catalog_table, _service_catalog_table):
+        table = getter(name)
+        if table and type_str in table:
+            return table[type_str]
+    return None
 
 
 def _compat_table(name: str):
@@ -38,14 +63,184 @@ def _compat_table(name: str):
     return getattr(compat_v1, name, None) or None
 
 
-def relationships_for(type_str: str) -> Optional[List[str]]:
+def _compat_entry(name: str, type_str: str):
+    """A ``compat_v1`` table entry for *type_str*, processor or service.
+
+    Services live in the ``SERVICE_``-prefixed twins of each table.
+    """
+    for table_name in (name, f"SERVICE_{name}"):
+        table = _compat_table(table_name)
+        if table and type_str in table:
+            return table[type_str]
+    return None
+
+
+def harvested_on_v1(type_str: str) -> bool:
+    """Whether the 1.x compat harvest actually instantiated this type.
+
+    ``DESCRIPTORS``/``PROPERTY_NAMES`` only carry types that *have* properties,
+    so a type with none at all (``ForkEnrichment``, ``ExtractEmailAttachments``,
+    every lookup service) used to be indistinguishable from one the harvest
+    never saw — and "no data" makes every cross-version lookup degrade to
+    "unknown, don't translate". ``TYPES``/``SERVICE_TYPES`` record the harvest's
+    real reach, so "known to have nothing to translate" is now sayable.
+    Absent tables (a compat module generated before this) return False, which is
+    the old behaviour.
+    """
+    for table_name in ("TYPES", "SERVICE_TYPES"):
+        table = _compat_table(table_name)
+        if table and type_str in table:
+            return True
+    return False
+
+
+def _version_map_entry(type_str: str):
+    """This type's entry in the generated cross-version map, or ``None``.
+
+    ``None`` means "the map has nothing to say about this type" — it wasn't
+    harvested, or it exists on only one line. An empty dict means the opposite:
+    the type was compared on both lines and its property surface is identical.
+    That distinction is what lets callers tell "no differences" from "no data".
+    """
+    try:
+        from niflow import version_map
+    except Exception:
+        return None
+    for table in ("PROCESSOR_DIFF", "SERVICE_DIFF"):
+        diff = getattr(version_map, table, None) or {}
+        if type_str in diff:
+            return diff[type_str]
+    for table in ("PROCESSOR_TYPES_BOTH", "SERVICE_TYPES_BOTH"):
+        if type_str in (getattr(version_map, table, None) or frozenset()):
+            return {}
+    return None
+
+
+def _version_map_targets(major_version: int) -> bool:
+    """Whether the generated map's *old* line is the major version asked about.
+
+    The map is directional (harvested new-vs-old); using it to translate for a
+    target it wasn't built against would be worse than not using it at all.
+    """
+    try:
+        from niflow.version_map import VERSION_MAP_META
+    except Exception:
+        return False
+    old = str(VERSION_MAP_META.get("old_version", ""))
+    return old[:1].isdigit() and int(old.split(".", 1)[0]) == major_version
+
+
+def relationships_for(
+    type_str: str,
+    props: Optional[Dict[str, object]] = None,
+    major_version: Optional[int] = None,
+) -> Optional[List[str]]:
     """The relationship names for a processor type, or ``None`` if not harvested.
 
     A return of ``None`` means "unknown — fall back to a heuristic"; an empty
     list means "known to have no relationships".
+
+    Two things make a bare per-type set wrong, and both are answered here:
+
+    * **the line matters.** The catalog is harvested from 2.x; a 1.x server can
+      have a different set, and it is the server that refuses to start a
+      processor whose relationship is unhandled. Pass ``major_version=1`` to get
+      the 1.x set (``compat_v1.RELATIONSHIPS``) where one was harvested.
+    * **properties matter.** ``UpdateAttribute`` has no ``set state fail``
+      relationship until ``Store State`` is set to "Store state locally" — and
+      then NiFi will not start it until that relationship is handled, on a flow
+      ``validate`` called clean. Pass the processor's ``props`` to fold in the
+      harvested :data:`CONDITIONAL_RELATIONSHIPS` overrides.
     """
-    table = _catalog_table("RELATIONSHIPS")
+    table = None
+    if major_version == 1:
+        table = _compat_table("RELATIONSHIPS")
+    if table is None or type_str not in table:
+        table = _catalog_table("RELATIONSHIPS")
+    if not table or type_str not in table:
+        return None
+    base = list(table[type_str])
+    return _apply_conditional(type_str, base, props, major_version)
+
+
+def _apply_conditional(
+    type_str: str,
+    base: List[str],
+    props: Optional[Dict[str, object]],
+    major_version: Optional[int],
+) -> List[str]:
+    """Fold property-conditional relationship overrides into a base set.
+
+    Each harvested entry is the FULL relationship set while one property holds
+    one value, so an active override *replaces* the base set rather than adding
+    to it (``RouteOnAttribute``'s non-default routing strategies collapse the
+    dynamic relationships to matched/unmatched). Two active overrides are
+    unioned — the harvest probes one property at a time and cannot know how a
+    pair combines, and over-reporting a relationship the user must handle is
+    the safe direction.
+    """
+    conditional = conditional_relationships_for(type_str, major_version)
+    if not conditional or not props:
+        return base
+    props = canonical_properties(type_str, props)
+    descriptors = descriptors_for(type_str) or {}
+    active: List[List[str]] = []
+    for name, by_value in conditional.items():
+        value = props.get(name)
+        if value in (None, ""):
+            value = (descriptors.get(name) or {}).get("default")
+        if isinstance(value, str) and value in by_value:
+            active.append(list(by_value[value]))
+    if not active:
+        return base
+    out: List[str] = list(active[0])
+    for extra in active[1:]:
+        out += [rel for rel in extra if rel not in out]
+    return out
+
+
+def conditional_relationships_for(
+    type_str: str, major_version: Optional[int] = None
+) -> Optional[Dict[str, Dict[str, tuple]]]:
+    """``{property: {value: (relationships, ...)}}`` for a type, or ``None``.
+
+    Harvested by setting each small-enum property to each of its values and
+    reading the relationship list back (:func:`niflow.codegen._probe_relationships`),
+    on both NiFi lines.
+    """
+    table = None
+    if major_version == 1:
+        table = _compat_table("CONDITIONAL_RELATIONSHIPS")
+        if table is not None and type_str not in table:
+            # The 1.x harvest ran and had nothing to say about this type; only
+            # fall back to the 2.x table when there was no 1.x harvest at all.
+            return None if type_str in (_compat_table("TYPES") or ()) else (
+                _catalog_table("CONDITIONAL_RELATIONSHIPS") or {}).get(type_str)
+    if table is None:
+        table = _catalog_table("CONDITIONAL_RELATIONSHIPS")
     return table.get(type_str) if table else None
+
+
+def primary_node_only(type_str: str) -> bool:
+    """Whether NiFi pins this processor type to the primary node.
+
+    ``@PrimaryNodeOnly`` types (ListFTP, ListSFTP, ...) are created with
+    ``executionNode=PRIMARY`` whatever was asked for, and the server refuses
+    ``ALL``, so the model's ``ALL`` default is not drift for them. Harvested
+    from ``ProcessorDTO.executionNodeRestricted``, which both NiFi lines
+    report; an un-harvested catalog simply has no set and this returns False.
+
+    Both lines are consulted: the 1.24 harvest agrees with 2.7.2 on every type
+    the two share and adds three that only exist on 1.x (``ListHDFS``,
+    ``GetJMSTopic``, ``ListAzureBlobStorage``), so the union is exactly "pinned
+    on the line you are talking to" without needing to know which line that is.
+    """
+    for getter, name in ((_catalog_table, "PRIMARY_NODE_ONLY"),
+                         (_compat_table, "PRIMARY_NODE_ONLY")):
+        table = getter(name)
+        if table and type_str in table:
+            return True
+    return False
 
 
 def descriptors_for(type_str: str) -> Optional[Dict[str, dict]]:
@@ -55,19 +250,117 @@ def descriptors_for(type_str: str) -> Optional[Dict[str, dict]]:
     dependencies, display}`` (only the keys that apply). ``None`` means
     "unknown — don't check properties for this type".
     """
-    table = _catalog_table("DESCRIPTORS")
-    if table is None:
-        return None
-    return table.get(type_str)
+    return _typed_entry("DESCRIPTORS", type_str)
 
 
 def property_names_for(type_str: str) -> Optional[List[str]]:
     """All canonical property names for a type, or ``None`` if not harvested."""
-    table = _catalog_table("PROPERTY_NAMES")
-    if table is None:
-        return None
-    names = table.get(type_str)
+    names = _typed_entry("PROPERTY_NAMES", type_str)
     return list(names) if names is not None else None
+
+
+def descriptors_for_target(
+    type_str: str, major_version: Optional[int] = None
+) -> Dict[str, dict]:
+    """Property descriptors as the *target* NiFi line reports them.
+
+    :func:`descriptors_for` speaks the catalog's namespace (2.x). A 1.x server
+    materialises properties 2.x does not have at all (``QueryRecord``'s
+    ``cache-schema``, ``ConsumeJMS``'s ``Session Cache size``) and can give a
+    shared property a different default (``FetchGoogleDrive``'s
+    ``Google Spreadsheet Export Type`` defaults to ``text/csv`` on 1.24 and
+    ``application/pdf`` on 2.7.2). Judging those against the 2.x table reads the
+    effective default as ``None``, which is why the differ proposed unsetting a
+    1.x-only property on every plan, forever.
+
+    The 1.x table is re-keyed through the harvested renames first, so a property
+    that merely changed name is not mistaken for a 1.x-only one, and it wins for
+    the keys it covers — the live server is the one that gets to say what its
+    own defaults are.
+    """
+    base = dict(descriptors_for(type_str) or {})
+    base = _with_import_defaults(base, type_str, major_version)
+    if major_version != 1:
+        return base
+    v1 = _compat_entry("DESCRIPTORS", type_str)
+    if not v1:
+        return base
+    renames = property_renames_for(type_str) or {}
+    v1_by_canonical = {legacy: canonical for canonical, legacy in renames.items()}
+    for name, entry in v1.items():
+        base[v1_by_canonical.get(name, name)] = entry
+    return base
+
+
+def import_defaults_for(type_str: str, major_version: Optional[int]) -> Dict[str, str]:
+    """What *importing a flow* makes this line write onto a type, by property.
+
+    Distinct from a descriptor default and not predictable from one: creating a
+    ``JsonRecordSetWriter`` through the REST API on 2.7.2 gives
+    ``Allow Scientific Notation = 'false'`` exactly as its descriptor says, but
+    importing a flow snapshot that never mentions the property gives ``'true'``
+    (NiFi preserving what older flows did). Harvested through the real import
+    path by ``python -m niflow.codegen --import-defaults``; empty when that has
+    not been run for this line, which is the old behaviour.
+    """
+    if major_version is None:
+        return {}
+    try:
+        from niflow.import_defaults import IMPORT_DEFAULTS
+    except Exception:
+        return {}
+    return dict((IMPORT_DEFAULTS.get(major_version) or {}).get(type_str) or {})
+
+
+def import_created_properties(
+    type_str: str, major_version: Optional[int]
+) -> Dict[str, str]:
+    """``{property: service type}`` the import fills in for this type by itself."""
+    if major_version is None:
+        return {}
+    try:
+        from niflow.import_defaults import IMPORT_SERVICES
+    except Exception:
+        return {}
+    return dict((IMPORT_SERVICES.get(major_version) or {}).get(type_str) or {})
+
+
+def import_created_service_types(major_version: Optional[int]) -> set:
+    """Every controller-service type this NiFi line creates for itself on import."""
+    if major_version is None:
+        return set()
+    try:
+        from niflow.import_defaults import IMPORT_SERVICES
+    except Exception:
+        return set()
+    return {
+        service_type
+        for by_property in (IMPORT_SERVICES.get(major_version) or {}).values()
+        for service_type in by_property.values()
+    }
+
+
+def _with_import_defaults(
+    descriptors: Dict[str, dict], type_str: str, major_version: Optional[int]
+) -> Dict[str, dict]:
+    """Overlay the import defaults as *the* default for the keys they cover.
+
+    The server's own behaviour on import beats what its descriptors advertise:
+    a model that says nothing about the property will end up holding this
+    value, so this is what "unset" is worth on that line. Without it the differ
+    read the materialised value as drift and planned an unset on every run —
+    which, once the applier learned to really send removals, became a write
+    NiFi would immediately undo.
+    """
+    overlay = import_defaults_for(type_str, major_version)
+    if not overlay:
+        return descriptors
+    out = dict(descriptors)
+    for key, value in overlay.items():
+        entry = dict(out.get(key) or {})
+        entry["default"] = value
+        out[key] = entry
+    return out
 
 
 # Types whose *dynamic properties become relationships* (RouteOnAttribute's
@@ -91,13 +384,32 @@ DYNAMIC_RELATIONSHIP_TYPES: Dict[str, Optional[Dict[str, str]]] = {
 }
 
 
-def supports_dynamic_relationships(type_str: str) -> bool:
-    """Whether a type's dynamic properties can create relationships."""
-    return type_str in DYNAMIC_RELATIONSHIP_TYPES
+def supports_dynamic_relationships(
+    type_str: str, major_version: Optional[int] = None
+) -> bool:
+    """Whether a type's dynamic properties can create relationships.
+
+    Harvested now (``DYNAMIC_RELATIONSHIPS``, set by probing one dynamic
+    property and reading the relationship list back — which works on 1.x, whose
+    ``/flow/processor-definition`` endpoint does not exist). The curated
+    :data:`DYNAMIC_RELATIONSHIP_TYPES` stays as a floor so a stale or missing
+    catalog never *loses* a type: the probe can only fail to confirm one (it
+    does not confirm ``RouteHL7`` on 1.24, whose dynamic property must parse as
+    an HL7 query before it counts), never wrongly invent one.
+    """
+    if type_str in DYNAMIC_RELATIONSHIP_TYPES:
+        return True
+    for getter in ((_compat_table,) if major_version == 1 else ()) + (_catalog_table,):
+        table = getter("DYNAMIC_RELATIONSHIPS")
+        if table and type_str in table:
+            return True
+    return False
 
 
 def dynamic_relationships_for(
-    type_str: str, props: Dict[str, object]
+    type_str: str,
+    props: Dict[str, object],
+    major_version: Optional[int] = None,
 ) -> Optional[List[str]]:
     """Relationship names the processor's dynamic properties create, or ``None``.
 
@@ -108,10 +420,19 @@ def dynamic_relationships_for(
     to tell real properties from dynamic ones. A list (possibly empty) means
     per-property routing is active and exactly those names are relationships.
     """
-    if type_str not in DYNAMIC_RELATIONSHIP_TYPES:
+    if not supports_dynamic_relationships(type_str, major_version):
         return None
     props = canonical_properties(type_str, props or {})
-    gate = DYNAMIC_RELATIONSHIP_TYPES[type_str]
+    gate = DYNAMIC_RELATIONSHIP_TYPES.get(type_str)
+    if gate is None and type_str in DYNAMIC_RELATIONSHIP_TYPES:
+        pass  # curated as "always a relationship"
+    elif gate is None:
+        # Harvested type with no curated gate: a conditional override means the
+        # per-property routing has been switched off, exactly like the gate.
+        base = (_catalog_table("RELATIONSHIPS") or {}).get(type_str) or []
+        if sorted(_apply_conditional(type_str, list(base), props, major_version)) \
+                != sorted(base):
+            return None
     if gate is not None:
         value = props.get(gate["property"])
         if value in (None, ""):
@@ -146,6 +467,106 @@ LEGACY_PROPERTY_ALIASES = {
     "attributes-to-log-regex": "Attributes to Log Regular Expression",
     "attributes-to-ignore-regex": "Attributes to Ignore Regular Expression",
 }
+
+
+# Renames the automatic matcher deliberately refuses to guess, confirmed by
+# hand from the two descriptor harvests (see docs/version-compat.md, "Renames
+# recovered by hand").
+#
+# ``niflow.versiondiff.detect_renames`` pairs a leftover property to exactly
+# one counterpart on display name, then description, and only when the pairing
+# is 1:1 in both directions. That is the right default — a wrong pairing writes
+# a value onto the wrong property, which is worse than not translating — but it
+# leaves genuine renames sitting in the ``only_new``/``only_old`` buckets as
+# false alarms whenever key *and* display name *and* description all moved.
+#
+# Each entry below was accepted only on corroborating evidence: the same
+# allowable-value set, the same default, the same required-ness/sensitivity,
+# the same dependency on the same sibling property, the same ordinal position,
+# and a description that still says the same thing. Keyed exactly like the
+# generated map: ``{type: {new (2.x/catalog) key: old (1.x) key}}``.
+#
+# Both the generator (so the committed map, its counts and the report agree)
+# and :func:`property_renames_for` (so translation works even against a stale
+# or missing map) read this table — for controller services as well as
+# processors, which is where a silent inert dynamic property hurts most.
+CURATED_TYPE_RENAMES: Dict[str, Dict[str, str]] = {
+    # --- processors ---
+    # 2.x dropped the unit from the key; the unit itself did not change
+    # (both lines document seconds) and the defaults match.
+    "org.apache.nifi.processors.mqtt.ConsumeMQTT": {
+        "Connection Timeout": "Connection Timeout (seconds)",
+        "Keep Alive": "Keep Alive Interval (seconds)",
+    },
+    "org.apache.nifi.processors.mqtt.PublishMQTT": {
+        "Connection Timeout": "Connection Timeout (seconds)",
+        "Keep Alive": "Keep Alive Interval (seconds)",
+    },
+    # "The SQL select query to execute…" -> "The SQL query to execute…".
+    "org.apache.nifi.processors.standard.ExecuteSQL": {
+        "SQL Query": "SQL select query",
+    },
+    "org.apache.nifi.processors.standard.ExecuteSQLRecord": {
+        "SQL Query": "SQL select query",
+    },
+    # Identical allowable set (TRACE…NONE) and default (ERROR).
+    "org.apache.nifi.processors.standard.FetchFile": {
+        "Permission Denied Log Level": "Log level when permission denied",
+    },
+    # 2.x moved the "(between 1 and 50)" range out of the name and into the
+    # description; same default of 1.
+    "org.apache.nifi.processors.aws.dynamodb.DeleteDynamoDB": {
+        "Batch Items Per Request": "Batch items for each request (between 1 and 50)",
+    },
+    "org.apache.nifi.processors.aws.dynamodb.GetDynamoDB": {
+        "Batch Items Per Request": "Batch items for each request (between 1 and 50)",
+        "Json Document": "Json Document attribute",
+    },
+    "org.apache.nifi.processors.aws.dynamodb.PutDynamoDB": {
+        "Batch Items Per Request": "Batch items for each request (between 1 and 50)",
+        "Json Document": "Json Document attribute",
+    },
+    "org.apache.nifi.processors.aws.sns.PutSNS": {
+        "Amazon Resource Name": "Amazon Resource Name (ARN)",
+    },
+    # Pure kebab-case -> display-name key; identical descriptor otherwise.
+    "org.apache.nifi.processors.aws.kinesis.stream.PutKinesisStream": {
+        "Max Message Buffer Size": "max-message-buffer-size",
+    },
+    # Identical allowable set (usm-json-file-path / usm-json-content /
+    # usm-security-names) and the same dependants hang off it.
+    "org.apache.nifi.snmp.processors.ListenTrapSNMP": {
+        "USM Users Input Method": "snmp-usm-users-source",
+    },
+    # 1.x "Catalog Name"; 2.x renamed it and its description now reads "the
+    # name of the database (or the name of the catalog…)". Same slot.
+    "org.apache.nifi.processors.standard.PutDatabaseRecord": {
+        "Database Name": "put-db-record-catalog-name",
+    },
+    # The credential slot survived the rename even though the credential kind
+    # changed: Airtable deprecated API keys in favour of personal access
+    # tokens and both go in the same header.
+    "org.apache.nifi.processors.airtable.QueryAirtableTable": {
+        "Personal Access Token": "api-key",
+    },
+    # --- controller services ---
+    # 1.x display "Max Connection Lifetime", same default of -1. NOTE the 1.x
+    # description says milliseconds where 2.x says "lifetime of a connection"
+    # (a duration string) — the property is the same one, but check the value
+    # after translating. Recorded under "behavioural drift" in the report.
+    "org.apache.nifi.dbcp.DBCPConnectionPool": {
+        "Maximum Connection Lifetime": "dbcp-max-conn-lifetime",
+    },
+    # 1.x display "Storage Account Key"; same sensitive credential.
+    "org.apache.nifi.services.azure.storage.ADLSCredentialsControllerService": {
+        "Account Key": "storage-account-key",
+    },
+}
+
+
+def curated_renames_for(type_str: str) -> Dict[str, str]:
+    """Hand-confirmed ``{new key: old key}`` renames for one type (may be empty)."""
+    return dict(CURATED_TYPE_RENAMES.get(type_str) or {})
 
 
 def canonical_properties(type_str: str, props: Dict[str, object]) -> Dict[str, object]:
@@ -208,22 +629,39 @@ def canonical_properties(type_str: str, props: Dict[str, object]) -> Dict[str, o
 def property_renames_for(type_str: str) -> Optional[Dict[str, str]]:
     """Canonical (catalog) property name -> 1.x name, for renamed keys only.
 
-    NiFi 2.x renamed many property keys to their display names, which the 1.x
-    line still shows as ``displayName`` over the old key — so joining the
-    committed catalog against the harvested 1.x compatibility table on display
-    names (case-insensitively, and only where each side lacks the other's key)
-    recovers the rename without curating every one. The curated
-    ``LEGACY_PROPERTY_ALIASES`` fill in the few renames where the display name
-    itself changed. ``None`` means "no 1.x data for this type — don't
-    translate".
+    Prefers the generated cross-version map (:mod:`niflow.version_map`), which
+    was built by diffing full descriptor harvests of both lines and matches
+    renames on display name *and* description — so it catches pairs this
+    module's own join cannot, and it covers controller services as well as
+    processors. ``make version-map`` regenerates it.
+
+    Without that map (never generated, or built against a different old line)
+    this falls back to the original join: NiFi 2.x renamed many property keys
+    to their display names, which the 1.x line still shows as ``displayName``
+    over the old key, so joining the committed catalog against the harvested
+    1.x compatibility table on display names (case-insensitively, and only
+    where each side lacks the other's key) recovers the rename without curating
+    every one. The curated ``LEGACY_PROPERTY_ALIASES`` fill in the few renames
+    where the display name itself changed. ``None`` means "no 1.x data for this
+    type — don't translate".
     """
-    v1_names_table = _compat_table("PROPERTY_NAMES")
+    entry = _version_map_entry(type_str)
+    if entry is not None and _version_map_targets(1):
+        return _with_curated(type_str, dict(entry.get("renamed") or {}))
+
+    v1_names_raw = _compat_entry("PROPERTY_NAMES", type_str)
     names = property_names_for(type_str)
-    if v1_names_table is None or type_str not in v1_names_table or names is None:
+    if v1_names_raw is None or names is None:
+        # A type the 1.x harvest DID instantiate but which has no properties at
+        # all (``ForkEnrichment``, the lookup services) is fully known — there
+        # is simply nothing to rename. Saying "unknown" for those turned them
+        # into fake holes in the compat data.
+        if harvested_on_v1(type_str) and not (names or v1_names_raw):
+            return {}
         return None
     known = set(names)
-    v1_names = set(v1_names_table[type_str])
-    v1_descriptors = (_compat_table("DESCRIPTORS") or {}).get(type_str) or {}
+    v1_names = set(v1_names_raw)
+    v1_descriptors = _compat_entry("DESCRIPTORS", type_str) or {}
 
     display_map: Dict[str, List[str]] = {}
     for v1_name in v1_names - known:
@@ -238,6 +676,26 @@ def property_renames_for(type_str: str) -> Optional[Dict[str, str]]:
     for old, new in LEGACY_PROPERTY_ALIASES.items():
         if new in known and new not in v1_names and old in v1_names:
             renames.setdefault(new, old)
+    return _with_curated(type_str, renames)
+
+
+def _with_curated(type_str: str, renames: Dict[str, str]) -> Dict[str, str]:
+    """Fold the hand-confirmed renames into an automatically derived set.
+
+    Curated entries win: they were checked against the same two harvests by
+    hand, so where the automatic matcher landed the same new key somewhere
+    else it was guessing. Any other new key that pointed at the curated old
+    key is dropped rather than left to fight over it — two keys translating to
+    one would make the push order decide which value survives.
+    """
+    curated = CURATED_TYPE_RENAMES.get(type_str)
+    if not curated:
+        return renames
+    for new_key, old_key in curated.items():
+        for other_new, other_old in list(renames.items()):
+            if other_old == old_key and other_new != new_key:
+                del renames[other_new]
+        renames[new_key] = old_key
     return renames
 
 
@@ -256,22 +714,131 @@ def properties_for_target(
       explicit unset, so it neither creates an unsupported property nor leaves
       one behind from an earlier push — and is reported in the second element;
     * dynamic keys (in neither namespace) pass through untouched.
+
+    The "no counterpart" set comes from the generated version map when it
+    covers this target, and otherwise from the compat-table join.
     """
     if major_version != 1 or not props:
         return props, []
     renames = property_renames_for(type_str)
     if renames is None:
         return props, []
-    v1_names = set((_compat_table("PROPERTY_NAMES") or {}).get(type_str) or ())
-    known = set(property_names_for(type_str) or ())
+    unsupported_names = _unsupported_on_target(type_str, major_version)
+    if unsupported_names is None:
+        # Fall back to the join's view: a catalog key that is neither renamed
+        # nor present in the 1.x namespace has no counterpart.
+        v1_names = set(_compat_entry("PROPERTY_NAMES", type_str) or ())
+        known = set(property_names_for(type_str) or ())
+        unsupported_names = {
+            key for key in known
+            if key not in renames and key not in v1_names
+        }
     out: Dict[str, object] = {}
     unsupported: List[str] = []
     for key, value in props.items():
         target = renames.get(key, key)
         if target != key and target in props:
             target = key  # 1.x key set explicitly elsewhere — keep both as-is
-        if target not in v1_names and key in known:
+        if target == key and key in unsupported_names:
             unsupported.append(key)
             value = None
         out[target] = value
     return out, unsupported
+
+
+def _unsupported_on_target(type_str: str, major_version: int) -> Optional[set]:
+    """Catalog-namespace keys the target line does not have, from the map.
+
+    ``None`` means the map cannot answer (not generated, built against a
+    different old line, or this type was never compared) — callers fall back
+    to the compat-table join. An empty set means "compared, nothing missing",
+    which is a genuine answer and must not be confused with the former.
+    """
+    if not _version_map_targets(major_version):
+        return None
+    entry = _version_map_entry(type_str)
+    if entry is None:
+        return None
+    return set(entry.get("only_new") or ())
+
+
+_KEY_SEPARATORS = re.compile(r"[-_ ]+")
+
+
+def _normalised_key(key: str) -> str:
+    """A property key with case and ``-``/``_``/space separators removed.
+
+    Deliberately *not* ``.``: attribute-style dynamic keys (``mime.type`` on an
+    UpdateAttribute) are the user's own names and must never be mistaken for a
+    real property (``Mime Type``) they merely resemble.
+    """
+    return _KEY_SEPARATORS.sub("", key).lower()
+
+
+def near_miss_properties(type_str: str, props: Dict[str, object]) -> Dict[str, str]:
+    """``{key written: property it almost certainly means}`` for one component.
+
+    ``max-bin-age`` is not a MergeContent property on *either* line — both key
+    it ``Max Bin Age`` — so NiFi accepts it as a **dynamic** property, does
+    nothing with it, and marks the processor invalid ("'max-bin-age' ... is not
+    a supported property"). `niflow validate` passed it clean, which is how it
+    reached a work server; the same shape catches any key carried over from an
+    older NiFi, a hand-edit, or a doc that kebab-cased a display name.
+
+    A key qualifies only when it is a property of neither namespace (2.x
+    catalog or 1.x compat) and normalises onto *exactly one* real property of
+    the same type in both directions — so a genuine dynamic property, which
+    resembles nothing the type declares, is never flagged. Un-harvested types
+    answer ``{}``: nothing is known about them, and guessing there would be the
+    false positive that teaches people to ignore the check.
+    """
+    if not props:
+        return {}
+    catalog_names = set(property_names_for(type_str) or ())
+    v1_names = set(_compat_entry("PROPERTY_NAMES", type_str) or ())
+    known = catalog_names | v1_names
+    if not known:
+        return {}
+    by_norm: Dict[str, List[str]] = {}
+    for name in sorted(known):
+        by_norm.setdefault(_normalised_key(name), []).append(name)
+    written = [key for key in props if key not in known]
+    out: Dict[str, str] = {}
+    for key in written:
+        norm = _normalised_key(key)
+        candidates = by_norm.get(norm) or []
+        # Two names normalising the same way across the two namespaces are the
+        # same property under two spellings (2.x "Maximum Number of Bins" vs
+        # 1.x "Maximum number of Bins") — suggest the catalog's, which is what
+        # the flow should say. Two *within* one namespace would be genuine
+        # ambiguity, and nothing is suggested there.
+        preferred = [name for name in candidates if name in catalog_names] or candidates
+        # 1:1 the other way too — two keys in the flow normalising onto the
+        # same property means the flow, not the catalog, needs reading.
+        if len(preferred) == 1 and sum(
+                1 for other in written if _normalised_key(other) == norm) == 1:
+            out[key] = preferred[0]
+    return out
+
+
+def unsupported_properties(
+    type_str: str, props: Dict[str, object], major_version: int
+) -> List[str]:
+    """Which of *props* are real properties the target line does not have.
+
+    The read-only twin of :func:`properties_for_target` for callers that want
+    to *report* rather than translate (validate, doctor). Keys are canonicalized
+    first, so a flow written with display-name or legacy keys is judged on what
+    it actually means. Dynamic properties — keys in neither namespace — are the
+    user's own and are never flagged.
+    """
+    if not props:
+        return []
+    unsupported_names = _unsupported_on_target(type_str, major_version)
+    if unsupported_names is None:
+        _, unsupported = properties_for_target(
+            type_str, canonical_properties(type_str, props), major_version
+        )
+        return sorted(unsupported)
+    canonical = canonical_properties(type_str, props)
+    return sorted(set(canonical) & unsupported_names)

@@ -38,11 +38,32 @@ class FakeNiFi:
                 "source": {"id": "g1", "name": "Gen", "type": "PROCESSOR"},
                 "destination": {"id": "p1", "name": "Sink", "type": "PROCESSOR"},
             }})
+        if (method, path) == ("GET", "/connections/c3"):
+            return FakeResponse(200, {"component": {
+                "source": {"id": "g1", "name": "Gen", "type": "PROCESSOR"},
+                "destination": {"id": "p1", "name": "Sink", "type": "PROCESSOR"},
+                "selectedRelationships": ["failure"],
+            }})
         if (method, path) == ("GET", "/connections/c2"):
             return FakeResponse(200, {"component": {
                 "source": {"id": "g1", "name": "Gen", "type": "PROCESSOR"},
                 "destination": {"id": "f1", "name": "", "type": "FUNNEL"},
             }})
+
+        # --- port listing (start-point menu) for a two-level tree ---
+        if (method, path) == ("GET", "/flow/process-groups/11111111-1111-1111-1111-111111111111"):
+            return FakeResponse(200, {"processGroupFlow": {"flow": {
+                "inputPorts": [{"component": {"id": "in1", "name": "in",
+                                              "state": "STOPPED"}}],
+                "outputPorts": [{"component": {"id": "out1", "name": "out",
+                                               "state": "RUNNING"}}],
+                "processGroups": [{"component": {"id": "22222222-2222-2222-2222-222222222222", "name": "Stage"}}],
+            }}})
+        if (method, path) == ("GET", "/flow/process-groups/22222222-2222-2222-2222-222222222222"):
+            return FakeResponse(200, {"processGroupFlow": {"flow": {
+                "inputPorts": [{"component": {"id": "in2", "name": "in",
+                                              "state": "STOPPED"}}],
+            }}})
 
         # --- run-once plumbing for run_queue_endpoint_once ---
         if (method, path) == ("GET", "/processors/p1"):
@@ -115,3 +136,25 @@ def test_flowfile_events_since_fetches_only_new_events(client):
         {"name": "fresh", "before": None, "after": "x"},
     ]
     assert "pq-1" in client.session.deleted
+
+
+PG_TOP = "11111111-1111-1111-1111-111111111111"
+PG_CHILD = "22222222-2222-2222-2222-222222222222"
+
+
+def test_list_ports_walks_the_tree_and_tags_the_kind(client):
+    ports = client.list_ports(PG_TOP)
+    assert [(p["kind"], p["name"], p["path"]) for p in ports] == [
+        ("input_port", "in", ""),
+        ("output_port", "out", ""),
+        ("input_port", "in", "Stage"),   # same name, nested group
+    ]
+    # The port's own group id is what a deep link needs, not the walk's root.
+    assert [p["group_id"] for p in ports] == [PG_TOP, PG_TOP, PG_CHILD]
+
+
+def test_connection_relationships_names_a_fork_branch(client):
+    # CLONE/FORK events carry no relationship, so the stepper reads the
+    # connection the child landed in instead.
+    assert client.connection_relationships("c3") == ["failure"]
+    assert client.connection_relationships("c1") == []

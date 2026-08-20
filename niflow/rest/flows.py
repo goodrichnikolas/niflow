@@ -5,9 +5,10 @@ import json
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
-from xml.etree import ElementTree
 
-from niflow.core import Flow, find_identity_collisions
+from niflow.core import (
+    Flow, find_identity_collisions, find_unregistered_components,
+)
 from niflow.rest.common import (
     _POLL_INTERVAL_S,
     _POLL_TIMEOUT_S,
@@ -34,6 +35,104 @@ def _assert_identity_safe(flow: Flow) -> None:
             "pushing would silently merge or drop components, so nothing was "
             f"changed:\n{lines}"
         )
+    # Same contract, different mistake: a component that is wired but never
+    # added used to surface as a bare KeyError with a memory address, thrown
+    # from the middle of the emit — i.e. after teardown, on a push that had
+    # already started.
+    unregistered = find_unregistered_components(flow)
+    if unregistered:
+        lines = "\n".join(f"  - {where}: {message}" for where, message in unregistered)
+        raise ValueError(
+            "flow wires up components it does not contain, so the snapshot "
+            f"cannot be emitted; nothing was changed:\n{lines}"
+        )
+
+
+def _warn_baseline(flow: Flow, live_major: int, live_version: str) -> List[dict]:
+    """Warn when a flow breaks the declared baseline on a *different* line.
+
+    The baseline (``NIFLOW_MIN_NIFI_VERSION``, default 1.24) is the oldest NiFi
+    line the flows must keep working on. Pushing to a 2.x server is legitimate
+    and is never blocked by it — but a 2.x-only property is still a flow that
+    will not run at work, and mid-push is the cheapest moment to hear so.
+
+    Skipped when this server *is* the baseline line: ``_warn_cross_version``
+    already says it, and saying it twice trains the reader to skim.
+    """
+    from niflow.compat import baseline_issues, baseline_major, baseline_version
+
+    major = baseline_major()
+    if major is None or major == live_major:
+        return []
+    issues = baseline_issues(flow)
+    if not issues:
+        return []
+    logger.warning(
+        "%d issue(s) in %r against your compatibility baseline (NiFi %s): this "
+        "push to NiFi %s is fine, but the same flow would NOT work on the "
+        "baseline line",
+        len(issues), flow.name, baseline_version(), live_version,
+    )
+    for issue in issues:
+        logger.warning("  ! %s: %s", issue["component"], issue["message"])
+    logger.warning(
+        "  Full detail offline: niflow validate <flow.py>  (set "
+        "NIFLOW_MIN_NIFI_VERSION=none if you no longer target that line)"
+    )
+    return issues
+
+
+def _warn_untranslatable_types(flow: Flow, major: int, host: str = "") -> List[str]:
+    """Types this push cannot translate, because nothing was harvested.
+
+    Pushing to a 1.x server, ``properties_for_target`` returns identity for
+    a type ``compat_v1`` has never seen — "unknown, don't translate" — so
+    the properties go under their catalog (2.x) keys, 1.x files any it does
+    not recognise as inert dynamic properties, and the real ones run at
+    their defaults. Silently. That is the same failure the cross-version
+    work chased, in the one hole it cannot close by itself.
+
+    The stock catalogs no longer have such a hole (every type either has
+    1.x data or is known 2.x-only, in which case ``flow_issues`` already
+    says the push will fail). What still lands here is a **custom NAR** —
+    work's own processors, which no harvest of a stock container can know —
+    and a compat table generated before the type existed. Both are exactly
+    the case where a silent identity translation is worst, so say it.
+    """
+    if major != 1:
+        return []
+    from niflow.processors.rules import harvested_on_v1
+    from niflow.version_map import (
+        PROCESSOR_TYPES_ONLY_NEW, SERVICE_TYPES_ONLY_NEW,
+    )
+
+    known_only_new = set(PROCESSOR_TYPES_ONLY_NEW) | set(SERVICE_TYPES_ONLY_NEW)
+    blind: List[str] = []
+
+    def visit(group) -> None:
+        for component in list(group.processors) + list(group.controller_services):
+            type_str = component.type
+            if (type_str not in known_only_new
+                    and not harvested_on_v1(type_str)
+                    and type_str not in blind):
+                blind.append(type_str)
+        for child in group.process_groups:
+            visit(child)
+
+    visit(flow)
+    if not blind:
+        return []
+    logger.warning(
+        "%d type(s) in %r have no NiFi 1.x property data, so their "
+        "properties are being sent under their catalog keys untranslated: "
+        "%s", len(blind), flow.name, ", ".join(sorted(blind)),
+    )
+    logger.warning(
+        "  If this server runs them (a custom NAR, or a newer 1.x line), "
+        "harvest it once: NIFLOW_NIFI_HOST=%s make catalog-v1",
+        host,
+    )
+    return blind
 
 
 class FlowsMixin:
@@ -55,6 +154,9 @@ class FlowsMixin:
                 statuses = [
                     comp.get("validationStatus")
                     for _, _, comp in self.walk_processors(pg_id)
+                ] + [
+                    comp.get("validationStatus")
+                    for _, _, comp in self.walk_services(pg_id)
                 ]
                 if "VALIDATING" not in statuses or time.monotonic() > deadline:
                     break
@@ -79,6 +181,7 @@ class FlowsMixin:
         pg_id = self.resolve_group(group)
         snapshot = self.download_snapshot(pg_id)
         flow = from_json(snapshot)
+        self._overlay_run_state(pg_id, flow)
 
         entity = self._pg_entity(pg_id)
         parent_id = entity["component"].get("parentGroupId")
@@ -94,6 +197,79 @@ class FlowsMixin:
         for warning in flow.pull_warnings:
             logger.warning("Pull of %r is lossy: %s", flow.name, warning)
         return flow
+
+    def _overlay_run_state(self, pg_id: str, flow: Flow) -> None:
+        """Correct the run state that ``/download`` sanitises, in two calls.
+
+        ``GET /process-groups/{id}/download`` is a *flow definition*, not a
+        snapshot of the canvas: it reports every controller service as
+        ``DISABLED`` however live it is, and every processor as ``ENABLED``
+        however hard it is running (checked side by side against the live
+        endpoints on 1.24 and 2.7.2). Left alone that makes ``niflow pull``
+        write ``enabled=False`` for services that are enabled — a lie in the
+        checked-in code that review cannot catch — and makes a *stated*
+        ``enabled=True`` re-plan forever, because the live side can never agree.
+
+        Cost is two calls for the whole subtree, however deep it is:
+        ``/flow/process-groups/{id}/status?recursive=true`` carries every
+        processor's ``runStatus``, and the controller-service listing takes
+        ``includeDescendantGroups`` (both work on 1.x and 2.x). Best effort: if
+        either read is unavailable the model keeps the snapshot's values, which
+        is exactly where it was before.
+        """
+        from niflow.core import ProcessGroup
+
+        status = self._recursive_status(pg_id)
+        if status is None:
+            logger.debug("No recursive status for %s; run state left as downloaded", pg_id)
+            return
+
+        # Walk the status tree and the model together, by group name, so every
+        # group ends up paired with its live id.
+        group_ids: Dict[str, ProcessGroup] = {}
+
+        def visit(snapshot: dict, group: ProcessGroup) -> None:
+            group_ids[snapshot["id"]] = group
+            by_name = {p.name: p for p in group.processors}
+            for wrapper in snapshot.get("processorStatusSnapshots") or []:
+                live = wrapper.get("processorStatusSnapshot") or {}
+                processor = by_name.get(live.get("name"))
+                if processor is None:
+                    continue
+                run = (live.get("runStatus") or "").upper()
+                # Anything that is neither running nor disabled (Stopped,
+                # Validating, Invalid) is a processor that *may* run: ENABLED.
+                processor.scheduled_state = (
+                    "RUNNING" if run == "RUNNING"
+                    else "DISABLED" if run == "DISABLED" else "ENABLED"
+                )
+            children = {child.name: child for child in group.process_groups}
+            for wrapper in snapshot.get("processGroupStatusSnapshots") or []:
+                live = wrapper.get("processGroupStatusSnapshot") or {}
+                child = children.get(live.get("name"))
+                if child is not None:
+                    visit(live, child)
+
+        visit(status, flow)
+
+        try:
+            listing = self._get_json(
+                f"/flow/process-groups/{pg_id}/controller-services"
+                "?includeAncestorGroups=false&includeDescendantGroups=true"
+            )
+        except Exception as exc:  # permissions, or an older endpoint signature
+            logger.debug("Live controller-service state unavailable: %s", exc)
+            return
+        for entity in listing.get("controllerServices") or []:
+            component = entity.get("component") or {}
+            group = group_ids.get(component.get("parentGroupId"))
+            if group is None:
+                continue  # a service of an ancestor group, or a group we skipped
+            for service in group.controller_services:
+                if service.name == component.get("name"):
+                    # ENABLING counts as enabled: it is on its way up, and a
+                    # plan that proposes enabling it again would never settle.
+                    service.enabled = component.get("state") in ("ENABLED", "ENABLING")
 
     def _refresh_parameter_values(self, flow: Flow) -> None:
         try:
@@ -118,6 +294,52 @@ class FlowsMixin:
                 if lp and not param.sensitive and lp.get("value") is not None:
                     param.value = lp["value"]
 
+    def _warn_cross_version(self, flow: Flow) -> List[dict]:
+        """Log every incompatibility with the *live server's* NiFi line, loudly.
+
+        The emitter already drops unsupported keys one warning at a time while
+        it renders the snapshot, which is both late (mid-push) and easy to lose
+        in the log. This runs first, before any mutation, and says the whole
+        thing at once: which components set properties — or use types — that
+        cannot survive the crossing, and how to see the full list offline.
+
+        Also warns when the flow would not survive the declared compatibility
+        *baseline* (``NIFLOW_MIN_NIFI_VERSION``, default 1.24) even though this
+        particular server is a different line. Pushing 2.x-only properties to a
+        2.x server is legitimate and must not be blocked or made to look like an
+        error — but if the same flow has to run on 1.24 next week, this is the
+        moment it is cheapest to hear about it.
+
+        Never fatal, in either direction: a flow with cross-version problems
+        still pushes (NiFi accepts it; that is exactly the problem), so this
+        informs rather than blocks. ``niflow validate`` is the gate that fails —
+        it checks the baseline by default and exits non-zero.
+        """
+        from niflow.compat import flow_issues
+
+        try:
+            major = self._major_version()
+        except Exception:  # unreachable server is the caller's problem, not ours
+            return []
+        _warn_baseline(flow, major, self.version())
+        _warn_untranslatable_types(flow, major, getattr(self, "base", ""))
+        issues = flow_issues(flow, major)
+        if not issues:
+            return []
+        logger.warning(
+            "%d cross-version issue(s) pushing %r to NiFi %s: these properties "
+            "will NOT take effect on this server (NiFi stores an unknown key as "
+            "an inert dynamic property and runs the real one at its default)",
+            len(issues), flow.name, self.version(),
+        )
+        for issue in issues:
+            logger.warning("  ! %s: %s", issue["component"], issue["message"])
+        logger.warning(
+            "  See docs/version-compat.md, or check offline with: "
+            "niflow validate <flow.py> --target-version %s", self.version(),
+        )
+        return issues
+
     def push_flow(
         self,
         flow: Flow,
@@ -140,6 +362,7 @@ class FlowsMixin:
           version control). Simpler, and there's nothing to lose.
         """
         _assert_identity_safe(flow)
+        self._warn_cross_version(flow)
         parent_id = self.resolve_group(flow.parent_pg or "root")
 
         position = {"x": 0.0, "y": 0.0}
@@ -181,17 +404,26 @@ class FlowsMixin:
         # *desired* side is checked; a live group someone built with
         # duplicates still pulls and diffs (pairing them in listed order).
         _assert_identity_safe(flow)
+        self._warn_cross_version(flow)
         # Materialise auto-layout coordinates so planned adds carry positions.
         apply_layout(flow)
         parent_id = self.resolve_group(flow.parent_pg or "root")
         existing = [c for c in self._child_groups(parent_id) if c["name"] == flow.name]
         if not existing:
             live = Flow(name=flow.name)
-            return None, live, diff_flows(live, flow)
+            return None, live, diff_flows(live, flow, self._major_version())
         pg_id = existing[0]["id"]
         live = from_json(self.download_snapshot(pg_id))
+        # The download sanitises run state; without this a stated enabled=True
+        # would re-plan forever (see :meth:`_overlay_run_state`).
+        self._overlay_run_state(pg_id, live)
         live.nifi_id = pg_id
-        return pg_id, live, diff_flows(live, flow)
+        # The server itself says which line it is; plan.diff_flows only has to
+        # *infer* that (from 1.x-only property keys in the snapshot) for
+        # callers with no client, and a flow whose live side happens to carry
+        # no 1.x-only residue would otherwise be judged with the 2.x catalog
+        # alone — the diff-side half of the cross-version fix.
+        return pg_id, live, diff_flows(live, flow, self._major_version())
 
     def push_update(
         self,
@@ -286,21 +518,39 @@ class FlowsMixin:
     ) -> str:
         """Swap a versioned group's contents *without* deleting the group.
 
-        The vehicle that drops a flow's components (services + wiring) straight
-        *into* an existing group differs by line: NiFi 1.x uses templates
-        (removed in 2.x); NiFi 2.x uses copy/paste (``PUT .../paste``), which is
-        the supported template replacement. Either way the group id and its
-        ``versionControlInformation`` are preserved, so the push shows up as
-        *local changes* to review and commit.
+        Both lines follow the same three beats — emit the snapshot, pre-create
+        the group's own controller services and remap every reference to them
+        (:meth:`_stage_in_place_contents`), then hand the components to the
+        group — and differ only in that last transport step:
+
+        * **NiFi 2.x**: ``PUT /process-groups/{id}/paste`` (:meth:`_paste_into_group`).
+        * **NiFi 1.x**: import the snapshot as a temporary child group and
+          **move** its contents up with the snippet API
+          (:meth:`_move_snapshot_into_group`). 1.x snapshot import always
+          creates a *new* child group, which is why templates were used here
+          first; the snippet move is what turns that into an in-place inject,
+          and unlike a template it carries parameter references and
+          load-balance compression natively.
+
+        Either way the group id and its ``versionControlInformation`` are
+        preserved, so the push shows up as *local changes* to review and commit.
         """
         logger.info("In-place rebuild of versioned group %r (%s)", flow.name, pg_id)
+        on_1x = self._major_version() < 2
+        # Say what no in-place vehicle carries BEFORE emptying the group:
+        # afterwards the live flow is gone and the warning is too late to act on.
+        self._warn_in_place_limits(pg_id, flow)
         self._set_group_state(pg_id, "STOPPED")
         self._empty_queues(pg_id)
         self._empty_group_contents(pg_id)
-        if self._major_version() >= 2:
-            self._paste_into_group(pg_id, flow)
+        vehicle = "snippet move" if on_1x else "paste"
+        if on_1x:
+            self._move_snapshot_into_group(pg_id, flow)
         else:
-            self._instantiate_template(pg_id, flow)
+            self._paste_into_group(pg_id, flow)
+        # Neither vehicle is lossless (see :meth:`_reconcile_in_place`), so the
+        # rebuild always ends by diffing what landed against the model.
+        self._reconcile_in_place(pg_id, flow, vehicle)
         flow.nifi_id = pg_id
 
         self.apply_parameters(flow, secrets, env=env)
@@ -367,56 +617,164 @@ class FlowsMixin:
             },
         )
 
-    def _instantiate_template(self, pg_id: str, flow: Flow) -> None:
-        """Upload ``flow`` as a template and drop its contents into ``pg_id``.
+    # State that no in-place vehicle carries *by construction*, on either line:
+    # both the snippet move and paste inject the group's **contents**, and have
+    # no DTO for the group those contents land in. Everything else that a
+    # vehicle mangles is discovered (not declared) by :meth:`_reconcile_in_place`.
+    #
+    # Narrowed on 2026-08-19 when the 1.x vehicle became the snippet move:
+    # ``xml_format.template_limitations()`` also declared load-balance
+    # compression and parameter references, because 1.24 dropped the former and
+    # *escaped* ``#{`` in the latter while instantiating a template. The snippet
+    # move carries both natively (verified live on 1.24), so warning about them
+    # would now be crying wolf — templates keep the declaration for
+    # ``niflow convert``, the push no longer uses it.
+    _IN_PLACE_CANNOT_CARRY = (
+        ("parameter_context", "parameter-context binding to {value!r}"),
+        ("variables", "variables {value!r}"),
+        ("comment", "group comment {value!r}"),
+    )
 
-        NiFi 1.x only. The components land directly inside ``pg_id`` (no extra
-        nesting), services and connections included. The temporary template is
-        deleted afterwards so it doesn't linger in the template registry.
+    def _in_place_limitations(self, pg_id: str, flow: Flow) -> List[dict]:
+        """The target group's own settings that this push has to *change*.
+
+        Only the ones that actually differ from the live group: the vehicle
+        never carries any of the three, but the group keeps whatever it already
+        had (emptying its contents leaves its own settings alone), so declaring
+        a setting that is already correct would be crying wolf.
         """
-        # Templates are instance-global and keyed by name, so an earlier
-        # interrupted push can leave one behind and 409 the upload (and even
-        # block deleting the group). Clear any same-named template first.
-        self._delete_templates_named(flow.name)
-        # NiFi 1.x returns the template-upload result as XML (a <templateEntity>),
-        # not JSON — parse the id out of it rather than calling .json().
-        upload = self._request(
-            "POST",
-            f"/process-groups/{pg_id}/templates/upload",
-            files={"template": (f"{flow.name}.xml", flow.to_xml(), "application/xml")},
+        live = self.download_snapshot(pg_id).get("flowContents") or {}
+        desired = {
+            "parameter_context": (
+                flow.parameter_context.name if flow.parameter_context else None
+            ),
+            "variables": flow.variables or None,
+            "comment": flow.comment or None,
+        }
+        current = {
+            "parameter_context": live.get("parameterContextName"),
+            "variables": live.get("variables") or None,
+            "comment": live.get("comments") or None,
+        }
+        out: List[dict] = []
+        for key, message in self._IN_PLACE_CANNOT_CARRY:
+            value = desired[key]
+            if value and value != current[key]:
+                out.append({
+                    "where": flow.name or ".",
+                    "message": message.format(value=value),
+                    "repair": "applied over the REST API once the contents land",
+                })
+        return out
+
+    def _warn_in_place_limits(self, pg_id: str, flow: Flow) -> List[dict]:
+        """Say what the in-place vehicle cannot carry — before anything moves.
+
+        The in-place rebuild empties the live group first, so a warning issued
+        afterwards is a post-mortem. This runs while the flow is still intact
+        and names every item plus the repair that follows (see
+        :meth:`_reconcile_in_place`). Not fatal: everything listed *is* applied
+        over the REST API afterwards, and refusing the push would leave the
+        user with no way to move a versioned flow at all.
+        """
+        limits = self._in_place_limitations(pg_id, flow)
+        if not limits:
+            return limits
+        logger.warning(
+            "%d setting(s) of the group %r itself cannot travel with its "
+            "contents; each is applied over the REST API afterwards:",
+            len(limits), flow.name,
         )
-        template_id = ElementTree.fromstring(upload.text).findtext("template/id")
-        try:
-            self._request(
-                "POST",
-                f"/process-groups/{pg_id}/template-instance",
-                json={
-                    "templateId": template_id,
-                    "originX": 0.0,
-                    "originY": 0.0,
-                    "disconnectedNodeAcknowledged": False,
-                },
+        for item in limits:
+            logger.warning("  ! %s: %s (%s)", item["where"], item["message"], item["repair"])
+        return limits
+
+    # What an in-place vehicle is allowed to have got wrong, and which NiFi
+    # behaviour makes the repair necessary:
+    #   group_settings     — neither vehicle has a DTO for the *target* group,
+    #                        so its own binding/variables/comment are re-applied
+    #                        (2.x paste also drops a *child* group's binding)
+    #   connection         — reserved: the 1.x template vehicle dropped
+    #                        load-balance compression; the snippet move carries it
+    #   processor/service  — 2.x paste lands every processor ENABLED, losing
+    #                        DISABLED (the 1.x template vehicle also ESCAPED
+    #                        ``#{p}`` into ``##{p}``; the snippet move does not)
+    _IN_PLACE_REPAIR_KINDS = (
+        "group_settings", "connection", "processor", "controller_service",
+    )
+
+    def _reconcile_in_place(self, pg_id: str, flow: Flow, vehicle: str) -> List[Any]:
+        """Put back the state the in-place vehicle mangled or dropped.
+
+        Neither vehicle round-trips a flow exactly: 1.x templates and 2.x paste
+        each lose a different slice (see :data:`_IN_PLACE_REPAIR_KINDS`). Rather
+        than hand-code each repair, diff the live group against the model and
+        re-apply the residue with the same incremental applier
+        ``push --update`` uses — one change at a time, so a single change the
+        server rejects can't strand the rest.
+
+        Only *updates* are repaired; a missing or extra component would mean the
+        emitter itself lost something, which is a bug to report rather than to
+        paper over.
+        """
+        from niflow.apply import PlanApplier
+        from niflow.formats.json_format import from_json
+        from niflow.plan import diff_flows
+
+        self.ensure_parameter_contexts(flow)
+        live = from_json(self.download_snapshot(pg_id))
+        live.nifi_id = pg_id
+        changes = diff_flows(live, flow, self._major_version())
+        repairable = [
+            c for c in changes
+            if c.op == "update" and c.kind in self._IN_PLACE_REPAIR_KINDS
+        ]
+        if repairable:
+            logger.info(
+                "In-place %s left %d difference(s); restoring them",
+                vehicle, len(repairable),
             )
-        finally:
-            self._request("DELETE", f"/templates/{template_id}")
+            applier = PlanApplier(self, pg_id, live, flow)
+            for change in repairable:
+                try:
+                    applier.apply([change])
+                except Exception as exc:  # the contents are already in place
+                    logger.warning(
+                        "Could not restore %s %s %s: %s — %s; run 'niflow push "
+                        "--update' to finish the job",
+                        change.op, change.kind, change.location, change.name, exc,
+                    )
+        repaired = {id(c) for c in repairable}
+        for change in changes:
+            if id(change) in repaired:
+                continue
+            logger.warning(
+                "In-place push left a difference the %s could not carry: "
+                "%s %s %s: %s",
+                vehicle, change.op, change.kind, change.location, change.name,
+            )
+        return changes
 
-    def _delete_templates_named(self, name: str) -> None:
-        """Delete every instance-global template whose name is ``name`` (1.x)."""
-        templates = self._get_json("/flow/templates").get("templates", [])
-        for entity in templates:
-            if entity.get("template", {}).get("name") == name:
-                self._request("DELETE", f"/templates/{entity['id']}")
+    # Name of the throwaway child group the 1.x snippet move imports into.
+    # Fixed (not random) so an interrupted push leaves a *findable* group
+    # rather than anonymous debris — see :meth:`_move_snapshot_into_group`.
+    _STAGING_GROUP_NAME = "niflow-in-place-staging"
 
-    def _paste_into_group(self, pg_id: str, flow: Flow) -> None:
-        """Inject ``flow``'s components into ``pg_id`` via NiFi 2.x copy/paste.
+    def _stage_in_place_contents(
+        self, pg_id: str, flow: Flow
+    ) -> Tuple[dict, dict, Dict[str, dict]]:
+        """Emit ``flow`` and pre-create ``pg_id``'s own controller services.
 
-        Paste (``PUT /process-groups/{id}/paste``) is the 2.x replacement for
-        templates, but it carries only *references* to a group's own controller
-        services, not their definitions. So we recreate the group-level services
-        first, remap every reference (processor properties and inter-service
-        properties) to the new ids, and hand paste those ids as
-        ``externalControllerServiceReferences`` so it wires them back up.
-        Components nested in child groups bring their own services along.
+        Shared by both in-place vehicles, because both have the same hole: a
+        group's *own* controller services travel as references, never as
+        definitions (2.x paste has no field for them; a 1.x snippet move is
+        refused outright — *"references a service that is not available in the
+        destination Process Group"*). So the services are created on the target
+        group first, every reference to them is remapped to the new ids, and
+        the definitions are dropped from the payload. Services owned by nested
+        groups travel inside those groups and are left alone.
+
+        Returns ``(snapshot, contents, externalControllerServiceReferences)``.
         """
         snapshot = json.loads(flow.to_json(target_major=self._major_version()))
         self._align_bundles(snapshot)
@@ -426,6 +784,121 @@ class FlowsMixin:
             pg_id, contents.get("controllerServices") or []
         )
         self._remap_service_refs(contents, id_map)
+        contents["controllerServices"] = []
+        return snapshot, contents, ext_refs
+
+    def _move_snapshot_into_group(self, pg_id: str, flow: Flow) -> None:
+        """Inject ``flow``'s components into ``pg_id`` via the NiFi 1.x snippet API.
+
+        NiFi 1.x has no paste and (from niflow's side) no lossless template:
+        1.24 drops load-balance compression and *escapes* every ``#{`` while
+        instantiating one, so parameter references land dead. What it does have
+        is snapshot import plus snippets. Import always creates a **new child
+        group**, so:
+
+        1. import the snapshot as a temporary child of ``pg_id`` — its
+           processors already reference the services pre-created on ``pg_id``,
+           which are in scope from a child group;
+        2. ``POST /snippets`` over everything the temp group holds;
+        3. ``PUT /snippets/{id}`` with ``parentGroupId`` = ``pg_id`` — one
+           server-side move, no re-serialisation, so property values (parameter
+           references included) are byte-identical to the snapshot;
+        4. delete the now-empty temp group.
+
+        The temp group is removed on **every** exit path: a group left on the
+        canvas is its own bug, and half-moved contents inside it are invisible
+        to ``niflow plan``. If any step fails the caller is told that the
+        versioned group is empty and how to restore it.
+        """
+        snapshot, contents, _ext_refs = self._stage_in_place_contents(pg_id, flow)
+
+        # An earlier interrupted push can only have left a staging group inside
+        # pg_id, which _empty_group_contents has just torn down — but never
+        # import on top of one, or the move would carry a stranger's components.
+        for child in self._child_groups(pg_id):
+            if child["name"] == self._STAGING_GROUP_NAME:
+                logger.warning("Removing a staging group left by an earlier push")
+                self._teardown(child["id"])
+
+        temp_id = self._create_from_snapshot(
+            pg_id, self._STAGING_GROUP_NAME, snapshot, {"x": 0.0, "y": 0.0}
+        )
+        try:
+            snippet_id = self._snippet_over_group(temp_id)
+            self._request(
+                "PUT",
+                f"/snippets/{snippet_id}",
+                json={
+                    "snippet": {"id": snippet_id, "parentGroupId": pg_id},
+                    "disconnectedNodeAcknowledged": False,
+                },
+            )
+        except Exception as exc:
+            self._discard_staging_group(temp_id)
+            raise RuntimeError(
+                f"In-place push of {flow.name!r} ({pg_id}) failed while moving "
+                f"the new contents into the group: {exc}. The staging group was "
+                f"removed, so nothing is left on the canvas — but the versioned "
+                f"group is now EMPTY and still linked to its registry flow. "
+                f"Restore it with 'niflow rollback {flow.name}' (the pre-push "
+                f"backup), or re-run the push."
+            ) from exc
+        self._discard_staging_group(temp_id)
+
+    def _snippet_over_group(self, pg_id: str) -> str:
+        """Define a snippet covering everything ``pg_id`` currently holds (1.x).
+
+        A snippet is a set of component ids plus each one's current revision;
+        ``PUT /snippets/{id}`` with a different ``parentGroupId`` then moves
+        exactly that set. Controller services are deliberately absent — the
+        target group's own services were pre-created by
+        :meth:`_stage_in_place_contents`, and nested groups carry theirs inside.
+        """
+        flow = self._get_json(f"/flow/process-groups/{pg_id}")["processGroupFlow"]["flow"]
+        snippet: Dict[str, Any] = {"parentGroupId": pg_id}
+        for key in (
+            "processors", "connections", "inputPorts", "outputPorts",
+            "funnels", "labels", "processGroups", "remoteProcessGroups",
+        ):
+            entities = flow.get(key) or []
+            if entities:
+                snippet[key] = {
+                    entity["id"]: {
+                        "clientId": "niflow",
+                        "version": entity["revision"]["version"],
+                    }
+                    for entity in entities
+                }
+        created = self._request("POST", "/snippets", json={"snippet": snippet}).json()
+        return created["snippet"]["id"]
+
+    def _discard_staging_group(self, temp_id: str) -> None:
+        """Delete the staging group, whether it is empty or still holds a flow.
+
+        Never raises: this runs on the failure path too, where an exception
+        would replace the *real* error with a cleanup one. A staging group that
+        somehow survives is reported loudly, with its id, so it can be deleted
+        by hand.
+        """
+        try:
+            self._teardown(temp_id)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.error(
+                "Could not delete the in-place staging group %s: %s — delete it "
+                "by hand (it is a child of the group that was just pushed)",
+                temp_id, exc,
+            )
+
+    def _paste_into_group(self, pg_id: str, flow: Flow) -> None:
+        """Inject ``flow``'s components into ``pg_id`` via NiFi 2.x copy/paste.
+
+        Paste (``PUT /process-groups/{id}/paste``) is the 2.x replacement for
+        templates. It carries only *references* to a group's own controller
+        services, so :meth:`_stage_in_place_contents` pre-creates them and
+        remaps the references first; paste gets those ids as
+        ``externalControllerServiceReferences`` and wires them back up.
+        """
+        _snapshot, contents, ext_refs = self._stage_in_place_contents(pg_id, flow)
 
         copy_response = {
             key: contents.get(key) or []
@@ -485,13 +958,16 @@ class FlowsMixin:
         return id_map, ext_refs
 
     def _remap_service_refs(self, group: dict, id_map: Dict[str, str]) -> None:
-        """Rewrite processor service-ref property values (versioned id -> new id),
-        recursing into child groups. Only values matching a recreated group-level
-        service are touched; services owned by nested groups are left for paste."""
+        """Rewrite service-ref property values (versioned id -> new id) across the
+        tree. Only values matching a recreated group-level service are touched;
+        services owned by nested groups keep their own identifiers, but a nested
+        component may still *reference* a parent-group service, so child groups
+        are swept too (their own services included)."""
         if not id_map:
             return
-        for proc in group.get("processors") or []:
-            props = proc.get("properties")
+        components = (group.get("processors") or []) + (group.get("controllerServices") or [])
+        for component in components:
+            props = component.get("properties")
             if not props:
                 continue
             for key, value in list(props.items()):

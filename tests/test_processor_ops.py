@@ -74,6 +74,19 @@ class FakeNiFi:
                 ],
                 "processGroups": [_group("grand-id", "Grand")],
             }}})
+        # Controller services live behind their own endpoint, one call per
+        # group — an invalid service is the commonest reason a flow sits idle.
+        if method == "GET" and path.endswith("/controller-services"):
+            pg_id = path.split("/")[3]
+            services = {
+                "child-id": [{"component": {
+                    "id": "svc-1", "name": "Pool", "parentGroupId": "child-id",
+                    "validationStatus": "INVALID",
+                    "validationErrors": ["'Database Connection URL' is invalid: required"],
+                }}],
+            }
+            return FakeResponse(200, {"controllerServices": services.get(pg_id, [])})
+
         if (method, path) == ("GET", "/flow/process-groups/grand-id"):
             return FakeResponse(200, {"processGroupFlow": {"id": "grand-id", "flow": {
                 "processors": [_proc("g3", "Gen3", GEN, "STOPPED")],
@@ -174,13 +187,27 @@ def test_quiesce_group_stops_disables_then_drains_in_order(client):
 
 def test_validation_errors_lists_invalid_processors_with_paths(client):
     invalid = client.validation_errors()
-    assert invalid == [{
-        "id": "p1",
-        "name": "Sink",
-        "path": "Child",
-        "group_id": "child-id",
-        "errors": ["'Directory' is invalid: required"],
-    }]
+    assert invalid == [
+        {
+            "id": "p1",
+            "name": "Sink",
+            "path": "Child",
+            "group_id": "child-id",
+            "kind": "processor",
+            "errors": ["'Directory' is invalid: required"],
+        },
+        # A controller service that cannot start is the commonest reason a
+        # whole flow sits idle, and it used to be missing from this list
+        # entirely — invisible to the Errors panel and to validate --live.
+        {
+            "id": "svc-1",
+            "name": "Pool",
+            "path": "Child",
+            "group_id": "child-id",
+            "kind": "controller_service",
+            "errors": ["'Database Connection URL' is invalid: required"],
+        },
+    ]
 
 
 def test_bulletins_flatten_newest_first_and_skip_unreadable(client):

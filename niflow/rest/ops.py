@@ -115,26 +115,33 @@ class OpsMixin:
         return moved
 
     def explain_status(self, group: str = "root",
-                       docs_dir: str = "docs/explanations") -> dict:
+                       docs_dir: str = "docs/explanations",
+                       depth: int = 1) -> dict:
         """Is the group's plain-English doc missing, current, or outdated?
 
+        Also costs out a generate at ``depth`` (documents and LLM calls).
         See :mod:`niflow.explain`; no LLM needed for the check itself.
         """
         from niflow.explain import explanation_status
 
-        return explanation_status(self, group, docs_dir=docs_dir)
+        return explanation_status(self, group, docs_dir=docs_dir, depth=depth)
 
     def explain_group(self, group: str = "root",
                       docs_dir: str = "docs/explanations",
-                      recurse: bool = True, force: bool = False) -> List[dict]:
-        """Write plain-English walkthrough docs for a live group's subtree.
+                      depth: int = 1, force: bool = False,
+                      confirm=None) -> List[dict]:
+        """Write plain-English walkthrough docs for a live group.
 
+        ``depth`` levels get their own document (1 = just this group, its
+        nested groups summarised in one line each; 0 = the whole subtree).
+        ``confirm(plan)`` gets the document/LLM-call counts before anything
+        is written and can abort by returning ``False`` (then: no results).
         See :mod:`niflow.explain`; needs an LLM (``NIFLOW_LLM_URL``).
         """
         from niflow.explain import explain_group
 
         return explain_group(self, group, docs_dir=docs_dir,
-                             recurse=recurse, force=force)
+                             depth=depth, force=force, confirm=confirm)
 
     def backup_group(self, group: str, name: Optional[str] = None) -> Path:
         """Snapshot a live group to ``.niflow-backups/`` (see :mod:`niflow.backup`).

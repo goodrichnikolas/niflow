@@ -837,6 +837,15 @@ class InspectorWindow(QMainWindow):
         self.resize(1100, 640)
 
         self.refresh_button = QPushButton("⟳ Refresh queues & sinks")
+        # Per-queue purge: the web GUI's Queues tab has the same pair of
+        # buttons (this one, plus a flow-wide purge on the main window).
+        self.purge_button = QPushButton("Purge queue")
+        self.purge_button.setToolTip(
+            "Drop every FlowFile queued in the selected queue (irreversible)"
+        )
+        self.purge_button.setStyleSheet("color:#b42318")
+        self.purge_button.setEnabled(False)
+        self._selected_queue = None
         self.auto_refresh = QCheckBox("Auto-refresh (2s)")
         self.auto_refresh.setToolTip(
             "Re-list queues and sinks every 2 seconds while debugging a running flow"
@@ -871,6 +880,7 @@ class InspectorWindow(QMainWindow):
 
         top_row = QHBoxLayout()
         top_row.addWidget(self.refresh_button, stretch=1)
+        top_row.addWidget(self.purge_button)
         top_row.addWidget(self.auto_refresh)
         column = QVBoxLayout()
         column.addLayout(top_row)
@@ -881,6 +891,7 @@ class InspectorWindow(QMainWindow):
         self.setCentralWidget(container)
 
         self.refresh_button.clicked.connect(self.refresh)
+        self.purge_button.clicked.connect(self.purge_selected_queue)
         self.sources.itemClicked.connect(self._open_source)
         self.items.itemClicked.connect(self._show_item)
         self.runner.busy_changed.connect(
@@ -903,6 +914,8 @@ class InspectorWindow(QMainWindow):
         # Only show queues that actually hold FlowFiles — empty ones just clog
         # the list. (Sinks always show; they're the end-of-line check.)
         queues = [q for q in queues if q.get("queued")]
+        self._selected_queue = None
+        self.purge_button.setEnabled(False)
         self.sources.clear()
         self.items.clear()
         for q in queues:
@@ -922,6 +935,9 @@ class InspectorWindow(QMainWindow):
         data = item.data(_ROLE)
         self.items.clear()
         self._clear_detail()
+        # Purge applies to queues only — sinks have no queue to drop.
+        self._selected_queue = data if data["kind"] == "queue" else None
+        self.purge_button.setEnabled(self._selected_queue is not None)
         if data["kind"] == "queue":
             self.status.setText("Listing FlowFiles…")
             self.runner.submit(
@@ -936,6 +952,31 @@ class InspectorWindow(QMainWindow):
                 lambda events: self._populate_items(data, events, kind="event"),
                 self._fail,
             )
+
+    def purge_selected_queue(self) -> None:
+        """Drop the selected queue's FlowFiles, after a confirmation."""
+        queue = getattr(self, "_selected_queue", None)
+        if not queue:
+            return
+        label = f"{queue.get('source') or '?'} → {queue.get('destination') or '?'}"
+        if QMessageBox.question(
+            self, "Purge queue",
+            f"Drop every FlowFile queued in {label}?\n\nThis cannot be undone.",
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        self.status.setText(f"Purging {label}…")
+        self.runner.submit(
+            lambda: self.client.drain_connection(queue["id"]),
+            lambda dropped: self._purged(label, dropped),
+            self._fail,
+        )
+
+    def _purged(self, label: str, dropped: str) -> None:
+        self.status.setText(
+            f"✓ Purged {label} ({dropped} dropped)." if dropped
+            else f"✓ Purged {label}."
+        )
+        self.refresh()
 
     def _populate_items(self, source: dict, rows: list, kind: str) -> None:
         self.items.clear()

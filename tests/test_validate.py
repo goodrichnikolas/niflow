@@ -16,8 +16,11 @@ def _proc(name, type=UNKNOWN):
 def known_relationships(monkeypatch):
     """Pretend the catalog harvested relationships for type 'Known'."""
     table = {"Known": ["success", "failure"]}
+    # validate now asks for the set on a specific NiFi line, and for the
+    # property values actually set (relationships can be conditional).
     monkeypatch.setattr(
-        "niflow.validate.relationships_for", lambda t: table.get(t)
+        "niflow.validate.relationships_for",
+        lambda t, props=None, major_version=None: table.get(t),
     )
 
 
@@ -32,7 +35,8 @@ def known_descriptors(monkeypatch):
             {"property": "Compression", "values": ["gzip"]}]},
     }}
     # All 'Known' processors have their relationships handled in these tests.
-    monkeypatch.setattr("niflow.validate.relationships_for", lambda t: None)
+    monkeypatch.setattr("niflow.validate.relationships_for",
+                        lambda t, props=None, major_version=None: None)
     monkeypatch.setattr("niflow.validate.descriptors_for", lambda t: table.get(t))
 
 
@@ -331,3 +335,174 @@ def test_primary_node_incoming_from_funnel_counts():
     flow.add_connection(gen >> fun, fun >> audit)
     assert any("PRIMARY" in i["message"] and i["component"] == "f/Audit"
                for i in validate_flow(flow))
+
+
+# --- keys that will silently become dynamic properties -----------------------
+
+MERGE = "org.apache.nifi.processors.standard.MergeContent"
+
+
+def _merge(properties):
+    return Processor(name="Merge", type=MERGE, properties=properties,
+                     auto_terminate=["merged", "original", "failure"])
+
+
+def test_kebab_cased_key_that_is_no_property_on_either_line_is_flagged():
+    """The `max-bin-age` repro: valid-looking, inert on the server.
+
+    Both 2.7.2 and 1.24 key it `Max Bin Age`, so NiFi files the written key
+    under dynamic properties, does nothing with it, and marks the processor
+    invalid — after the push, on the server.
+    """
+    flow = Flow("F")
+    flow.add(_merge({"max-bin-age": "10 sec"}))
+    messages = [i["message"] for i in validate_flow(flow)]
+    assert any("'max-bin-age'" in m and "'Max Bin Age'" in m for m in messages)
+
+
+def test_the_real_key_passes():
+    flow = Flow("F")
+    flow.add(_merge({"Max Bin Age": "10 sec"}))
+    assert validate_flow(flow) == []
+
+
+def test_the_1x_spelling_of_a_renamed_property_passes():
+    """`Header File` is 1.24's name for 2.x's `Header` — a real property, not a typo."""
+    flow = Flow("F")
+    flow.add(_merge({"Header File": "/tmp/h"}))
+    assert validate_flow(flow) == []
+
+
+def test_a_genuine_dynamic_property_is_not_flagged():
+    flow = Flow("F")
+    flow.add(_merge({"my.own.attribute": "x"}))
+    assert validate_flow(flow) == []
+
+
+def test_two_spellings_of_one_property_are_left_to_the_reader():
+    """Ambiguity gets no guess — the flow, not the catalog, needs reading."""
+    flow = Flow("F")
+    flow.add(_merge({"max-bin-age": "10 sec", "max_bin_age": "20 sec"}))
+    assert validate_flow(flow) == []
+
+
+def test_unharvested_types_are_never_guessed_at():
+    flow = Flow("F")
+    flow.add(Processor(name="X", type=UNKNOWN, properties={"any-key": "1"},
+                       auto_terminate=["success"]))
+    messages = [i["message"] for i in validate_flow(flow)]
+    assert not any("did you mean" in m for m in messages)
+
+
+def test_controller_service_properties_are_validated_too():
+    from niflow.core import ControllerService
+
+    flow = Flow("F")
+    flow.add(ControllerService(
+        name="Pool", type="org.apache.nifi.dbcp.DBCPConnectionPool",
+        properties={"database-connection-url": "jdbc:h2:mem:x"}))
+    messages = [i["message"] for i in validate_flow(flow)]
+    assert any("did you mean" in m for m in messages), messages
+
+
+# --- wired but never added ---------------------------------------------------
+
+def test_a_service_used_as_a_property_but_never_added_is_flagged():
+    from niflow.core import ControllerService
+
+    flow = Flow("F")
+    reader = ControllerService(name="Reader", type="org.x.Reader")
+    flow.add(Processor(name="Q", type=UNKNOWN, properties={"Record Reader": reader},
+                       auto_terminate=["success"]))
+    messages = [i["message"] for i in validate_flow(flow)]
+    assert any("never added to the flow" in m and "'Reader'" in m for m in messages)
+
+
+def test_a_connection_endpoint_that_is_not_in_the_flow_is_flagged():
+    flow = Flow("F")
+    a = Processor(name="A", type=UNKNOWN, auto_terminate=["success"])
+    b = Processor(name="B", type=UNKNOWN, auto_terminate=["success"])
+    flow.add(a)  # B is wired but never added
+    flow.add_connection(a >> b)
+    messages = [i["message"] for i in validate_flow(flow)]
+    assert any("connection destination 'B' is not part of the flow" in m
+               for m in messages)
+
+
+def test_a_service_registered_in_an_ancestor_group_is_fine():
+    """NiFi resolves a service from any ancestor — registration is tree-wide."""
+    from niflow.core import ControllerService
+
+    flow = Flow("F")
+    reader = ControllerService(name="Reader", type="org.x.Reader")
+    flow.add(reader)
+    with flow.process_group("Child") as child:
+        child.add_processor(Processor(name="Q", type=UNKNOWN,
+                                      properties={"Record Reader": reader},
+                                      auto_terminate=["success"]))
+    messages = [i["message"] for i in validate_flow(flow)]
+    assert not any("never added" in m for m in messages)
+
+
+# --- structural checks NiFi enforces at push time ----------------------------
+
+def test_a_connection_between_two_child_groups_is_flagged():
+    """NiFi needs a port to cross a group boundary; the push fails otherwise."""
+    flow = Flow("F")
+    with flow.process_group("A") as a:
+        a.add_processor(Processor(name="PA", type=UNKNOWN))
+    with flow.process_group("B") as b:
+        b.add_processor(Processor(name="PB", type=UNKNOWN, auto_terminate=["success"]))
+    pa = flow.process_groups[0].processors[0]
+    pb = flow.process_groups[1].processors[0]
+    flow.process_groups[0].connections.append(pa >> pb)
+    messages = [i["message"] for i in validate_flow(flow)]
+    assert any("cross a group boundary" in m and "'F/B'" in m for m in messages)
+
+
+def test_a_connection_into_a_child_groups_port_is_fine():
+    from niflow.core import InputPort
+
+    flow = Flow("F")
+    src = Processor(name="Src", type=UNKNOWN)
+    flow.add(src)
+    with flow.process_group("Child") as child:
+        port = InputPort(name="In")
+        child.add(port)
+        child.add_processor(Processor(name="Inner", type=UNKNOWN,
+                                      auto_terminate=["success"]))
+        child.add_connection(port >> child.processors[0])
+    flow.add_connection(src >> flow.process_groups[0].input_ports[0])
+    messages = [i["message"] for i in validate_flow(flow)]
+    assert not any("cross a group boundary" in m for m in messages)
+
+
+def test_a_parameter_reference_with_no_context_bound_is_flagged():
+    flow = Flow("F")
+    flow.add(Processor(name="P", type=UNKNOWN, properties={"k": "#{db.password}"},
+                       auto_terminate=["success"]))
+    messages = [i["message"] for i in validate_flow(flow)]
+    assert any("'db.password'" in m and "no parameter context is bound" in m
+               for m in messages)
+
+
+def test_a_bound_context_on_an_ancestor_satisfies_a_child():
+    from niflow.core import Parameter, ParameterContext
+
+    flow = Flow("F")
+    flow.parameter_context = ParameterContext(
+        name="Ctx", parameters=[Parameter(name="db.password", value="x")])
+    with flow.process_group("Child") as child:
+        child.add_processor(Processor(name="P", type=UNKNOWN,
+                                      properties={"k": "#{db.password}"},
+                                      auto_terminate=["success"]))
+    messages = [i["message"] for i in validate_flow(flow)]
+    assert not any("parameter context" in m for m in messages)
+
+
+def test_the_escaped_parameter_syntax_is_not_a_reference():
+    """`##{x}` is the literal text "#{x}" — flows/torture.py ships one."""
+    flow = Flow("F")
+    flow.add(Processor(name="P", type=UNKNOWN, properties={"k": "text ##{not.a.param}"},
+                       auto_terminate=["success"]))
+    assert validate_flow(flow) == []

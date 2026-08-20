@@ -522,9 +522,10 @@ class PlanApplier:
         was_enabled = entity["component"].get("state") == "ENABLED"
         if was_enabled:
             self._set_service_state(svc_id, "DISABLED", wait=True)
-        self._put(f"/controller-services/{svc_id}", {
-            "id": svc_id, **self._service_component(service)
-        })
+        component = self._service_component(service)
+        component["properties"].update(
+            self._property_removals(change, service.type, component["properties"]))
+        self._put(f"/controller-services/{svc_id}", {"id": svc_id, **component})
         if service.enabled:
             self._set_service_state(svc_id, "ENABLED", wait=bool(running_refs))
         for kind, ref_id in running_refs:
@@ -662,6 +663,45 @@ class PlanApplier:
             "maxBackoffPeriod": proc.max_backoff_period,
         }
 
+    def _property_removals(
+        self, change: Change, type_str: str, sending: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Explicit ``null``s for the properties the plan says to unset.
+
+        ``PUT /processors/{id}`` and ``PUT /controller-services/{id}`` *merge*
+        the properties map: NiFi leaves any key the request does not mention
+        exactly as it was, and only a key sent as ``null`` is removed (a
+        dynamic property) or reset to its descriptor default (a real one).
+        Sending just the model's own properties therefore made every removal a
+        silent no-op — the plan printed
+        ``properties[max-bin-age]: '10 sec' -> None``, apply reported
+        "Applied", and the property was still on the server, still making the
+        processor invalid.
+
+        The plan's own ``properties[...]`` fields decide what gets nulled, so
+        what apply sends cannot drift from what the plan promised. Keys are put
+        back through :func:`properties_for_target` because the plan speaks the
+        catalog namespace and the server may not (a 1.x server keys the same
+        property by its old name); a dynamic key, in neither namespace, passes
+        through untouched.
+        """
+        from niflow.processors.rules import properties_for_target
+
+        removals = {
+            name[len("properties["):-1]
+            for name, (_live, desired) in change.fields.items()
+            if name.startswith("properties[") and name.endswith("]")
+            and desired is None
+        }
+        if not removals:
+            return {}
+        if self._target_major is None:
+            self._target_major = self.client._major_version()
+        translated, _ = properties_for_target(
+            type_str, {key: None for key in sorted(removals)}, self._target_major
+        )
+        return {key: None for key in translated if key not in sending}
+
     def _add_processor(self, change: Change) -> None:
         proc: Processor = change.desired
         gid = self._group_id(change.path)
@@ -686,8 +726,11 @@ class PlanApplier:
         if not proc_id:
             raise KeyError(f"no live id for processor {change.name!r}")
         self._stop_processor(proc_id)
+        config = self._processor_config(proc)
+        config["properties"].update(
+            self._property_removals(change, proc.type, config["properties"]))
         self._put(f"/processors/{proc_id}", {
-            "id": proc_id, "name": proc.name, "config": self._processor_config(proc),
+            "id": proc_id, "name": proc.name, "config": config,
         })
         if "scheduled_state" in change.fields:
             state = "DISABLED" if proc.scheduled_state == "DISABLED" else "STOPPED"

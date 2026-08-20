@@ -311,3 +311,161 @@ def test_auto_terminate_order_is_ignored():
     live.processors[1].auto_terminate = ["success", "failure"]
     desired.processors[1].auto_terminate = ["failure", "success"]
     assert diff_flows(live, desired) == []
+
+
+# --- things that must never drift forever (fuzz "cries wolf" cluster) --------
+#
+# `niflow drift` is meant for cron/CI: a plan against a freshly-pushed,
+# unmodified flow must be empty, or a real divergence hides in the noise.
+
+
+def _service_flow(**service_kwargs) -> Flow:
+    flow = Flow("Svc")
+    flow.add_controller_service(
+        ControllerService(name="Reader", type="org.apache.nifi.json.JsonTreeReader",
+                          **service_kwargs)
+    )
+    return flow
+
+
+def test_unstated_service_enabled_is_not_drift():
+    # NiFi imports every service DISABLED whatever the snapshot asked for, so
+    # the model's `enabled=True` default must not plan a change forever.
+    live = _service_flow(enabled=False)  # what a pulled flow looks like
+    assert diff_flows(live, _service_flow()) == []
+
+
+def test_explicitly_enabled_service_still_plans_when_live_is_disabled():
+    live = _service_flow(enabled=False)
+    changes = diff_flows(live, _service_flow(enabled=True))
+    assert [c.fields["enabled"] for c in changes] == [(False, True)]
+
+
+def test_deliberately_disabled_service_stays_pushable():
+    live = _service_flow(enabled=True)
+    changes = diff_flows(live, _service_flow(enabled=False))
+    assert [c.fields["enabled"] for c in changes] == [(True, False)]
+
+
+def test_service_enabled_assigned_after_construction_counts_as_stated():
+    live = _service_flow(enabled=True)
+    desired = _service_flow()
+    desired.controller_services[0].enabled = False
+    assert [c.fields["enabled"] for c in diff_flows(live, desired)] == [(True, False)]
+
+
+def _one_processor(type_str: str, **kwargs) -> Flow:
+    flow = Flow("P")
+    flow.add_processor(Processor(name="A", type=type_str, **kwargs))
+    return flow
+
+
+PRIMARY_ONLY = "org.apache.nifi.processors.standard.ListFTP"
+NORMAL = "org.apache.nifi.processors.attributes.UpdateAttribute"
+
+
+def test_primary_node_only_type_does_not_drift_to_all():
+    # NiFi forces executionNode=PRIMARY on @PrimaryNodeOnly types and refuses
+    # ALL, so the model default cannot be drift.
+    live = _one_processor(PRIMARY_ONLY, execution_node="PRIMARY")
+    assert diff_flows(live, _one_processor(PRIMARY_ONLY)) == []
+    # ...even when the flow file says ALL: that value is unreachable.
+    assert diff_flows(live, _one_processor(PRIMARY_ONLY, execution_node="ALL")) == []
+
+
+def test_execution_node_still_diffs_for_ordinary_types():
+    live = _one_processor(NORMAL, execution_node="PRIMARY")
+    changes = diff_flows(live, _one_processor(NORMAL))
+    assert [c.fields["execution_node"] for c in changes] == [("PRIMARY", "ALL")]
+
+
+def test_int_and_bool_property_values_match_their_server_strings():
+    live = _one_processor(NORMAL, properties={"n": "10", "b": "true", "f": "1.5"})
+    desired = _one_processor(NORMAL)
+    # Assigned post-construction, so the model normaliser never saw them.
+    desired.processors[0].properties = {"n": 10, "b": True, "f": 1.5}
+    assert diff_flows(live, desired) == []
+
+
+def test_a_genuinely_different_number_still_drifts():
+    live = _one_processor(NORMAL, properties={"n": "10"})
+    desired = _one_processor(NORMAL, properties={"n": 11})
+    assert [c.fields["properties[n]"] for c in diff_flows(live, desired)] == [("10", "11")]
+
+
+# --- components the server creates for itself on import ----------------------
+
+AWS_PUT_S3 = "org.apache.nifi.processors.aws.s3.PutS3Object"
+AWS_CREDS = ("org.apache.nifi.processors.aws.credentials.provider.service."
+             "AWSCredentialsProviderControllerService")
+
+
+def _aws_pair():
+    """(live, desired) where the live side has what NiFi's 2.x import added."""
+    from niflow.core import ControllerService, Flow, Processor
+
+    desired = Flow("F")
+    desired.add(Processor(name="Put", type=AWS_PUT_S3, auto_terminate=["success",
+                                                                       "failure"]))
+    live = Flow("F")
+    creds = ControllerService(name="AWSCredentialsProviderControllerService",
+                              type=AWS_CREDS)
+    live.add(creds)
+    live.add(Processor(name="Put", type=AWS_PUT_S3,
+                       properties={"AWS Credentials Provider Service": creds},
+                       auto_terminate=["success", "failure"]))
+    return live, desired
+
+
+def test_a_service_the_import_created_is_not_planned_for_removal():
+    """NiFi 2.x makes an AWS credentials service and wires it in by itself.
+
+    Removing it is not tidying up — it deletes the thing the processor
+    requires, on every plan, forever.
+    """
+    live, desired = _aws_pair()
+    assert diff_flows(live, desired, 2) == []
+
+
+def test_writing_the_service_in_the_flow_makes_it_diffable_again():
+    from niflow.core import ControllerService
+
+    live, desired = _aws_pair()
+    desired.add(ControllerService(name="AWSCredentialsProviderControllerService",
+                                  type=AWS_CREDS, comments="ours now"))
+    changes = diff_flows(live, desired, 2)
+    assert [(c.op, c.kind) for c in changes] == [("update", "controller_service")]
+
+
+def test_a_service_the_import_does_not_create_is_still_removed():
+    from niflow.core import ControllerService, Flow
+
+    live, desired = Flow("F"), Flow("F")
+    live.add(ControllerService(name="Pool", type="org.apache.nifi.dbcp.DBCPConnectionPool"))
+    changes = diff_flows(live, desired, 2)
+    assert [(c.op, c.kind, c.name) for c in changes] == [
+        ("remove", "controller_service", "Pool")]
+
+
+def test_a_property_the_target_line_cannot_have_is_not_drift():
+    """The emitter omits it and says so; the plan must not cry wolf forever.
+
+    `Headers Source` is a 2.x-only PublishAMQP property. Pushed to 1.24 it is
+    dropped from the snapshot with a warning (and `validate` fails on it
+    against the baseline), so the live side will never have it — reporting it
+    as a change on every plan buries the real ones.
+    """
+    from niflow.core import Flow, Processor
+
+    amqp = "org.apache.nifi.amqp.processors.PublishAMQP"
+    live = Flow("F")
+    live.add(Processor(name="Pub", type=amqp, properties={"AMQP Version": "0.9.1"}))
+    desired = Flow("F")
+    desired.add(Processor(name="Pub", type=amqp, properties={
+        "AMQP Version": "0.9.1", "Headers Source": "FLOWFILE_ATTRIBUTES"}))
+
+    assert diff_flows(live, desired, 1) == []
+    # On the line that HAS the property it is an ordinary change.
+    changes = diff_flows(live, desired, 2)
+    assert [c.fields for c in changes] == [
+        {"properties[Headers Source]": (None, "FLOWFILE_ATTRIBUTES")}]

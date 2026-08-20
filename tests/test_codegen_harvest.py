@@ -132,3 +132,154 @@ def test_emit_relationships_renders_importable_sorted_map():
     }
     # Keys are emitted in sorted order for stable diffs.
     assert list(ns["RELATIONSHIPS"]) == ["a.Type", "b.Type"]
+
+
+# --- relationship probes ----------------------------------------------------
+# A processor's relationship set is not a per-type constant: a property value
+# can switch one on (UpdateAttribute's "Store State" -> "set state fail", which
+# NiFi 1.24 then refuses to start the processor without), and some types turn
+# every dynamic property into a relationship. Neither is readable off the create
+# response, and NiFi 1.x has no /flow/processor-definition endpoint to ask, so
+# both are probed by PUTting the property and reading the answer back.
+
+from niflow.codegen import (  # noqa: E402
+    _DYNAMIC_PROBE_PROPERTY,
+    _emit_conditional_relationships,
+    _emit_dynamic_relationships,
+    _emit_type_set,
+    _probe_relationships,
+)
+
+
+class ProbeClient:
+    """A processor whose relationships depend on 'Mode' and dynamic properties."""
+
+    def __init__(self, *, dynamic=False, refuse=()):
+        self.dynamic = dynamic
+        self.refuse = set(refuse)
+        self.puts = []
+        self.properties = {}
+
+    def _request(self, method, path, **kw):
+        assert (method, path) == ("PUT", "/processors/p1")
+        props = kw["json"]["component"]["config"]["properties"]
+        self.puts.append(dict(props))
+        for key, value in props.items():
+            if value in self.refuse:
+                raise RuntimeError("NiFi refused that value")
+            if value is None:
+                self.properties.pop(key, None)
+            else:
+                self.properties[key] = value
+        rels = ["success"]
+        if self.properties.get("Mode") == "split":
+            rels = ["left", "right"]
+        if self.dynamic:
+            rels += [k for k in self.properties if k not in ("Mode", "Plain")]
+        return _Resp({"revision": {"version": 1},
+                      "component": {"relationships": [{"name": r} for r in sorted(rels)]}})
+
+    def _get_json(self, path):
+        return {"revision": {"version": 1}}
+
+
+_CREATED = {"component": {"id": "p1"}, "revision": {"version": 0}}
+_DESCRIPTORS = {
+    "Mode": {"defaultValue": "whole", "allowableValues": [
+        {"allowableValue": {"value": "whole"}}, {"allowableValue": {"value": "split"}}]},
+    "Plain": {},  # no allowable values -> never probed
+}
+
+
+def test_probe_finds_a_relationship_a_property_switches_on():
+    client = ProbeClient()
+    dynamic, conditional = _probe_relationships(
+        client, _CREATED, ["success"], _DESCRIPTORS)
+    assert dynamic is False
+    assert conditional == {"Mode": {"split": ["left", "right"]}}
+
+
+def test_probe_does_not_record_a_value_that_changes_nothing():
+    client = ProbeClient()
+    _, conditional = _probe_relationships(
+        client, _CREATED, ["success"],
+        {"Mode": {"defaultValue": "whole", "allowableValues": [
+            {"allowableValue": {"value": "whole"}}]}})
+    assert conditional == {}
+
+
+def test_probe_detects_dynamic_relationship_types():
+    client = ProbeClient(dynamic=True)
+    dynamic, _ = _probe_relationships(client, _CREATED, ["success"], {})
+    assert dynamic is True
+    # The probe property is removed again, so it can't pollute later probes.
+    assert client.puts[-1] == {_DYNAMIC_PROBE_PROPERTY: None}
+
+
+def test_probe_restores_the_default_between_properties():
+    client = ProbeClient()
+    _probe_relationships(client, _CREATED, ["success"], _DESCRIPTORS)
+    assert {"Mode": None} in client.puts
+
+
+def test_probe_survives_a_value_nifi_refuses():
+    client = ProbeClient(refuse={"split"})
+    dynamic, conditional = _probe_relationships(
+        client, _CREATED, ["success"], _DESCRIPTORS)
+    assert (dynamic, conditional) == (False, {})
+
+
+def test_probe_skips_controller_service_properties():
+    client = ProbeClient()
+    _probe_relationships(client, _CREATED, ["success"], {
+        "Reader": {"identifiesControllerService": "x", "allowableValues": [
+            {"allowableValue": {"value": "abc-uuid"}}]}})
+    assert client.puts == [{_DYNAMIC_PROBE_PROPERTY: "niflow"},
+                           {_DYNAMIC_PROBE_PROPERTY: None}]
+
+
+def test_probe_is_a_no_op_without_an_instance_id():
+    assert _probe_relationships(None, {"component": {}}, ["success"], {}) == (False, {})
+
+
+# --- emission ---------------------------------------------------------------
+
+def test_emit_conditional_relationships_is_sorted_and_importable():
+    rendered = _emit_conditional_relationships({
+        "b.T": {"conditional_relationships": {"Mode": {"split": ["right", "left"]}}},
+        "a.T": {"conditional_relationships": {}},
+    })
+    ns = {}
+    exec(rendered, ns)
+    assert ns["CONDITIONAL_RELATIONSHIPS"] == {"b.T": {"Mode": {"split": ("left", "right")}}}
+
+
+def test_emit_dynamic_relationships_lists_only_confirmed_types():
+    rendered = _emit_dynamic_relationships({
+        "b.T": {"dynamic_relationships": True},
+        "a.T": {"dynamic_relationships": False},
+    })
+    ns = {}
+    exec(rendered, ns)
+    assert ns["DYNAMIC_RELATIONSHIPS"] == frozenset({"b.T"})
+
+
+def test_emit_type_set_records_types_with_no_properties_at_all():
+    """Otherwise 'harvested, has nothing' reads as 'never harvested'."""
+    rendered = _emit_type_set({"z.T": {"properties": []}, "a.T": {"properties": ["x"]}})
+    ns = {}
+    exec(rendered, ns)
+    assert ns["TYPES"] == frozenset({"a.T", "z.T"})
+
+
+def test_service_reference_allowable_values_are_not_recorded():
+    """They are live instance UUIDs: fresh every run, so the catalog churned."""
+    trimmed = _trim_descriptors({
+        "Reader": {"identifiesControllerService": "org.apache.nifi.RecordReader",
+                   "allowableValues": [
+                       {"allowableValue": {"value": "1c43e0c1-01a0-1000-6337-7f5cad0afe9f"}}]},
+        "Mode": {"allowableValues": [{"allowableValue": {"value": "whole"}}]},
+    })
+    assert "allowable" not in trimmed["Reader"]
+    assert trimmed["Reader"]["service"] == "org.apache.nifi.RecordReader"
+    assert trimmed["Mode"]["allowable"] == ["whole"]  # a real enum still kept

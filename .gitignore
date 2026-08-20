@@ -18,6 +18,23 @@ __pycache__/
 # Automatic pre-push snapshots (niflow rollback restores from here)
 .niflow-backups/
 
+# `niflow follow` stepping sessions (hop history + branch/mute state; they
+# hold real FlowFile attributes, so they stay local like flows/ does)
+.niflow-follow/
+
+# `niflow watch` health baselines + alert history (per NiFi instance). Holds
+# real component names and error text from work flows, so it stays local.
+.niflow-watch/
+
+# `niflow fuzz` sweep output: results.jsonl, run/summary, and one generated
+# repro flow per finding. Regenerate with `make fuzz`; never committed.
+.niflow-fuzz/
+
+# Raw property-descriptor harvests written by `make version-map`; the map and
+# report generated FROM them (niflow/version_map.py, docs/version-compat.md)
+# are committed, these intermediates are not.
+.niflow-rulebooks/
+
 # Per-environment connection config (may hold a work password) + TLS material
 .niflow.env
 # API keys (GOOGLE_API_KEY etc. — niflow.llm reads this)
@@ -25,3 +42,25 @@ __pycache__/
 *.p12
 *.pfx
 certs/
+
+# Pulled flows are REAL work flows — internal hostnames, SQL, endpoints, queue
+# names — so nothing under flows/ is committed by default (`niflow pull --all`
+# writes here, and so does the web GUI's flows dir). The example flows the repo
+# ships with are the deliberate exceptions below.
+# NB: it has to be `flows/*`, not `flows/` — git never descends into an ignored
+# directory, so a negation under `flows/` would silently never match.
+flows/*
+!flows/.gitkeep
+!flows/abc_to_json.py
+!flows/torture.py
+!flows/labyrinth.py
+
+# `niflow explain` writes LLM prose about whatever flow you pointed it at —
+# same exposure as flows/, one step less obvious. Only the explanations of the
+# example flows stay tracked.
+docs/explanations/*
+!docs/explanations/root.md
+!docs/explanations/AbcToJson.md
+!docs/explanations/NiflowTorture.md
+!docs/explanations/NiflowTorture__Stage.md
+!docs/explanations/NiflowTorture__Stage 2.md

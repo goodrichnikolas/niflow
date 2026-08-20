@@ -21,6 +21,7 @@ Whole-instance workflows::
 
     niflow pull --all -o flows/                # mirror every top-level group
     niflow drift                               # ok/DRIFT per flow; exit 1 on any
+    niflow watch                               # alert when a healthy component breaks
     niflow push --all flows/ --update          # reconcile the directory
     niflow diagram flows/my_flow.py -o doc.md  # Mermaid flowchart for PR review
 
@@ -122,9 +123,37 @@ def cmd_validate(args: argparse.Namespace) -> int:
     Catches the errors NiFi would reject on push (unhandled relationships,
     missing required properties, bad values) using the harvested rulebook, so
     you can fix them before pushing. Exit code 1 if any issues are found.
+
+    The **compatibility baseline** is checked by default and with no flag:
+    every flow is judged against the oldest NiFi line the estate runs
+    (``NIFLOW_MIN_NIFI_VERSION`` in ``.niflow.env``, default 1.24), and a
+    property that cannot land there is a named failure, not a note. It fails
+    the command deliberately — on the server that failure is *silent* (NiFi
+    files an unknown key away as an inert dynamic property and runs the real
+    one at its default), and a warning in a wall of output is exactly how that
+    class of bug reaches production.
+
+    ``--target-version 2.7.2`` swaps the baseline for an ad-hoc check against
+    some other line; ``--no-compat-check`` (or a baseline of ``none``) turns
+    the cross-version check off for someone who only cares about 2.x.
     """
     flow = _load_flow_py(args.file, args.var)
-    issues = flow.validate()
+    target_version = getattr(args, "target_version", None)
+    baseline = not getattr(args, "no_compat_check", False)
+    if target_version:
+        from niflow.compat import describe_target, parse_major
+
+        target_major = parse_major(target_version)
+        if target_major is None:
+            print(f"--target-version {target_version!r} is not a NiFi version "
+                  f"(try 1.24 or 2.7.2)")
+            return 2
+        print(f"Target: {describe_target(target_major)}")
+    elif baseline:
+        from niflow.compat import describe_baseline
+
+        print(f"Checking {describe_baseline()}")
+    issues = flow.validate(target_version, baseline=baseline)
     if issues:
         print(f"{flow.name!r} has {len(issues)} static validation issue(s):")
         for issue in issues:
@@ -427,10 +456,36 @@ def cmd_stop(args: argparse.Namespace) -> int:
 
 def cmd_explain(args: argparse.Namespace) -> int:
     """Write plain-English walkthrough docs for a live group (needs an LLM)."""
+    from niflow.llm import llm_config
+
+    config = llm_config()
+    # Say which backend is about to be billed/driven — for the Claude Code
+    # provider there is no URL to show, hence describe() rather than .url.
+    print(f"LLM: {config.describe() if config else 'not configured'}")
+    depth = 0 if args.all else args.depth
+
+    def confirm(plan: dict) -> bool:
+        """Count first, spend second — a deep canvas is hundreds of docs."""
+        level = "all levels" if depth <= 0 else f"depth {depth}"
+        print(f"{plan['documents']} document(s) in scope at {level}: "
+              f"{plan['llm_calls']} LLM call(s), "
+              f"{plan['documents'] - plan['llm_calls']} already current "
+              f"(or hand-written and left alone).")
+        if plan["summarised_groups"]:
+            print(f"{plan['summarised_groups']} deeper group(s) get one summary "
+                  "line each inside their parent — use --depth N or --all to "
+                  "give them documents of their own.")
+        if not plan["llm_calls"] or args.yes or not sys.stdin.isatty():
+            return True
+        return input("Generate? [y/N] ").strip().lower() in ("y", "yes")
+
     results = _client().explain_group(
         args.group, docs_dir=args.docs_dir,
-        recurse=not args.no_recurse, force=args.force,
+        depth=depth, force=args.force, confirm=confirm,
     )
+    if not results:  # confirm() said no
+        print("Aborted.")
+        return 1
     for r in results:
         print(f"{r['status']:>9}  {r['group']}  ({r['path']})")
     written = sum(r["status"] == "generated" for r in results)
@@ -440,17 +495,40 @@ def cmd_explain(args: argparse.Namespace) -> int:
 
 def cmd_trace(args: argparse.Namespace) -> int:
     """Print one FlowFile's provenance journey, hop by hop."""
-    from niflow.follow import format_hop
+    from niflow.follow import annotate_hops, format_hop
 
-    trace = _client().trace_flowfile(args.uuid)
+    trace = _client().trace_flowfile(args.uuid, max_events=args.max_events)
     hops = trace["hops"]
     if not hops:
         print(f"No provenance events for {args.uuid} — wrong UUID, or the "
               "events have aged out of the provenance repository.")
         return 1
+    # A capped journey is the newest N events, not the first N — saying so
+    # matters, because the hop numbered 1 is then NOT where the file began and
+    # reading it as the origin is the wrong conclusion.
+    if trace.get("truncated"):
+        print(f"Showing the newest {len(hops)} hops of a longer journey — "
+              f"the file's earlier hops are not below "
+              f"(raise --max-events to see further back).\n")
+    # Same annotation the stepper applies, so trace and follow render
+    # identically (added/changed/removed + content changes).
+    annotate_hops(hops)
     for i, hop in enumerate(hops, 1):
         print(format_hop(i, hop, full=args.full))
     return 0
+
+
+def cmd_watch(args: argparse.Namespace) -> int:
+    """Background health watcher: alert when a healthy component starts failing."""
+    from niflow.watch import watch_command
+
+    return watch_command(
+        _client(), args.group,
+        interval=args.interval, baseline=args.baseline, once=args.once,
+        list_only=args.list, as_json=args.json, include_warnings=args.warnings,
+        probe=not args.no_probe, no_stop_alerts=args.no_stop_alerts,
+        ack=args.ack, clear=args.clear,
+    )
 
 
 def cmd_follow(args: argparse.Namespace) -> int:
@@ -460,9 +538,56 @@ def cmd_follow(args: argparse.Namespace) -> int:
     return follow_command(
         _client(), args.group,
         uuid=args.uuid, queue=args.queue, source=args.source,
-        auto=args.auto, max_hops=args.max_hops,
+        start=args.start, list_only=args.list, mute=args.mute or [],
+        resume=args.resume, auto=args.auto, max_hops=args.max_hops,
         restore=args.restore, full=args.full,
     )
+
+
+def cmd_fuzz(args: argparse.Namespace) -> int:
+    """Generate thousands of micro-flows and hunt niflow's own defects."""
+    from niflow.fuzz import (
+        KINDS,
+        NIFLOW_BUG,
+        SweepConfig,
+        format_report,
+        replay,
+        sweep,
+    )
+
+    config = SweepConfig(
+        tier=args.tier,
+        count=args.count,
+        seed=args.seed,
+        kinds=tuple(args.kinds.split(",")) if args.kinds else KINDS,
+        type_pattern=args.types,
+        out_dir=Path(args.out),
+        resume=args.resume,
+        max_repros_per_signature=args.repros_per_bug,
+        max_failures=args.max_failures,
+        keep_sandboxes=args.keep_sandboxes,
+    )
+    client = _client() if config.tier >= 2 else None
+
+    if args.replay:
+        result = replay(args.replay, config, client)
+        print(f"{result.case.case_id} [{result.case.kind}] -> {result.status}")
+        print(json.dumps(result.case.spec, indent=2, ensure_ascii=False))
+        for finding in result.findings:
+            print(f"\n### {finding.check} [{finding.classification}] {finding.signature}")
+            print(f"  {finding.message}")
+            if finding.detail:
+                print(finding.detail)
+        return 1 if result.status == NIFLOW_BUG else 0
+
+    def progress(index: int, total: int, _result) -> None:
+        if index % 100 == 0 or index == total:
+            print(f"  ... {index}/{total}", file=sys.stderr, flush=True)
+
+    report = sweep(config, client, progress=None if args.quiet else progress)
+    print(format_report(report))
+    print(f"\nFull results: {config.out_dir}/results.jsonl")
+    return 1 if report.counts[NIFLOW_BUG] else 0
 
 
 def cmd_tidy(args: argparse.Namespace) -> int:
@@ -557,8 +682,51 @@ def main(argv: Optional[list] = None) -> int:
         "Also dry-run against the live NiFi: push a throwaway sandbox, collect "
         "the server's own validation errors, delete it"
     ))
+    p.add_argument("--target-version", metavar="VER", default=None, help=(
+        "Check against this NiFi line instead of the configured baseline "
+        "(e.g. --target-version 2.7.2). Offline — uses the generated "
+        "cross-version map — so you can find out at home what breaks at work"
+    ))
+    p.add_argument("--no-compat-check", action="store_true", help=(
+        "Skip the cross-version check entirely. By default every flow is "
+        "checked against the compatibility baseline NIFLOW_MIN_NIFI_VERSION "
+        "(default 1.24) and fails validate if a property cannot land there"
+    ))
     p.add_argument("--var", default="flow")
     p.set_defaults(func=cmd_validate)
+
+    p = sub.add_parser(
+        "fuzz",
+        help="Generate thousands of micro-flows and hunt niflow's own bugs "
+        "(tier 1 needs no NiFi)",
+    )
+    p.add_argument("--tier", "--level", type=int, choices=(1, 2, 3), default=1,
+                   dest="tier", help=(
+                       "1: offline emit/parse/plan round trips (default); "
+                       "2: + NiFi's own validation in a sandbox; "
+                       "3: + live push/pull/plan convergence"))
+    p.add_argument("--count", type=int, default=0,
+                   help="Cases to run (0 = every generated case)")
+    p.add_argument("--seed", type=int, default=0, help="Generator seed (default: 0)")
+    p.add_argument("--kinds", help="Comma-separated case kinds "
+                   "(solo,props,pair,service,shape)")
+    p.add_argument("--types", help="Regex filter on processor type")
+    p.add_argument("-o", "--out", default=".niflow-fuzz",
+                   help="Output directory for results + repros (default: .niflow-fuzz)")
+    p.add_argument("--resume", action="store_true",
+                   help="Skip cases already recorded in the output directory")
+    p.add_argument("--replay", metavar="CASE_ID",
+                   help="Re-run one case by id and print everything it found")
+    p.add_argument("--repros-per-bug", type=int, default=3,
+                   help="Standalone repro files to write per root-cause "
+                        "signature (default: 3)")
+    p.add_argument("--max-failures", type=int, default=0,
+                   help="Stop after this many failing cases (0 = never)")
+    p.add_argument("--keep-sandboxes", action="store_true",
+                   help="Leave the live sandbox groups behind for autopsy "
+                        "(tiers 2/3 delete every 'niflow-fuzz *' group when done)")
+    p.add_argument("--quiet", action="store_true", help="No progress output")
+    p.set_defaults(func=cmd_fuzz)
 
     p = sub.add_parser("copy", help="Clone a group as a detached working copy")
     p.add_argument("group", help="Source group name, path, or id")
@@ -620,7 +788,8 @@ def main(argv: Optional[list] = None) -> int:
     p = sub.add_parser(
         "explain",
         help="Write a plain-English walkthrough of a live group to "
-        "docs/explanations/ (needs an LLM — set NIFLOW_LLM_URL + _MODEL)",
+        "docs/explanations/ (needs an LLM — an installed Claude Code CLI "
+        "is enough; otherwise GOOGLE_API_KEY or NIFLOW_LLM_URL + _MODEL)",
     )
     p.add_argument("group", nargs="?", default="root",
                    help="Group name, a/b path, id, or 'root' (default: root)")
@@ -628,8 +797,15 @@ def main(argv: Optional[list] = None) -> int:
                    help="Where the .md documents live (default: docs/explanations)")
     p.add_argument("--force", action="store_true",
                    help="Regenerate even when the doc is up to date")
-    p.add_argument("--no-recurse", action="store_true",
-                   help="Only this group's document, not nested groups'")
+    p.add_argument("--depth", type=int, default=1, metavar="N",
+                   help="How many levels get their own document (default: 1 — "
+                        "just this group, with nested groups summarised in one "
+                        "line each); 2 adds the immediate children, and so on")
+    p.add_argument("--all", action="store_true",
+                   help="Document the whole subtree: one file and one LLM call "
+                        "per nested group, however deep (same as --depth 0)")
+    p.add_argument("-y", "--yes", action="store_true",
+                   help="Skip the 'N documents, N LLM calls' confirmation")
     p.set_defaults(func=cmd_explain)
 
     p = sub.add_parser(
@@ -658,6 +834,9 @@ def main(argv: Optional[list] = None) -> int:
     p.add_argument("uuid", help="FlowFile UUID (from a queue listing, bulletin, or log)")
     p.add_argument("--full", action="store_true",
                    help="Show every attribute at every hop, not just what changed")
+    p.add_argument("--max-events", type=int, default=1000, metavar="N",
+                   help="Cap the journey at the newest N provenance events "
+                        "(default 1000; a capped trace says so)")
     p.set_defaults(func=cmd_trace)
 
     p = sub.add_parser(
@@ -671,6 +850,18 @@ def main(argv: Optional[list] = None) -> int:
     p.add_argument("--queue", help="Connection id to take the FlowFile from")
     p.add_argument("--source", help="Run this source processor once first "
                    "to mint the FlowFile to follow")
+    p.add_argument("--start", help="Start point to begin at: a number from "
+                   "--list, a connection/processor id, or 'kind:id'")
+    p.add_argument("--list", action="store_true",
+                   help="List the plausible start points and exit "
+                   "(read-only: the group is not quiesced)")
+    p.add_argument("--mute", action="append", metavar="SPEC",
+                   help="Do not follow a branch: a relationship name, "
+                   "'rel:failure', 'dest:PutFile', 'queue:<id>' or a child "
+                   "UUID. Repeatable. View-only — NiFi keeps running it")
+    p.add_argument("--resume", action="store_true",
+                   help="Re-attach to the last saved session for this group "
+                   "instead of starting a new journey")
     p.add_argument("--auto", action="store_true",
                    help="Step without prompting until the file reaches a "
                    "terminal state (dropped/sent/port)")
@@ -682,6 +873,38 @@ def main(argv: Optional[list] = None) -> int:
     p.add_argument("--full", action="store_true",
                    help="Show every attribute at every hop, not just what changed")
     p.set_defaults(func=cmd_follow)
+
+    p = sub.add_parser(
+        "watch",
+        help="Watch for components that were healthy and started failing, "
+        "and say whether the cause looks external (cron/CI friendly)",
+    )
+    p.add_argument("group", nargs="?", default="root",
+                   help="Group name, a/b path, id, or 'root' (default: root)")
+    p.add_argument("--interval", type=float, default=15.0,
+                   help="Seconds between health polls (default: 15)")
+    p.add_argument("--baseline", type=float, default=120.0,
+                   help="Seconds a component must look healthy before a "
+                        "failure counts as 'it WAS working' (default: 120)")
+    p.add_argument("--once", action="store_true",
+                   help="Poll once and exit — the cron shape; exit 1 if any "
+                        "alert is active")
+    p.add_argument("--list", action="store_true",
+                   help="Print the recorded alerts and exit (no polling)")
+    p.add_argument("--json", action="store_true",
+                   help="One JSON object per alert event, for piping")
+    p.add_argument("--warnings", action="store_true",
+                   help="Treat WARNING bulletins as failures too, not just ERROR")
+    p.add_argument("--no-probe", action="store_true",
+                   help="Skip the provenance probe that recovers the HTTP "
+                        "status / URL when an alert fires")
+    p.add_argument("--no-stop-alerts", action="store_true",
+                   help="Don't alert when a running processor becomes stopped")
+    p.add_argument("--ack", metavar="ALERT_ID",
+                   help="Acknowledge one alert so it stops shouting")
+    p.add_argument("--clear", action="store_true",
+                   help="Forget every resolved alert")
+    p.set_defaults(func=cmd_watch)
 
     args = parser.parse_args(argv)
     try:

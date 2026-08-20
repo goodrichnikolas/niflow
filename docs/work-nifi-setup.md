@@ -21,8 +21,9 @@ cp .niflow.env.example .niflow.env        # then edit it
 NIFLOW_NIFI_HOST=https://<host>:8443/nifi-api niflow doctor
 ```
 
-The doctor runs six checks (config sanity → TLS → server auth mode → your
-credentials → identity → canvas access) and each failure names the exact
+The doctor walks the layers in order (config sanity → what TLS trust material
+is in effect → reachability → server auth mode → your credentials → identity →
+canvas access) and each failure names the exact
 `.niflow.env` key to fix. When it prints `All good`, every niflow command —
 CLI, GUI, web GUI, library — connects the same way from then on.
 
@@ -142,6 +143,24 @@ NIFLOW_NIFI_CA_BUNDLE=/home/you/certs/nifi-ca.pem
 
 (When `CA_BUNDLE` is set, `VERIFY_SSL` is ignored.)
 
+### If the machine already exports a CA bundle
+
+Corporate images often set `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, or
+`SSL_CERT_FILE` globally. `requests` reads the first two on *every* call and
+they beat a session's own `verify` setting unless the call pins `verify=`
+itself — which is how a machine-wide bundle silently overrode
+`NIFLOW_NIFI_CA_BUNDLE` (and even turned `VERIFY_SSL=false` back on). niflow
+now pins its own trust material on every request, and `niflow doctor` prints
+both lines so you can see which bundle is in play:
+
+```
+✓ trust material: verifying the server against CA bundle /home/you/certs/nifi-ca.pem
+⚠ trust environment: REQUESTS_CA_BUNDLE=/etc/pki/corp-ca.pem set in this environment...
+```
+
+If the environment bundle is the one that trusts this NiFi, point
+`NIFLOW_NIFI_CA_BUNDLE` at that same file so the choice is deliberate.
+
 ## 6. Verify, then work
 
 ```bash
@@ -169,6 +188,7 @@ Notes for a Liquibase/CI-managed instance:
 |---|---|
 | `reachability: cannot reach` | wrong host/port, container down (`podman ps`), or VPN/proxy in the way |
 | `TLS trust` | §5 (CA bundle), or `NIFLOW_NIFI_VERIFY_SSL=false` while investigating |
+| `trust environment: REQUESTS_CA_BUNDLE=...` | the box exports a CA bundle; §5 |
 | `TLS handshake ... REQUIRES a client certificate` | §4 |
 | `auth mismatch: no login endpoint` | server is cert-auth; §4 |
 | `authentication: wrong username/password` | try your LDAP/directory credentials; confirm with admins |

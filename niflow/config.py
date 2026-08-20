@@ -20,9 +20,19 @@ Recognised keys (file or environment):
                              file contains both)
     NIFLOW_NIFI_CA_BUNDLE    path to the CA/server cert PEM to trust
     NIFLOW_NIFI_VERIFY_SSL   true/false (ignored when CA_BUNDLE is set)
+    NIFLOW_MIN_NIFI_VERSION  compatibility baseline: the OLDEST NiFi line your
+                             flows must still work on (default 1.24; "none"
+                             disables the check)
 
 When a client certificate is configured it IS the identity: token login is
 skipped entirely and the username/password are ignored.
+
+``NIFLOW_MIN_NIFI_VERSION`` is the odd one out — it is not about connecting.
+It is declared here because it is a property of your *estate*, not of any one
+command: "we author against 2.x, but 1.24 is what actually runs at work, so a
+flow that cannot survive 1.24 is broken." Declaring it once means `niflow
+validate` enforces it without a flag and `niflow doctor` reports it, instead
+of it being something you have to remember to check.
 """
 from __future__ import annotations
 
@@ -45,8 +55,17 @@ _KEYS = {
     "NIFLOW_NIFI_CLIENT_KEY": "client_key",
     "NIFLOW_NIFI_CA_BUNDLE": "ca_bundle",
     "NIFLOW_NIFI_VERIFY_SSL": "verify_ssl",
+    "NIFLOW_MIN_NIFI_VERSION": "min_nifi_version",
 }
 _BOOL_FIELDS = {"verify_ssl"}
+
+# The compatibility baseline when nothing declares one. 1.24 rather than
+# "whatever you are pushing to": 2.x is where flows are authored, 1.24 is what
+# production runs, and only the second one is a hard requirement.
+DEFAULT_MIN_NIFI_VERSION = "1.24"
+
+# Values of NIFLOW_MIN_NIFI_VERSION that mean "I only care about 2.x".
+_BASELINE_OFF = {"none", "off", "no", "false", "0", ""}
 
 
 class NiFiConfig(BaseModel):
@@ -65,6 +84,16 @@ class NiFiConfig(BaseModel):
     # Self-signed dev cert -> no verification by default.
     verify_ssl: bool = False
     suppress_ssl_warnings: bool = True
+    # Compatibility baseline: the oldest NiFi line these flows must keep
+    # working on, regardless of which server any one push targets. "none"
+    # turns the check off.
+    min_nifi_version: str = DEFAULT_MIN_NIFI_VERSION
+
+    @property
+    def compat_baseline(self) -> Optional[str]:
+        """The declared baseline version, or ``None`` if the check is off."""
+        value = (self.min_nifi_version or "").strip()
+        return None if value.lower() in _BASELINE_OFF else value
 
     @property
     def auth_mode(self) -> str:

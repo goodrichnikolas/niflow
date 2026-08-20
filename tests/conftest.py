@@ -21,8 +21,9 @@ def _nifi_reachable(config: NiFiConfig) -> bool:
 
 @pytest.fixture(autouse=True)
 def _isolated_backups(monkeypatch, tmp_path):
-    """Keep automatic pre-push backups out of the repo during tests."""
+    """Keep automatic pre-push backups and follow sessions out of the repo."""
     monkeypatch.setenv("NIFLOW_BACKUP_DIR", str(tmp_path / "niflow-backups"))
+    monkeypatch.setenv("NIFLOW_FOLLOW_DIR", str(tmp_path / "niflow-follow"))
 
 
 @pytest.fixture(scope="session")
