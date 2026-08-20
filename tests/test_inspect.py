@@ -428,3 +428,29 @@ def test_the_server_clock_survives_midnight():
               "time_offset_ms": 0}
     anchored = NiFiClient._server_now(totals)
     assert abs((anchored - minutes_ago).total_seconds()) < 2
+
+
+def test_the_server_clock_works_when_the_server_is_not_on_utc():
+    """Work's NiFi need not run on UTC; the offset comes back with every answer."""
+    from niflow.client import NiFiClient
+
+    now = _dt.datetime.now(_dt.timezone.utc)
+    offset = _dt.timedelta(hours=-4)                     # e.g. a server on EDT
+    totals = {"generated": (now + offset).strftime("%H:%M:%S") + " EDT",
+              "time_offset_ms": offset.total_seconds() * 1000}
+    assert abs((NiFiClient._server_now(totals) - now).total_seconds()) < 2
+
+
+def test_the_server_clock_reads_the_right_day_across_midnight():
+    """The date comes from this machine; only the time of day comes from NiFi."""
+    from niflow.client import NiFiClient
+
+    now = _dt.datetime.now(_dt.timezone.utc)
+    offset = _dt.timedelta(hours=-4)
+    server_local = now + offset
+    totals = {"generated": server_local.strftime("%H:%M:%S") + " EDT",
+              "time_offset_ms": offset.total_seconds() * 1000}
+    anchored = NiFiClient._server_now(totals)
+    # Same instant, whatever side of midnight either clock is on.
+    assert abs((anchored - now).total_seconds()) < 2
+    assert anchored.tzinfo is not None
