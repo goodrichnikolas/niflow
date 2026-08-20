@@ -408,11 +408,31 @@ def _diff_properties(
         a, b = live.get(key), desired.get(key)
         allowable = (descriptors.get(key) or {}).get("allowable")
         default = (descriptors.get(key) or {}).get("default")
-        a_eff = default if a is None else _normalise_prop(a, allowable)
-        b_eff = default if b is None else _normalise_prop(b, allowable)
+        a_eff = _effective_prop(a, default, allowable)
+        b_eff = _effective_prop(b, default, allowable)
         if a_eff != b_eff:
             fields[f"properties[{key}]"] = (_display_prop(a), _display_prop(b))
     return fields
+
+
+def _effective_prop(value: Any, default: Any, allowable: Any) -> Any:
+    """What a property is really worth on one side of the diff.
+
+    Unset means the descriptor default. And an **empty string means unset**
+    when the descriptor has no default: NiFi materialises "no value" as ``""``
+    for some properties (``DetectDuplicate``'s ``FlowFile Description``), so a
+    live ``""`` against a model that says nothing was read as drift and
+    ``properties[FlowFile Description]: '' -> None`` re-planned forever.
+    A ``""`` written against a descriptor that *does* have a default is still
+    a real assertion — the user overriding the default with nothing — and
+    stays diffed.
+    """
+    if value is None:
+        return default
+    normalised = _normalise_prop(value, allowable)
+    if normalised == "" and default is None:
+        return None
+    return normalised
 
 
 def _normalise_prop(value: Any, allowable: Any = None) -> Any:

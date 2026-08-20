@@ -539,6 +539,72 @@ ProcessGroup.model_rebuild()
 Flow.model_rebuild()
 
 
+def find_unregistered_components(group: ProcessGroup) -> List[Tuple[str, str]]:
+    """Components that are *wired* into a flow but were never added to it.
+
+    Two hand-editing mistakes with the same ugly ending — a bare ``KeyError``
+    carrying a memory address, thrown from the middle of an emit, after the
+    push has already started:
+
+    * a :class:`ControllerService` used as a property value but never
+      ``add_controller_service``'d, so it has no identifier to reference;
+    * a connection whose source or destination was never added to its group,
+      so the endpoint points at a component the snapshot does not contain.
+
+    Registration is checked across the **whole tree**, not per group: NiFi
+    resolves a controller service from any ancestor group, and a connection
+    between groups is a separate (real) problem that
+    :func:`niflow.validate.validate_flow` reports on its own.
+
+    Returns ``(group_path, message)`` pairs, empty when everything is wired to
+    something the flow actually contains.
+    """
+    registered: set = set()
+    services: set = set()
+
+    def collect(g: ProcessGroup) -> None:
+        registered.add(id(g))
+        for member in (list(g.processors) + list(g.input_ports)
+                       + list(g.output_ports) + list(g.funnels)):
+            registered.add(id(member))
+        for service in g.controller_services:
+            registered.add(id(service))
+            services.add(id(service))
+        for child in g.process_groups:
+            collect(child)
+
+    collect(group)
+    problems: List[Tuple[str, str]] = []
+
+    def visit(g: ProcessGroup, path: str) -> None:
+        owners = [("processor", p) for p in g.processors]
+        owners += [("controller service", s) for s in g.controller_services]
+        for kind, owner in owners:
+            for key, value in (owner.properties or {}).items():
+                if isinstance(value, ControllerService) and id(value) not in services:
+                    problems.append((
+                        path,
+                        f"{kind} {owner.name!r} property {key!r} references "
+                        f"controller service {value.name!r}, which was never "
+                        f"added to the flow — add_controller_service() it "
+                        f"(in this group or an ancestor)",
+                    ))
+        for conn in g.connections:
+            for role, end in (("source", conn.source), ("destination", conn.target)):
+                if id(end) not in registered:
+                    problems.append((
+                        path,
+                        f"connection {role} {getattr(end, 'name', end)!r} is not "
+                        f"part of the flow — add it to a group before "
+                        f"connecting it",
+                    ))
+        for child in g.process_groups:
+            visit(child, f"{path}/{child.name}")
+
+    visit(group, group.name or ".")
+    return problems
+
+
 def find_identity_collisions(group: ProcessGroup) -> List[Tuple[str, str]]:
     """Same-kind name duplicates that break niflow's name-based identity.
 

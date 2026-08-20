@@ -130,16 +130,32 @@ def test_a_plain_processor_passes_every_offline_check():
     assert result.status == PASSED, [f.message for f in result.findings]
 
 
-def test_offline_check_reports_a_crash_with_the_niflow_frame():
-    # A controller service referenced but never registered — to_json cannot
-    # resolve its identifier.
-    result = check_offline(Case("shape", {
+def test_a_service_referenced_but_never_registered_is_refused_by_name():
+    """It used to be a bare KeyError with a memory address, mid-emit.
+
+    The model really is broken, so refusing it is correct — what was wrong was
+    refusing it unreadably, from inside the emitter, after a push had started.
+    `validate` sees it offline now and `to_json` names the service, so the
+    harness records a clean rejection rather than a niflow bug.
+    """
+    from niflow.core import find_unregistered_components
+    from niflow.formats import to_json
+
+    case = Case("shape", {
         "shape": "unregistered_service",
         "source": UPDATE_ATTR, "target": UPDATE_ATTR,
-    }))
-    assert result.status == NIFLOW_BUG
-    signatures = [f.signature for f in result.findings]
-    assert any(s.startswith("emit_json:KeyError@json_format") for s in signatures)
+    })
+    flow = case.build()
+    assert find_unregistered_components(flow)
+    with pytest.raises(ValueError) as caught:
+        to_json(flow)
+    assert "not part of this flow" in str(caught.value)
+    assert "KeyError" not in str(caught.value)
+
+    result = check_offline(case)
+    assert result.status != NIFLOW_BUG
+    assert not [f for f in result.findings
+                if f.signature.startswith("emit_json:KeyError")]
 
 
 def test_server_normalisation_stringifies_property_values():
@@ -149,7 +165,7 @@ def test_server_normalisation_stringifies_property_values():
                                  auto_terminate=["success"]))
     snapshot = _server_normalised(json.loads(to_json(flow)))
     props = snapshot["flowContents"]["processors"][0]["properties"]
-    assert props == {"n": "3", "b": "true", "s": "x", "u": None}
+    assert props == {"n": "3", "b": "true", "s": "x"}  # None is dropped on emit
 
 
 def test_plan_sensitivity_flags_a_field_the_differ_cannot_see(monkeypatch):

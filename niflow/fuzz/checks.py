@@ -21,7 +21,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from niflow.core import Flow, Funnel, ProcessGroup, Processor, find_identity_collisions
+from niflow.core import (
+    Flow, Funnel, ProcessGroup, Processor, find_identity_collisions,
+    find_unregistered_components,
+)
 from niflow.fuzz.cases import (
     NIFI_REJECTED,
     NIFLOW_BUG,
@@ -176,6 +179,7 @@ def check_offline(case: Case, *, target_majors: Sequence[int] = (1,)) -> CaseRes
             return result
 
         collisions = find_identity_collisions(flow)
+        unregistered = find_unregistered_components(flow)
 
         # --- JSON emission + round trip -------------------------------------
         try:
@@ -190,6 +194,14 @@ def check_offline(case: Case, *, target_majors: Sequence[int] = (1,)) -> CaseRes
                     f"find_identity_collisions() sees no duplicate: {exc}",
                     key="unreported-collision"))
             return result
+        except ValueError as exc:
+            # Wiring a component the flow does not contain is the user's
+            # mistake, and refusing it by name is the fix for the bare
+            # KeyError-with-a-memory-address this used to raise. Only an
+            # *unexplained* refusal is a niflow bug.
+            if not unregistered:
+                result.add(_exception_finding("emit_json", exc))
+            return result
         except Exception as exc:
             result.add(_exception_finding("emit_json", exc))
             return result
@@ -200,6 +212,13 @@ def check_offline(case: Case, *, target_majors: Sequence[int] = (1,)) -> CaseRes
                     "find_identity_collisions() reports duplicates but to_json "
                     f"emitted anyway: {collisions[0][1]}",
                     key="silent-merge"))
+            if unregistered:
+                result.add(_finding(
+                    "wiring",
+                    "find_unregistered_components() reports a component that is "
+                    f"wired but not in the flow, and to_json emitted anyway: "
+                    f"{unregistered[0][1]}",
+                    key="unregistered-emitted"))
 
         try:
             reparsed = from_json(snapshot_text)

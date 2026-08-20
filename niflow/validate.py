@@ -31,9 +31,12 @@ NiFi, since they can't be judged statically.
 from __future__ import annotations
 
 import re
-from typing import Dict, List, Set
+from typing import Dict, List, Set, Tuple
 
-from niflow.core import Flow, ProcessGroup, find_identity_collisions
+from niflow.core import (
+    Flow, Port, ProcessGroup, find_identity_collisions,
+    find_unregistered_components,
+)
 from niflow.processors.rules import (
     canonical_properties,
     descriptors_for,
@@ -55,6 +58,19 @@ _TIME_UNITS = {
     "w", "wk", "wks", "week", "weeks",
 }
 _DURATION_RE = re.compile(r"^\s*\d+(\.\d+)?\s*([A-Za-z]+)\s*$")
+
+
+# ``#{param}`` — the reference syntax; whether a context is BOUND is static
+# even though the value is not. NiFi escapes a literal ``#`` by doubling it,
+# so ``##{x}`` is the text "#{x}" and not a reference at all (flows/torture.py
+# has one on purpose) — an *odd* run of ``#`` before the brace is the real
+# thing, an even run is escaped.
+_PARAMETER_REF = re.compile(r"(#+)\{([^}]+)\}")
+
+
+def _parameter_references(value: str) -> List[str]:
+    return [name for hashes, name in _PARAMETER_REF.findall(value)
+            if len(hashes) % 2 == 1]
 
 
 def _is_expression(value: object) -> bool:
@@ -175,6 +191,81 @@ def _property_issues(proc, label: str) -> List[dict]:
     return out
 
 
+def _structural_issues(flow: Flow) -> List[dict]:
+    """Two things NiFi rejects at push time that are visible right here.
+
+    * **A connection that crosses a group boundary without a port.** NiFi
+      requires an input/output port to leave a process group; niflow emitted
+      the connection happily and the push failed with "Connection has a source
+      with identifier … but no component could be found in the Process Group",
+      which reads like a niflow bug and costs a whole push to discover. Legal
+      endpoints for a connection owned by group *g* are members of *g* itself,
+      or a **port** of one of its direct children (the parent-to-child hop
+      niflow already supports).
+    * **A parameter reference with no parameter context bound.** The validator
+      deliberately does not judge ``#{...}`` *values* — they are resolved on
+      the server — but whether any context is bound up the tree is static, and
+      NiFi refuses the component outright: "references one or more Parameters
+      but no Parameter Context is currently set on the Process Group".
+    """
+    owners: Dict[int, Tuple[ProcessGroup, str]] = {}
+
+    def index(group: ProcessGroup, path: str) -> None:
+        for member in (list(group.processors) + list(group.input_ports)
+                       + list(group.output_ports) + list(group.funnels)
+                       + list(group.process_groups)):
+            owners[id(member)] = (group, path)
+        for child in group.process_groups:
+            index(child, f"{path}/{child.name}")
+
+    index(flow, flow.name or ".")
+    issues: List[dict] = []
+
+    def visit(group: ProcessGroup, path: str, context_bound: bool) -> None:
+        bound = context_bound or group.parameter_context is not None
+        children = {id(child) for child in group.process_groups}
+        for conn in group.connections:
+            for role, end in (("source", conn.source), ("destination", conn.target)):
+                owner = owners.get(id(end))
+                if owner is None:
+                    continue  # not in the flow at all — reported separately
+                owner_group, owner_path = owner
+                if owner_group is group:
+                    continue
+                if isinstance(end, Port) and id(owner_group) in children:
+                    continue  # the parent-to-child-port hop, which is legal
+                issues.append({
+                    "component": f"{path}/{_connection_label(conn)}",
+                    "message": f"connection {role} {end.name!r} lives in "
+                               f"{owner_path!r}, not in {path!r} — NiFi needs an "
+                               f"input/output port to cross a group boundary",
+                })
+        if not bound:
+            for component in list(group.processors) + list(group.controller_services):
+                referenced = sorted({
+                    ref for value in (component.properties or {}).values()
+                    if isinstance(value, str)
+                    for ref in _parameter_references(value)
+                })
+                if referenced:
+                    issues.append({
+                        "component": f"{path}/{component.name}",
+                        "message": f"references parameter(s) "
+                                   f"{', '.join(repr(r) for r in referenced)} but no "
+                                   f"parameter context is bound to this group or any "
+                                   f"ancestor — NiFi refuses to run the component",
+                    })
+        for child in group.process_groups:
+            visit(child, f"{path}/{child.name}", bound)
+
+    visit(flow, flow.name or ".", False)
+    return issues
+
+
+def _connection_label(conn) -> str:
+    return f"{getattr(conn.source, 'name', '?')} -> {getattr(conn.target, 'name', '?')}"
+
+
 def validate_flow(
     flow: Flow, target_version: object = None, *, baseline: bool = True
 ) -> List[dict]:
@@ -218,7 +309,13 @@ def validate_flow(
         # silently merge or clobber each other on push — always an error.
         {"component": where, "message": message}
         for where, message in find_identity_collisions(flow)
-    ]
+    ] + [
+        # A service used as a property value but never added, or a connection
+        # endpoint that is not in the flow: the emitter has no identifier for
+        # it and raised a bare KeyError mid-push. Statically visible here.
+        {"component": where, "message": message}
+        for where, message in find_unregistered_components(flow)
+    ] + _structural_issues(flow)
 
     def visit(group: ProcessGroup, prefix: str) -> None:
         path = f"{prefix}/{group.name}" if prefix else group.name

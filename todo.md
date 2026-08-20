@@ -777,71 +777,70 @@ all produce a non-empty plan in both directions.
       construction. This also killed a second signature nobody had attributed
       to it: `xml_roundtrip:update:processor|properties[…]` (172 cases).
 
-- [ ] **P2 — bare `KeyError` (with a memory address) when a component is wired
-      but never registered.** Two shapes, both easy hand-editing mistakes:
-      a `ControllerService` passed as a property value but never
-      `add_controller_service`'d (`json_format._emit_properties:846`), and a
-      connection whose endpoint was never `add_processor`'d
-      (`json_format._emit_endpoint:930`). `validate` does not catch either, so
-      the first sign is an unreadable traceback in the middle of a push.
-      Repro: `niflow fuzz --replay shape-25b2ccb4fc` / `--replay shape-ea0fcdf8b2`.
-      Fix direction: a pre-emit reachability check next to
-      `find_identity_collisions`, naming the component and the group.
-      Server line: both (pure emitter).
+- [x] **P2 — bare `KeyError` when a component is wired but never registered.**
+      *(fixed 2026-08-20)* `core.find_unregistered_components()` reports both
+      shapes by name — a `ControllerService` used as a property value but never
+      added (checked across the **whole tree**: NiFi resolves a service from
+      any ancestor), and a connection endpoint that is not in the flow.
+      `validate` reports them offline, `_assert_identity_safe` refuses the push
+      **before teardown** (an emit-time failure after teardown loses the live
+      flow), and `to_json` itself now raises a `ValueError` naming the
+      component instead of a KeyError carrying a memory address. The fuzz
+      harness treats a named refusal of a genuinely broken model as correct —
+      and flags the opposite case, emitting one anyway.
 
-- [ ] **P3 — a live property whose value is the empty string drifts against an
-      unset model field** (`properties[FlowFile Description]: '' -> None` on
-      DetectDuplicate). `_diff_properties` compares `""` against the descriptor
-      default `None`. Same family as the P2 above; probably the same fix
-      (treat `""` and "unset with no default" as equal). Server line: both.
+- [x] **P3 — a live empty-string property drifted against an unset model
+      field.** *(fixed 2026-08-20)* `plan._effective_prop()`: unset means the
+      descriptor default, and `""` means unset **when the descriptor has no
+      default** — NiFi materialises "no value" as `""` for some properties
+      (`DetectDuplicate`'s `FlowFile Description`). A `""` written against a
+      descriptor that *does* have a default is still a real assertion (the
+      user overriding the default with nothing) and stays diffed.
 
-- [ ] **P3 — `to_json` is not byte-stable for an explicitly `None` property
-      value.** `properties={"x": None}` survives emission but `from_json`'s
-      `_clean_properties` drops it, so `to_json(from_json(to_json(f)))` differs
-      from `to_json(f)` — the one documented invariant of the JSON format.
-      Either drop `None` on the way out too, or keep it on the way in.
-      Server line: both (pure format).
+- [x] **P3 — `to_json` is byte-stable for an explicitly `None` property.**
+      *(fixed 2026-08-20)* The emit side now drops `None`-valued properties,
+      matching the parse side (`_clean_properties` drops them as "NiFi
+      defaults, not user state"). A snapshot creates its components fresh, so
+      an omitted key and an explicit null mean the same thing to the server —
+      and the format's one invariant, `to_json(from_json(to_json(f))) ==
+      to_json(f)`, holds again.
 
-- [ ] **P1 — niflow has no 1.x *relationship* data, so a push to 1.24 can leave
-      relationships unhandled and `validate` never notices.** The compat harvest
-      (`make catalog-v1`) records DESCRIPTORS and PROPERTY_NAMES but not
-      RELATIONSHIPS, and the rulebook only knows the 2.x set. Live proof on
-      1.24.0: `UpdateAttribute` with `Store State` set has a relationship
-      `set state fail` that does not exist in the 2.x catalog —
-      `validate_flow` returns `[]` while the server says *"Relationship 'set
-      state fail' is not connected to any component and is not
-      auto-terminated"*, i.e. the processor cannot start after a clean push.
-      Repro:
-      ```
-      NIFLOW_NIFI_HOST=https://localhost:8444/nifi-api niflow fuzz --tier 2 \
-          --replay props-1cb013c86a
-      ```
-      or push a lone `UpdateAttribute` with `{"Store State": "Store state
-      locally"}` to 1.24 and read the Errors panel. Fix direction: harvest
-      relationships into `compat_v1` and have `validate` (and the auto-terminate
-      helper) take a target line, the way the emitter now does for properties.
-      Server line: **1.x only**. Sibling of the 2026-08-18 property fix; same
-      shape, different table.
+- [x] **P1 — 1.x relationship data.** Shipped with T13/T17: `make catalog-v1`
+      emits RELATIONSHIPS, CONDITIONAL_RELATIONSHIPS, DYNAMIC_RELATIONSHIPS and
+      PRIMARY_NODE_ONLY into `compat_v1`, and `validate_flow` judges
+      relationships against the **target line** (default: the 1.24 baseline).
+      Verified 2026-08-20: `UpdateAttribute` with `Store State` set now reports
+      `relationship 'set state fail' is not connected or auto-terminated`
+      against 1.24 — the case that used to validate clean and then refuse to
+      start on the server.
 
-- [ ] **P3 — `validate` misses two things NiFi rejects and niflow could see
-      statically.** Both surfaced ~100 times in the tier-2 sweep:
-      * a property value referencing `#{param}` while **no parameter context is
-        bound** anywhere up the tree — NiFi: *"references one or more Parameters
-        but no Parameter Context is currently set on the Process Group"*. The
-        validator deliberately skips EL/parameter *values*, but whether a
-        context is bound is statically knowable.
-      * a connection whose two endpoints live in **different child groups**
-        (NiFi requires ports for that). niflow emits it happily; the push fails
-        with *"Connection has a source with identifier … but no component could
-        be found in the Process Group"*, which reads like a niflow bug and
-        wastes a push. Repro: `niflow fuzz --replay shape-267c6461ba`.
-      Server line: both.
+- [x] **P3 — `validate` now catches both things NiFi rejects and niflow could
+      see statically.** *(fixed 2026-08-20, `validate._structural_issues`)*
+      * **A parameter reference with no context bound anywhere up the tree.**
+        Values stay unjudged (they resolve on the server), but whether a
+        context is bound is static. NiFi's escape rule is honoured: `##{x}` is
+        the literal text `#{x}` and not a reference — an *odd* run of `#`
+        before the brace is the real thing (flows/torture.py ships one on
+        purpose, and it was the first false positive this check produced).
+      * **A connection whose endpoints live in different groups.** Legal
+        endpoints for a connection owned by group *g* are members of *g*, or a
+        **port** of one of its direct children (the parent-to-child hop niflow
+        already supports); anything else needs a port, and the push failed
+        with "no component could be found in the Process Group", which reads
+        like a niflow bug and costs a whole push to discover.
 
 - [ ] **Follow-ups for the harness itself** (not bugs, just coverage gaps):
       a controller-service *catalog* sweep (services get exercised only as
       referenced types today), a case kind for parameter contexts with real
       secrets, and `apply.py` failure injection (the incremental applier is only
       covered through the live tier).
+## Fuzz round two — offline sweep is clean (2026-08-20)
+Same seed and case set as round one: **3,419 cases, 0 findings** (round one
+closed at 40 failing / 5 signatures). The five that were left belonged to the
+unregistered-component `KeyError`, the `''`-vs-unset and explicit-`None`
+drift pair, and the 1.x property-namespace family — all fixed above. Tier 2/3
+against the live pair still need a re-run for a comparable number.
+
 ## Fuzz round one — "cries wolf" cluster closed (2026-08-19)
 The four drift-forever items above (`enabled`, `@PrimaryNodeOnly`,
 `int`/`bool` property values, empty-group `to_python`) are fixed; see each
@@ -862,25 +861,12 @@ primary-node-only types (NiFi refuses the edit, so there is nothing for the
 plan to see). Without those two, the fix would have traded 344 findings for
 517 of the opposite kind.
 
-- [ ] **P2 — run state is invisible to `plan` and `pull`: NiFi's
-      flow-definition download sanitises it.** Found while fixing the `enabled`
-      drift. `/process-groups/{id}/download` reports **every controller service
-      as `scheduledState: DISABLED`** even when it is live-ENABLED, and every
-      processor as `ENABLED` even when it is RUNNING (verified on 2.7.2:
-      `/flow/process-groups/{id}/controller-services` says ENABLED for the same
-      service at the same moment). Consequences:
-      * `niflow pull` writes `enabled=False` for services that are enabled on
-        the canvas — a lossy pull, silently;
-      * a *stated* `enabled=True` re-plans forever (the apply really does
-        enable the service, the next read just can't see it), and a stated
-        `enabled=False` can never disable an enabled service;
-      * the same blindness applies to `scheduled_state='RUNNING'`, so anyone
-        who states RUNNING gets permanent drift.
-      Fix direction: overlay the real states onto the live model in
-      `pull_flow`/`plan_flow` — one recursive read of
-      `/flow/process-groups/{id}/controller-services` (and the processor list,
-      which `walk_processors` already does) — then `enabled` becomes a fully
-      honest two-way assertion. Server line: **both**.
+- [x] **P2 — run state is no longer invisible to `plan` and `pull`.** Fixed
+      2026-08-19: `_overlay_run_state` reads the real states
+      (`/flow/process-groups/{id}/controller-services` plus the processor
+      listing) onto the live model after the sanitising `/download`, so
+      `enabled` is an honest two-way assertion and a stated `RUNNING` no longer
+      drifts forever. Cover: tests/test_pull_run_state.py.
 
 - [ ] **P3 — a live property whose value NiFi materialises differently from its
       own descriptor default drifts forever.** Sibling of the `''` vs unset P3.

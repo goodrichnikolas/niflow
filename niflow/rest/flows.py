@@ -6,7 +6,9 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from niflow.core import Flow, find_identity_collisions
+from niflow.core import (
+    Flow, find_identity_collisions, find_unregistered_components,
+)
 from niflow.rest.common import (
     _POLL_INTERVAL_S,
     _POLL_TIMEOUT_S,
@@ -32,6 +34,17 @@ def _assert_identity_safe(flow: Flow) -> None:
             "flow has duplicate names that break niflow's name-based identity; "
             "pushing would silently merge or drop components, so nothing was "
             f"changed:\n{lines}"
+        )
+    # Same contract, different mistake: a component that is wired but never
+    # added used to surface as a bare KeyError with a memory address, thrown
+    # from the middle of the emit — i.e. after teardown, on a push that had
+    # already started.
+    unregistered = find_unregistered_components(flow)
+    if unregistered:
+        lines = "\n".join(f"  - {where}: {message}" for where, message in unregistered)
+        raise ValueError(
+            "flow wires up components it does not contain, so the snapshot "
+            f"cannot be emitted; nothing was changed:\n{lines}"
         )
 
 

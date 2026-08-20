@@ -266,4 +266,21 @@ def test_emitted_property_values_are_strings():
     # own snapshot on the next plan.
     proc.properties = {"n": 7, "b": True, "u": None}
     emitted = json.loads(flow.to_json())["flowContents"]["processors"][0]["properties"]
-    assert emitted == {"n": "7", "b": "true", "u": None}
+    # None is dropped, not emitted as null: the parse side drops None-valued
+    # properties (they are NiFi defaults, not user state), so emitting one made
+    # to_json(from_json(to_json(f))) differ from to_json(f).
+    assert emitted == {"n": "7", "b": "true"}
+
+
+def test_an_explicitly_none_property_round_trips_byte_stable():
+    """The format's one invariant: to_json(from_json(to_json(f))) == to_json(f)."""
+    from niflow.core import Processor
+
+    flow = Flow("F")
+    flow.add_processor(Processor(
+        name="A", type="org.apache.nifi.processors.attributes.UpdateAttribute",
+        properties={"unset": None, "set": "1"}, auto_terminate=["success"]))
+    from niflow.formats import from_json
+
+    once = flow.to_json()
+    assert once == from_json(once).to_json()

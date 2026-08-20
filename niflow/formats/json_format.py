@@ -850,8 +850,27 @@ def _emit_properties(props: dict, identifiers: Dict[int, str]) -> dict:
     """
     out: Dict[str, Any] = {}
     for key, value in props.items():
+        if value is None:
+            # The parse side drops None-valued properties (they are NiFi's
+            # defaults, not user state — see _clean_properties), so emitting
+            # one broke the format's single invariant: to_json(from_json(
+            # to_json(f))) was not byte-identical to to_json(f). A snapshot
+            # creates its components fresh, so an omitted key and an explicit
+            # null mean the same thing to the server.
+            continue
         if isinstance(value, ControllerService):
-            out[key] = identifiers[id(value)]
+            try:
+                out[key] = identifiers[id(value)]
+            except KeyError:
+                # A service referenced but never added has no identifier. The
+                # bare KeyError this used to raise carried a memory address and
+                # nothing else; validate/push now catch it first, so reaching
+                # here means a caller emitted a model it never checked.
+                raise ValueError(
+                    f"property {key!r} references controller service "
+                    f"{value.name!r}, which is not part of this flow — "
+                    f"add_controller_service() it before emitting"
+                ) from None
         else:
             out[key] = nifi_property_value(value)
     return out
@@ -934,6 +953,12 @@ def _emit_endpoint(
         kind = "PROCESS_GROUP"
     else:
         kind = "PROCESSOR"  # defensive fallback; shouldn't happen in valid flows
+    if id(component) not in identifiers:
+        raise ValueError(
+            f"connection endpoint {getattr(component, 'name', component)!r} "
+            f"({kind.lower().replace('_', ' ')}) is not part of this flow — "
+            f"add it to a group before connecting it"
+        )
     ref = {
         "id": identifiers[id(component)],
         "name": component.name,
