@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import time
-from typing import Iterator, List, Optional, Tuple
+from datetime import datetime, timedelta, timezone
+from typing import Dict, Iterator, List, Optional, Tuple
 
 from niflow.rest.common import (
     _POLL_INTERVAL_S,
@@ -19,6 +20,31 @@ logger = get_logger()
 # component with a million events cannot turn one click into a heavy query.
 _PROV_ESCALATION = 10
 _PROV_RESULT_CEILING = 5000
+
+# Above that ceiling the count escalation gives up, so "recent" is bounded by
+# *time* instead (T7a). NiFi's request DTO takes ``startDate``/``endDate`` as
+# ``MM/dd/yyyy HH:mm:ss`` plus a zone, and it honours the zone — verified on
+# both 1.24.0 and 2.7.2 by sending the same instant as UTC and as EDT wall
+# clock and getting the same events — so niflow always sends UTC and never has
+# to care what timezone the server runs in.
+_PROV_TIME_FORMAT = "%m/%d/%Y %H:%M:%S UTC"
+# The walk starts one minute wide, narrows (÷4) while a slice is still capped,
+# and widens (×4) as it moves back into sparser history. One second is the
+# floor because that is all the date format can express.
+_PROV_WINDOW_START_S = 60
+_PROV_WINDOW_MIN_S = 1
+_PROV_WINDOW_MAX_S = 6 * 3600
+# An empty window means we are walking through history with nothing in it, so
+# widen harder than after a productive one; the whole walk is bounded by a step
+# count as well as by the look-back, so a pathological flow cannot spin here.
+_PROV_WINDOW_GROWTH = 4
+_PROV_WINDOW_EMPTY_GROWTH = 8
+_PROV_WINDOW_MAX_STEPS = 20
+# How far back the walk will go before it stops looking, and how far into the
+# future the first window reaches so a small client/server clock skew cannot
+# hide the newest events.
+_PROV_LOOKBACK_S = 24 * 3600
+_PROV_FUTURE_PAD_S = 300
 
 
 def _event_order(event: dict) -> int:
@@ -576,7 +602,9 @@ class InspectMixin:
 
     def _provenance_query(self, search_terms: dict, max_results: int, what: str,
                           summarize: bool = True,
-                          totals: Optional[dict] = None) -> List[dict]:
+                          totals: Optional[dict] = None,
+                          start: Optional[datetime] = None,
+                          end: Optional[datetime] = None) -> List[dict]:
         """Run one async provenance query (create → poll → delete); raw DTOs.
 
         ``summarize=False`` asks NiFi for the *whole* event DTO — attributes,
@@ -604,11 +632,21 @@ class InspectMixin:
                 "under-reports events when searchTerms is empty; filter by "
                 "FlowFileUUID, ProcessorID or Component ID"
             )
-        body = {"provenance": {"request": {
+        request = {
             "searchTerms": search_terms,
             "maxResults": max_results,
             "summarize": summarize,
-        }}}
+        }
+        # Bounding by time is what makes a busy component answerable at all:
+        # inside a window small enough to fit under the cap, the answer is
+        # complete rather than an arbitrary subset (see _provenance_windowed).
+        if start is not None:
+            request["startDate"] = start.astimezone(timezone.utc).strftime(
+                _PROV_TIME_FORMAT)
+        if end is not None:
+            request["endDate"] = end.astimezone(timezone.utc).strftime(
+                _PROV_TIME_FORMAT)
+        body = {"provenance": {"request": request}}
         prov = self._request("POST", "/provenance", json=body).json()["provenance"]
         prov_id = prov["id"]
         try:
@@ -623,6 +661,12 @@ class InspectMixin:
                 totals["total"] = results.get("total", "")
                 totals["total_count"] = results.get("totalCount", 0) or 0
                 totals["oldest_event"] = results.get("oldestEvent", "")
+                # The server's own clock, free with every answer: "generated"
+                # is its current time of day and "timeOffset" its UTC offset in
+                # milliseconds. A time-bounded query has to be anchored on the
+                # server's now, not the caller's.
+                totals["generated"] = results.get("generated", "")
+                totals["time_offset_ms"] = results.get("timeOffset", 0) or 0
             return results.get("provenanceEvents") or []
         finally:
             self._request("DELETE", f"/provenance/{prov_id}")
@@ -647,31 +691,154 @@ class InspectMixin:
         the answer is complete (or the ceiling is reached) and the newest
         ``max_results`` are then taken here, where the ordering is knowable.
         """
-        cap = max(1, max_results)
-        events: List[dict] = []
-        capped = False
-        while True:
+        def ask(cap: int) -> Tuple[List[dict], bool, dict]:
             totals: dict = {}
-            events = self._provenance_query(
+            found = self._provenance_query(
                 search_terms, cap, what, summarize=summarize, totals=totals)
-            capped = str(totals.get("total") or "").endswith("+")
-            if not capped or cap >= ceiling:
-                break
+            return found, str(totals.get("total") or "").endswith("+"), totals
+
+        cap = max(1, max_results)
+        events, capped, totals = ask(cap)
+        # One escalation step before reaching for time: a component whose whole
+        # history is only just over ``max_results`` is settled by it, in one
+        # cheap query, and stays on the exact path.
+        if capped and max_results and cap < ceiling:
             cap = min(cap * _PROV_ESCALATION, ceiling)
+            events, capped, totals = ask(cap)
+        if not capped:
+            events.sort(key=_event_order)
+            return (events[-max_results:] if max_results else events), False
+
+        if max_results:
+            # Bounding by time answers this in one or two cheap queries where
+            # escalating the count needs four heavy ones and still may not
+            # settle it (measured on 1.24 against a component with ~200k
+            # events: a complete 60-second window came back in 0.01s, a
+            # ceiling-capped countwide query in 0.22s).
+            windowed, still_capped = self._provenance_windowed(
+                search_terms, max_results, what, summarize, ceiling,
+                self._server_now(totals))
+            if windowed:
+                return windowed, still_capped
+
+        # Nothing inside the look-back (or the caller wants *every* event):
+        # escalate the cap instead, which is exact whenever the component's
+        # whole history fits under the ceiling.
+        while capped and cap < ceiling:
+            cap = min(cap * _PROV_ESCALATION, ceiling)
+            events, capped, totals = ask(cap)
         events.sort(key=_event_order)
         return (events[-max_results:] if max_results else events), capped
 
-    def recent_events(self, component_id: str, max_results: int = 25) -> List[dict]:
+    @staticmethod
+    def _server_now(totals: dict) -> datetime:
+        """The server's current time, as a UTC ``datetime``.
+
+        Every provenance answer carries the server's clock: ``generated`` is
+        its current *time of day* (``"23:11:39 UTC"``) and ``timeOffset`` its
+        UTC offset in milliseconds. Only the date is missing, and that comes
+        from this machine — with a rollover correction, so a query run either
+        side of midnight cannot land a day out.
+
+        Anchoring on the server matters because the window is the server's
+        judgement, not ours: a laptop minutes ahead of a work NiFi would ask
+        for a slice that has not happened yet. Falls back to this machine's
+        clock when the fields are missing (an older server, or a fixture).
+        """
+        here = datetime.now(timezone.utc)
+        stamp = str(totals.get("generated") or "").split()[0:1]
+        if not stamp:
+            return here
+        try:
+            clock = datetime.strptime(stamp[0], "%H:%M:%S").time()
+        except ValueError:
+            return here
+        offset = timedelta(milliseconds=totals.get("time_offset_ms") or 0)
+        server_local = here + offset
+        candidate = datetime.combine(server_local.date(), clock).replace(
+            tzinfo=timezone.utc) - offset
+        # Same wall clock, wrong date: pick the day that puts the server's
+        # "now" closest to ours instead of a 24-hour jump.
+        for shift in (0, -1, 1):
+            shifted = candidate + timedelta(days=shift)
+            if abs((shifted - here).total_seconds()) <= 12 * 3600:
+                return shifted
+        return candidate
+
+    def _provenance_windowed(
+        self, search_terms: dict, max_results: int, what: str, summarize: bool,
+        ceiling: int, server_now: datetime, lookback: int = _PROV_LOOKBACK_S,
+    ) -> Tuple[List[dict], bool]:
+        """The newest ``max_results`` events, bounded by *time* not by count.
+
+        The count escalation in :meth:`_provenance_newest` cannot answer for a
+        component with more events than the ceiling: NiFi keeps flagging the
+        answer capped, and a capped answer is an arbitrary subset — the reason
+        "recent events" could show yesterday's while the newest were 130k event
+        ids later.
+
+        So walk backwards in windows instead. A window whose contents fit under
+        the cap is answered *completely* (NiFi reports a plain ``total``, not
+        ``"N+"``), and a complete window is trustworthy. Each still-capped
+        window is narrowed to a quarter and retried against the same end; each
+        complete one is banked and the walk steps back, widening as it moves
+        into sparser history.
+
+        Returns ``(events ascending, capped)``. ``capped`` here means the last
+        resort actually happened: a **one-second** slice held more events than
+        the ceiling, so its subset is arbitrary — but it is arbitrary *within
+        the newest second*, which is still the answer the caller asked for.
+        """
+        collected: Dict[int, dict] = {}
+        end = server_now + timedelta(seconds=_PROV_FUTURE_PAD_S)
+        floor = server_now - timedelta(seconds=lookback)
+        # The first slice has to absorb the future padding, or it would sit
+        # entirely in the future and cost a guaranteed-empty round trip.
+        window = _PROV_WINDOW_START_S + _PROV_FUTURE_PAD_S
+        capped = False
+        steps = 0
+        while len(collected) < max_results and end > floor:
+            if steps >= _PROV_WINDOW_MAX_STEPS:
+                break
+            steps += 1
+            start = max(end - timedelta(seconds=window), floor)
+            totals: dict = {}
+            events = self._provenance_query(
+                search_terms, ceiling, what, summarize=summarize,
+                totals=totals, start=start, end=end)
+            if str(totals.get("total") or "").endswith("+"):
+                if window > _PROV_WINDOW_MIN_S:
+                    window = max(window // _PROV_WINDOW_GROWTH, _PROV_WINDOW_MIN_S)
+                    continue    # same end, narrower slice
+                capped = True   # one second is busier than the ceiling
+            for event in events:
+                collected[_event_order(event)] = event
+            end = start
+            growth = _PROV_WINDOW_GROWTH if events else _PROV_WINDOW_EMPTY_GROWTH
+            window = min(window * growth, _PROV_WINDOW_MAX_S)
+        ordered = sorted(collected.values(), key=_event_order)
+        return ordered[-max_results:], capped
+
+    def recent_events(self, component_id: str, max_results: int = 25,
+                      totals: Optional[dict] = None) -> List[dict]:
         """Recent provenance events for a component, newest first.
 
         Mirrors "View data provenance" on a processor — the click-path this is
         meant to replace — scoped to one component via a provenance query
         (create → poll → delete).
+
+        ``totals`` (a dict the caller passes in) is filled with ``capped``:
+        True only in the last-resort case where a **single second** of this
+        component's history holds more events than the query ceiling, so the
+        answer is an arbitrary subset of that second rather than its newest
+        events. Everything else is exact.
         """
-        events, _capped = self._provenance_newest(
+        events, capped = self._provenance_newest(
             {"ProcessorID": {"value": component_id, "inverse": False}},
             max_results, component_id,
         )
+        if totals is not None:
+            totals["capped"] = capped
         events.reverse()   # newest first, as the caller (and NiFi's UI) show it
         return [
             {

@@ -2,10 +2,10 @@
 
 ## Where things stand — 2026-08-20
 The 2026-08-19 ticket sweep (T1–T17) is **closed**: every ticket is done except
-the two that cannot be done from here — **T7a** (bounding "recent events" by
-time rather than count, which changes what "recent" means) and **T7h** (needs a
-cluster). **T7d** is a recorded fact about MergeContent's hop counts, not a
-task.
+**T7h**, which needs a cluster this machine does not have. **T7d** is a
+recorded fact about MergeContent's hop counts, not a task. T7a (bounding
+"recent events" by time) landed 2026-08-20 without changing what "recent
+events" means — see its entry.
 
 Every fuzz P-finding is closed too. Sweeps as of today: offline **3,419 cases /
 0 findings**; tier 3 **120 / 0 on 2.7.2 and 120 / 0 on 1.24.0**. Unit tests 685;
@@ -1202,12 +1202,42 @@ on both lines).
 
 ### Written up, not fixed
 
-- [ ] **T7a — `recent_events`/trace can still be incomplete above the
-      escalation ceiling.** `_PROV_RESULT_CEILING = 5000`: a component with
-      more matching events than that falls back to NiFi's arbitrary subset.
-      The real fix is `startDate`/`endDate` on the provenance request (the
-      DTO supports both) to bound "recent" by time instead of by count.
-      Deliberately not done here: it changes what "recent events" means.
+- [x] **T7a — above the escalation ceiling, "recent" is bounded by time.**
+      *(done 2026-08-20, verified live on 1.24.0 and 2.7.2)* The worry was that
+      time-bounding changes what "recent events" *means*. It doesn't have to:
+      the window is a mechanism, not the contract. `recent_events` still
+      answers "the newest N" — it just stops asking a question NiFi cannot
+      answer.
+      `_provenance_windowed()` walks backwards in windows, narrowing (÷4) while
+      a slice still comes back capped and widening (×4, ×8 through empty
+      stretches, capped at 6h) as it moves into sparser history, until it has N
+      events or reaches the 24h look-back. A window whose contents fit under
+      the cap is answered **completely** — NiFi reports a plain `total` instead
+      of `"N+"` — and that is what makes it trustworthy.
+      Probed live before it was written:
+      - `startDate`/`endDate` take `MM/dd/yyyy HH:mm:ss` **plus a zone**, and
+        the zone is honoured (the same instant sent as UTC and as EDT wall
+        clock returned the same events on both lines), so niflow always sends
+        UTC and never has to know the server's timezone. `.SSS` and ISO-8601
+        are both rejected with a 400.
+      - Every provenance answer carries the server's own clock — `generated`
+        (time of day) and `timeOffset` (UTC offset in ms) — so the window is
+        anchored on the **server's** now, not the caller's; a laptop minutes
+        ahead of a work NiFi would otherwise ask for a slice that has not
+        happened yet. `_server_now()` handles the midnight rollover and falls
+        back to the local clock when the fields are absent.
+      Order of attack: one query at `max_results`, one ×10 escalation (which
+      settles any component whose whole history is just over the ask), then the
+      walk, then — only if the walk found nothing inside the look-back — the
+      old escalation to the ceiling, so an answer is never *worse* than before.
+      **Cheaper, too:** ~200k events on 1.24 went from 0.64s / 4 heavy queries
+      (and an answer that was still an arbitrary subset) to **0.06s / 3
+      queries** with the true newest 25. `capped` now means only the honest
+      last resort: one *second* busier than the ceiling, where the subset is
+      arbitrary within that second. Cover: 7 unit tests over a fake that
+      reproduces NiFi's shard behaviour, plus a live test that overflows the
+      ceiling and checks the answer against a complete ground-truth window
+      (green on both lines).
 - [x] **T7b — a wide fork folds into one row.** *(done 2026-08-20)*
       `FlowFollower.branch_groups()` folds branches by (relationship,
       destination); above 12 branches the CLI prints the grouped view — count,

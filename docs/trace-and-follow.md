@@ -35,6 +35,17 @@ Things worth knowing:
   changed".
 * **A capped journey shows the NEWEST N hops**, so hop #1 is then *not* where
   the file began. It says so when that happens.
+* **NiFi's `maxResults` does not mean "the newest N".** The cap is applied per
+  index shard, so a capped query answers with an arbitrary subset — measured on
+  1.24 against a component with 800 events, asking for 10 returned events from
+  the *previous day*. niflow therefore raises the cap until the answer comes
+  back complete, and for a component too busy for that (more events than the
+  5,000 ceiling, however far the cap is raised) it asks for a **time window**
+  instead: NiFi answers a window that fits under the cap completely, so the
+  walk steps backwards in windows — narrowing while a slice is still capped,
+  widening as it moves into sparser history — until it has the newest N. It is
+  also much cheaper: 0.06s and three queries against ~200k events on 1.24,
+  where escalating the count alone took 0.64s and still could not settle it.
 * **No hops** means the uuid is wrong or the events have aged out of the
   provenance repository — it says that too, rather than printing nothing.
 * Content in/out is fetchable per hop where NiFi still has it (the GUI has

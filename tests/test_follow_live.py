@@ -12,6 +12,7 @@ ports, a fan-in, a 50-way split into a 50-way merge, a followable 2-way
 split/merge, a route-to-failure lane with no provenance event, and a 200-file
 batch that overflows NiFi's queue listing.
 """
+import datetime
 import sys
 import time
 from pathlib import Path
@@ -235,6 +236,57 @@ def test_recent_events_returns_the_newest_events_not_an_arbitrary_slice(deployed
         assert len(events) == size
         assert int(events[0]["event_id"]) == newest      # newest first
         assert events == sorted(events, key=lambda e: -int(e["event_id"]))
+    _drain(client, pg_id)
+
+
+def test_a_component_past_the_escalation_ceiling_still_answers_with_the_newest(
+        deployed):
+    """T7a: above the ceiling the count can never settle it, so bound by time.
+
+    NiFi's ``maxResults`` is applied per index shard, so a capped answer is an
+    arbitrary subset — and a component with more events than
+    ``_PROV_RESULT_CEILING`` is *always* capped, however far the cap is
+    escalated. The walk instead asks for windows small enough to be answered
+    completely, which is both correct and much cheaper (measured on 1.24
+    against ~200k events: 0.06s and three queries, against 0.64s before).
+    """
+    from niflow.rest.inspect import _PROV_RESULT_CEILING
+
+    client = deployed
+    pg_id = client.resolve_group(GROUP)
+    bulk = _proc(client, pg_id, "BulkGen")
+
+    # Overflow the ceiling: each run is BATCH creates, and every file is
+    # dropped at the auto-terminated end of the lane.
+    runs = (_PROV_RESULT_CEILING // labyrinth.BATCH) + 4
+    for _ in range(runs):
+        client.run_processor_once(bulk["id"])
+    time.sleep(4)
+
+    terms = {"ProcessorID": {"value": bulk["id"], "inverse": False}}
+    totals = {}
+    client._provenance_query(terms, _PROV_RESULT_CEILING, "bulk", totals=totals)
+    assert str(totals["total"]).endswith("+"), (
+        "fixture did not exceed the escalation ceiling — nothing to prove")
+
+    # Ground truth: one more batch, in its own second, so a window covering
+    # only that batch comes back complete and names the newest events exactly.
+    mark = client._server_now(totals)
+    time.sleep(1.5)          # the request format has second resolution
+    client.run_processor_once(bulk["id"])
+    time.sleep(3)
+    truth_totals = {}
+    truth = client._provenance_query(
+        terms, _PROV_RESULT_CEILING, "bulk", totals=truth_totals,
+        start=mark + datetime.timedelta(seconds=1),
+        end=mark + datetime.timedelta(seconds=120))
+    assert not str(truth_totals["total"]).endswith("+"), (
+        "the ground-truth window is itself capped — narrow it")
+    assert truth, "the final batch produced no events"
+    newest = sorted(int(e["eventId"]) for e in truth)[-25:]
+
+    events = client.recent_events(bulk["id"], max_results=25)
+    assert [int(e["event_id"]) for e in events] == sorted(newest, reverse=True)
     _drain(client, pg_id)
 
 

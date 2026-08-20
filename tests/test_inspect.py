@@ -278,3 +278,153 @@ def test_an_unfiltered_provenance_query_is_refused():
         client._provenance_query({}, 100, "recent events")
     assert "unfiltered provenance query" in str(caught.value)
     assert "FlowFileUUID" in str(caught.value)
+
+
+# --- T7a: above the escalation ceiling, "recent" is bounded by time ----------
+
+class _BusyProvenance:
+    """A server whose provenance behaves the way NiFi's actually does.
+
+    Measured on 1.24.0: a capped query answers with an *arbitrary* subset, not
+    the newest N — once seen as events from the previous day while the newest
+    were 130k event ids later. This fake reproduces exactly that: when the
+    match count exceeds the cap it returns the OLDEST slice and flags the
+    answer with a trailing "+" the way NiFi does.
+    """
+
+    def __init__(self, events, ceiling=5000):
+        self.events = events            # ascending by event id
+        self.ceiling = ceiling
+        self.windows = []               # (start, end) actually requested
+
+    def query(self, search_terms, cap, what, summarize=True, totals=None,
+              start=None, end=None):
+        self.windows.append((start, end))
+        matched = [
+            e for e in self.events
+            if (start is None or e["when"] >= start)
+            and (end is None or e["when"] <= end)
+        ]
+        capped = len(matched) > cap
+        served = matched[:cap] if capped else matched
+        if totals is not None:
+            totals["total"] = f"{len(served)}+" if capped else str(len(served))
+            totals["total_count"] = len(served)
+            totals["generated"] = "12:00:00 UTC"
+            totals["time_offset_ms"] = 0
+        return [dict(e["dto"]) for e in served]
+
+
+def _busy_client(events, ceiling=5000):
+    from niflow.client import NiFiClient
+
+    client = NiFiClient.__new__(NiFiClient)
+    fake = _BusyProvenance(events, ceiling)
+    client._provenance_query = fake.query
+    client._server_now = staticmethod(lambda totals: NOW)
+    return client, fake
+
+
+import datetime as _dt
+
+NOW = _dt.datetime(2026, 8, 20, 12, 0, 0, tzinfo=_dt.timezone.utc)
+
+
+def _stream(count, seconds_apart=0.01, first_id=1):
+    """`count` events ending just before NOW, newest last."""
+    return [
+        {"when": NOW - _dt.timedelta(seconds=(count - i) * seconds_apart),
+         "dto": {"eventId": str(first_id + i), "eventType": "CREATE"}}
+        for i in range(count)
+    ]
+
+
+def test_a_component_past_the_ceiling_still_gets_its_newest_events():
+    """The bug: the count escalation gives up and the subset is arbitrary."""
+    events = _stream(20000)
+    client, fake = _busy_client(events, ceiling=5000)
+
+    got, capped = client._provenance_newest(
+        {"ProcessorID": {"value": "p1", "inverse": False}}, 25, "p1")
+
+    assert [e["eventId"] for e in got] == [str(i) for i in range(19976, 20001)]
+    assert capped is False           # every window it used answered completely
+    assert any(start is not None for start, _ in fake.windows), "no window was used"
+
+
+def test_the_walk_narrows_until_a_window_answers_completely():
+    events = _stream(20000, seconds_apart=0.001)   # 20 events per ms — dense
+    client, fake = _busy_client(events, ceiling=100)
+
+    got, capped = client._provenance_newest(
+        {"ProcessorID": {"value": "p1", "inverse": False}}, 10, "p1")
+
+    assert [e["eventId"] for e in got] == [str(i) for i in range(19991, 20001)]
+    widths = [(end - start).total_seconds()
+              for start, end in fake.windows if start is not None]
+    assert widths[0] > widths[-1], "the walk never narrowed"
+
+
+def test_one_second_busier_than_the_ceiling_is_reported_capped():
+    """The honest last resort: an arbitrary subset OF THE NEWEST SECOND."""
+    events = _stream(20000, seconds_apart=0.0)      # all at the same instant
+    client, _ = _busy_client(events, ceiling=100)
+
+    got, capped = client._provenance_newest(
+        {"ProcessorID": {"value": "p1", "inverse": False}}, 10, "p1")
+
+    assert capped is True
+    assert len(got) == 10
+
+
+def test_a_quiet_component_never_pays_for_a_window():
+    events = _stream(30)
+    client, fake = _busy_client(events, ceiling=5000)
+
+    got, capped = client._provenance_newest(
+        {"ProcessorID": {"value": "p1", "inverse": False}}, 25, "p1")
+
+    assert capped is False
+    assert [e["eventId"] for e in got] == [str(i) for i in range(6, 31)]
+    assert all(start is None for start, _ in fake.windows), "windowed a quiet component"
+
+
+def test_events_older_than_the_look_back_still_answer_something():
+    """Never worse than before: the capped subset is the floor, not an empty list."""
+    old = [
+        {"when": NOW - _dt.timedelta(days=30),
+         "dto": {"eventId": str(i), "eventType": "CREATE"}}
+        for i in range(1, 20001)
+    ]
+    client, _ = _busy_client(old, ceiling=100)
+
+    got, capped = client._provenance_newest(
+        {"ProcessorID": {"value": "p1", "inverse": False}}, 10, "p1")
+
+    assert len(got) == 10
+    assert capped is True
+
+
+def test_the_server_clock_anchors_the_window_not_ours():
+    """A laptop ahead of the server would ask for a slice that hasn't happened."""
+    from niflow.client import NiFiClient
+
+    now = _dt.datetime.now(_dt.timezone.utc)
+    totals = {"generated": (now - _dt.timedelta(hours=2)).strftime("%H:%M:%S") + " UTC",
+              "time_offset_ms": 0}
+    anchored = NiFiClient._server_now(totals)
+    assert abs((now - anchored).total_seconds() - 7200) < 5
+
+    # No clock in the answer (old server, fixture): fall back to ours.
+    assert abs((NiFiClient._server_now({}) - now).total_seconds()) < 5
+
+
+def test_the_server_clock_survives_midnight():
+    from niflow.client import NiFiClient
+
+    now = _dt.datetime.now(_dt.timezone.utc)
+    minutes_ago = now - _dt.timedelta(minutes=10)
+    totals = {"generated": minutes_ago.strftime("%H:%M:%S") + " UTC",
+              "time_offset_ms": 0}
+    anchored = NiFiClient._server_now(totals)
+    assert abs((anchored - minutes_ago).total_seconds()) < 2
