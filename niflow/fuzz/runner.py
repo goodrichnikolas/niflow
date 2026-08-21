@@ -135,6 +135,36 @@ def cleanup_sandboxes(client: Any, prefix: str = SANDBOX_PREFIX) -> int:
             progressed = True
         if not progressed:
             break
+    removed += _cleanup_contexts(client, prefix)
+    return removed
+
+
+def _cleanup_contexts(client: Any, prefix: str) -> int:
+    """Delete the parameter contexts a sweep created.
+
+    Contexts are **global** and outlive the group that used them, so a sweep
+    that leaves one behind poisons the next run: a stale sensitive parameter
+    left thirteen later cases unable to export their group at all on 1.24
+    (``GET /process-groups/{id}/download`` answered 500).
+    """
+    removed = 0
+    try:
+        entities = client._get_json("/flow/parameter-contexts").get(
+            "parameterContexts", [])
+    except Exception:  # pragma: no cover - older server, or no permission
+        return 0
+    for entity in entities:
+        component = entity.get("component") or {}
+        if not str(component.get("name") or "").startswith(prefix):
+            continue
+        try:
+            client._request(
+                "DELETE", f"/parameter-contexts/{component['id']}",
+                params={"version": (entity.get("revision") or {}).get("version", 0),
+                        "clientId": "niflow"})
+            removed += 1
+        except Exception:
+            continue  # still referenced by a group we could not delete
     return removed
 
 

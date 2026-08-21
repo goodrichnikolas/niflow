@@ -22,6 +22,15 @@ niflow validate flows/prod.py --live               # + NiFi's own validation
   niflow bug;
 * `#{param}` references when **no parameter context is bound** anywhere up the
   tree. (`##{x}` is NiFi's escape for a literal `#{x}` and is not a reference.)
+* a **non-sensitive property referencing a sensitive parameter**. NiFi says it
+  itself — *"Cannot add Parameter with name 'x' unless that Parameter is Not
+  Sensitive because a Parameter with that name is already referenced from a
+  Property that is not Sensitive"* — and a flow that reaches that state on 1.24
+  can no longer be **downloaded at all** (HTTP 500), which breaks pull, plan and
+  backup together.
+* a **controller-service reference holding a string**: a property whose
+  descriptor identifies a service must be wired to one, not set to `#{param}`
+  or an expression. Same 500 on 1.24 for the parameter case.
 
 **Relationships**
 
@@ -36,7 +45,8 @@ niflow validate flows/prod.py --live               # + NiFi's own validation
 **Properties**
 
 * required properties that are not set (processors **and** controller
-  services);
+  services) — except the ones the target line fills in *itself* on import, like
+  the AWS credentials service NiFi 2.x creates and wires in;
 * values outside a property's allowable set;
 * a key that is a property of neither NiFi line but is one separator or one
   capital away from a real one — `max-bin-age` where MergeContent wants

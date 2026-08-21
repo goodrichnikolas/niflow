@@ -87,6 +87,11 @@ class Change:
     desired: Optional[Any] = None
     live: Optional[Any] = None
     note: Optional[str] = None  # e.g. probable-rename warning
+    #: Field names in this change whose live value NiFi will not disclose —
+    #: sensitive properties. They are still applied (the model's intent is the
+    #: only thing that can be), but they cannot be *compared*, so a change made
+    #: only of these is not evidence that anything drifted.
+    unknowable: Tuple[str, ...] = ()
 
     @property
     def location(self) -> str:
@@ -114,6 +119,7 @@ def diff_flows(
     changes: List[Change] = []
     _diff_group(live, desired, (), changes, target_major)
     _annotate_renames(changes)
+    _annotate_sensitive(changes, target_major)
     return changes
 
 
@@ -641,6 +647,56 @@ def _connection_name(conn: Connection) -> str:
 _RENAMEABLE_KINDS = ("processor", "controller_service", "input_port", "output_port", "process_group")
 
 
+def _annotate_sensitive(changes: List[Change], target_major: Optional[int]) -> None:
+    """Mark property changes whose live value NiFi refuses to disclose.
+
+    A sensitive property — a DBCP pool's ``Password``, an API token, a
+    keystore passphrase — reads back as ``None`` (or the literal ``********``)
+    however it was set, so a model that states one differs from the live side
+    *forever*. The change is kept, because sending the model's value is the
+    only way an intended change can ever land, but it is labelled: an eternal
+    "1 to change" with no explanation is how people learn to ignore a plan.
+
+    :func:`niflow.plan.only_unknowable` then lets the callers that answer
+    "has anything drifted?" — ``niflow drift``, the fuzz convergence checks —
+    tell this apart from real drift.
+    """
+    from niflow.processors.rules import sensitive_properties
+
+    for change in changes:
+        if change.op != "update" or not change.fields:
+            continue
+        type_str = getattr(change.desired, "type", "") or getattr(change.live, "type", "")
+        if not type_str:
+            continue
+        secret = sensitive_properties(type_str, target_major)
+        if not secret:
+            continue
+        unknowable = tuple(
+            name for name in change.fields
+            if name.startswith("properties[") and name.endswith("]")
+            and name[len("properties["):-1] in secret
+            and change.fields[name][0] in (None, "", "********")
+        )
+        if not unknowable:
+            continue
+        change.unknowable = unknowable
+        listed = ", ".join(n[len("properties["):-1] for n in unknowable)
+        note = (f"sensitive: NiFi never returns {listed}, so this cannot be "
+                f"compared — it is applied as written and will re-plan on every "
+                f"run whether or not the server already has it")
+        change.note = f"{change.note} / {note}" if change.note else note
+
+
+def only_unknowable(change: Change) -> bool:
+    """True when every field of *change* is one NiFi will not disclose.
+
+    Such a change is an assertion, not evidence: nothing about it says the live
+    flow drifted from the model.
+    """
+    return bool(change.unknowable) and set(change.fields) == set(change.unknowable)
+
+
 def _annotate_renames(changes: List[Change]) -> None:
     """Flag add/remove pairs that look like renames (same group, same type).
 
@@ -695,7 +751,8 @@ def format_plan(changes: List[Change]) -> str:
         if change.note:
             lines.append(f"    ! {change.note}")
         for fname, (old, new) in change.fields.items():
-            lines.append(f"    {fname}: {old!r} -> {new!r}")
+            suffix = "   (sensitive — not comparable)" if fname in change.unknowable else ""
+            lines.append(f"    {fname}: {old!r} -> {new!r}{suffix}")
     counts = {"add": 0, "remove": 0, "update": 0}
     for change in changes:
         counts[change.op] += 1

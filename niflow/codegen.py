@@ -405,6 +405,13 @@ def _trim_descriptors(descriptors: Optional[dict]) -> dict:
         service = d.get("identifiesControllerService")
         if service:
             entry["service"] = service
+        if d.get("sensitive"):
+            # NiFi never hands a sensitive value back — a pulled flow has None
+            # where the password is — so the differ has to know which
+            # properties it cannot compare, or every plan reports the same
+            # phantom change forever (a DBCP pool's Password, a token, a
+            # keystore passphrase).
+            entry["sensitive"] = True
         allowable = [
             a["allowableValue"]["value"]
             for a in (d.get("allowableValues") or [])

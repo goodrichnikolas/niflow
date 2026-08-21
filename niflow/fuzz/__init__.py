@@ -38,6 +38,7 @@ from niflow.fuzz.cases import (
     HOSTILE_NAMES,
     HOSTILE_VALUES,
     KINDS,
+    SECRET_VALUE,
     NIFI_REJECTED,
     DEFAULT_OUT_DIR,
     NIFLOW_BUG,
@@ -57,10 +58,13 @@ from niflow.fuzz.checks import (
     _server_normalised,
     check_live_roundtrip,
     check_live_validate,
+    check_apply_faults,
     check_offline,
     check_plan_sensitivity,
+    check_secret_containment,
     normalise_message,
 )
+from niflow.fuzz.fakeserver import FakeServer
 from niflow.fuzz.runner import (
     Report,
     SweepConfig,
@@ -74,11 +78,12 @@ from niflow.fuzz.runner import (
 )
 
 __all__ = [
-    "PASSED", "NIFLOW_BUG", "NIFI_REJECTED", "KINDS", "SHAPES",
+    "PASSED", "NIFLOW_BUG", "NIFI_REJECTED", "KINDS", "SHAPES", "SECRET_VALUE",
     "HOSTILE_VALUES", "HOSTILE_NAMES", "DEFAULT_OUT_DIR",
     "Case", "build_case_flow", "generate_cases", "processor_types", "service_types",
     "Finding", "CaseResult", "normalise_message", "check_offline",
     "check_plan_sensitivity", "check_live_validate", "check_live_roundtrip",
+    "check_apply_faults", "check_secret_containment", "FakeServer",
     "SweepConfig", "Report", "run_case", "sweep", "replay", "find_case",
     "write_repro", "format_report", "cleanup_sandboxes", "SANDBOX_PREFIX",
 ]

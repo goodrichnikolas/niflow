@@ -469,3 +469,66 @@ def test_a_property_the_target_line_cannot_have_is_not_drift():
     changes = diff_flows(live, desired, 2)
     assert [c.fields for c in changes] == [
         {"properties[Headers Source]": (None, "FLOWFILE_ATTRIBUTES")}]
+
+
+# --- values NiFi will not disclose -------------------------------------------
+
+DBCP = "org.apache.nifi.dbcp.DBCPConnectionPool"
+
+
+def _pool(properties):
+    from niflow.core import ControllerService, Flow
+
+    flow = Flow("F")
+    flow.add(ControllerService(name="Pool", type=DBCP, properties=properties))
+    return flow
+
+
+def test_a_sensitive_property_is_flagged_as_not_comparable():
+    """A password reads back as nothing however it was set.
+
+    So a model that states one differs from the live flow forever. The change
+    stays — sending the model's value is the only way an intended change can
+    land — but an eternal "1 to change" with no explanation is how people learn
+    to ignore a plan.
+    """
+    from niflow.plan import format_plan, only_unknowable
+
+    live = _pool({"Database Connection URL": "jdbc:h2:mem:x"})
+    desired = _pool({"Database Connection URL": "jdbc:h2:mem:x", "Password": "hunter2"})
+    changes = diff_flows(live, desired, 2)
+
+    assert len(changes) == 1
+    assert changes[0].unknowable == ("properties[Password]",)
+    assert only_unknowable(changes[0])
+    rendered = format_plan(changes)
+    assert "sensitive" in rendered and "not comparable" in rendered
+
+
+def test_a_real_change_alongside_a_secret_is_still_drift():
+    from niflow.plan import only_unknowable
+
+    live = _pool({"Database Connection URL": "jdbc:h2:mem:x"})
+    desired = _pool({"Database Connection URL": "jdbc:h2:mem:y", "Password": "hunter2"})
+    changes = diff_flows(live, desired, 2)
+    assert not only_unknowable(changes[0])
+
+
+def test_a_live_value_that_came_back_is_compared_normally():
+    """Only an absent or masked live value is unknowable."""
+    from niflow.plan import only_unknowable
+
+    live = _pool({"Password": "old"})       # a server that did hand it back
+    desired = _pool({"Password": "new"})
+    changes = diff_flows(live, desired, 2)
+    assert changes and not only_unknowable(changes[0])
+    assert changes[0].unknowable == ()
+
+
+def test_a_masked_live_value_is_unknowable():
+    from niflow.plan import only_unknowable
+
+    live = _pool({"Password": "********"})   # what a live read returns
+    desired = _pool({"Password": "hunter2"})
+    changes = diff_flows(live, desired, 2)
+    assert only_unknowable(changes[0])

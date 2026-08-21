@@ -312,6 +312,21 @@ def import_defaults_for(type_str: str, major_version: Optional[int]) -> Dict[str
     return dict((IMPORT_DEFAULTS.get(major_version) or {}).get(type_str) or {})
 
 
+def sensitive_properties(type_str: str, major_version: Optional[int] = None) -> set:
+    """Property names this type keeps secret, as the target line describes them.
+
+    NiFi never hands a sensitive *value* back — a pulled flow has ``None`` where
+    the password is, and a live read can also return the literal mask
+    ``********`` — so these are the properties a differ cannot compare. The
+    flag is harvested (``make catalog`` / ``make catalog-v1``); an older
+    catalog without it simply answers "none", which is the old behaviour.
+    """
+    return {
+        name for name, entry in descriptors_for_target(type_str, major_version).items()
+        if entry.get("sensitive")
+    }
+
+
 def import_created_properties(
     type_str: str, major_version: Optional[int]
 ) -> Dict[str, str]:

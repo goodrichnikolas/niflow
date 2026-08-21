@@ -338,3 +338,27 @@ def test_no_import_data_for_a_line_changes_nothing():
     assert import_defaults_for(JSON_WRITER, None) == {}
     assert descriptors_for_target(JSON_WRITER, None)["Allow Scientific Notation"][
         "default"] == "false"
+
+
+def test_a_service_property_is_canonicalised_even_with_no_target_server():
+    """Found by the controller-service fuzz sweep, 2026-08-21.
+
+    Processors have always had display-name/legacy keys rewritten on the way
+    out; services only got it when a target NiFi line was known. Offline —
+    `niflow convert`, `to_json` on a hand-written flow — a service kept the key
+    as written, which NiFi stores as an inert *dynamic* property while the real
+    one runs at its default, and which also broke the format's round trip (the
+    parse side canonicalises, so re-emitting produced a different file).
+    """
+    import json
+
+    from niflow.core import ControllerService, Flow
+    from niflow.formats import from_json, to_json
+
+    flow = Flow("F")
+    flow.add(ControllerService(name="Reader", type="org.apache.nifi.csv.CSVReader",
+                               properties={"character-set": "UTF-16"}))
+    once = to_json(flow)
+    emitted = json.loads(once)["flowContents"]["controllerServices"][0]["properties"]
+    assert emitted == {"Character Set": "UTF-16"}
+    assert once == to_json(from_json(once))

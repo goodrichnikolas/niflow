@@ -267,17 +267,25 @@ def cmd_diagram(args: argparse.Namespace) -> int:
 
 def cmd_drift(args: argparse.Namespace) -> int:
     """One line per flow module: in sync or drifted. Exit 1 on any drift."""
+    from niflow.plan import only_unknowable
     from niflow.sync import plan_all
 
     client = _client()
     drifted = 0
     for r in plan_all(client, args.dir, var=args.var):
+        # A change made only of sensitive properties is not evidence of drift:
+        # NiFi never returns those values, so the difference is permanent and
+        # says nothing about the live flow. This is the cron/CI gate — failing
+        # it forever on a flow that holds a password is how a red build stops
+        # meaning anything.
+        changes = [c for c in (r["changes"] or []) if not only_unknowable(c)]
+        secret_only = len(r["changes"] or []) - len(changes)
         if not r["exists"]:
             print(f"DRIFT  {r['name']}: group missing from NiFi")
             drifted += 1
-        elif r["changes"]:
+        elif changes:
             counts = {"add": 0, "remove": 0, "update": 0}
-            for c in r["changes"]:
+            for c in changes:
                 counts[c.op] += 1
             print(
                 f"DRIFT  {r['name']}: +{counts['add']} ~{counts['update']} -{counts['remove']}"
@@ -285,7 +293,9 @@ def cmd_drift(args: argparse.Namespace) -> int:
             )
             drifted += 1
         else:
-            print(f"ok     {r['name']}")
+            note = (f"  ({secret_only} sensitive-only change(s) ignored)"
+                    if secret_only else "")
+            print(f"ok     {r['name']}{note}")
     return 1 if drifted else 0
 
 

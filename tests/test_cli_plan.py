@@ -1,4 +1,6 @@
 """The `niflow plan` and `niflow push --update` CLI commands (fake client)."""
+import argparse
+
 from niflow import Flow, Processor
 from niflow.cli import main
 
@@ -64,3 +66,56 @@ def test_push_update_noop_reports_clean(tmp_path, capsys, monkeypatch):
     monkeypatch.setattr("niflow.cli._client", lambda: FakeClient(_live_flow()))
     assert main(["push", _write_flow(tmp_path, "1"), "--update"]) == 0
     assert "nothing to do" in capsys.readouterr().out
+
+
+def test_drift_does_not_cry_wolf_over_a_password(monkeypatch, capsys):
+    """`drift` is the CI gate; a flow holding a secret must not fail it forever.
+
+    NiFi never returns a sensitive value, so the difference is permanent and
+    says nothing about whether the live flow changed.
+    """
+    from niflow import cli
+    from niflow.core import ControllerService, Flow
+    from niflow.plan import diff_flows
+
+    def pool(properties):
+        flow = Flow("Prod")
+        flow.add(ControllerService(name="Pool",
+                                   type="org.apache.nifi.dbcp.DBCPConnectionPool",
+                                   properties=properties))
+        return flow
+
+    changes = diff_flows(pool({}), pool({"Password": "hunter2"}), 2)
+    monkeypatch.setattr(cli, "_client", lambda: object())
+    monkeypatch.setattr(
+        "niflow.sync.plan_all",
+        lambda client, directory, var="flow": [
+            {"name": "Prod", "file": "flows/prod.py", "exists": True,
+             "changes": changes}],
+    )
+    args = argparse.Namespace(dir="flows", var="flow")
+    assert cli.cmd_drift(args) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("ok     Prod")
+    assert "1 sensitive-only change(s) ignored" in out
+
+
+def test_drift_still_fails_on_a_real_change(monkeypatch, capsys):
+    from niflow import cli
+    from niflow.core import Flow, Processor
+    from niflow.plan import diff_flows
+
+    live, desired = Flow("Prod"), Flow("Prod")
+    live.add(Processor(name="A", type="org.x.P", properties={"k": "1"}))
+    desired.add(Processor(name="A", type="org.x.P", properties={"k": "2"}))
+    changes = diff_flows(live, desired)
+
+    monkeypatch.setattr(cli, "_client", lambda: object())
+    monkeypatch.setattr(
+        "niflow.sync.plan_all",
+        lambda client, directory, var="flow": [
+            {"name": "Prod", "file": "flows/prod.py", "exists": True,
+             "changes": changes}],
+    )
+    assert cli.cmd_drift(argparse.Namespace(dir="flows", var="flow")) == 1
+    assert "DRIFT  Prod" in capsys.readouterr().out

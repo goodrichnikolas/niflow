@@ -55,6 +55,13 @@ otherwise every plan would propose unsetting every default forever. Concretely:
   processor is not drift against a model that never mentioned run state —
   turning a plan into an outage is not a niflow's job.
 
+* **A sensitive value cannot be compared at all.** NiFi never returns a
+  password, a token or a passphrase, so a model that states one differs from
+  the live flow forever. The change is still planned — sending the model's
+  value is the only way an intended change can ever land — but it is labelled
+  `(sensitive — not comparable)`, and `niflow drift` (the CI gate) does not
+  count a change made *only* of secrets as drift.
+
 Everything else *is* drift. In particular, a property you delete from a pulled
 flow really does plan as an unset, and `push --update` really does send it
 (NiFi merges the properties map on `PUT`, so a removal has to be sent as an

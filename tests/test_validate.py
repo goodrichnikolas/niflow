@@ -506,3 +506,96 @@ def test_the_escaped_parameter_syntax_is_not_a_reference():
     flow.add(Processor(name="P", type=UNKNOWN, properties={"k": "text ##{not.a.param}"},
                        auto_terminate=["success"]))
     assert validate_flow(flow) == []
+
+
+# --- rules NiFi enforces about sensitive values ------------------------------
+
+GEN = "org.apache.nifi.processors.standard.GenerateFlowFile"
+GRIDFS = "org.apache.nifi.processors.mongodb.gridfs.PutGridFS"
+
+
+def _with_context(properties, params, type_=GEN, terminate=("success",)):
+    from niflow.core import Parameter, ParameterContext
+
+    flow = Flow("F")
+    flow.parameter_context = ParameterContext(name="Ctx", parameters=params)
+    flow.add(Processor(name="A", type=type_, properties=properties,
+                       auto_terminate=list(terminate)))
+    return flow
+
+
+def test_a_plain_property_may_not_reference_a_sensitive_parameter():
+    """NiFi's own words, verified live on 1.24: "Cannot add Parameter with name
+    'x' unless that Parameter is Not Sensitive because a Parameter with that
+    name is already referenced from a Property that is not Sensitive" (409).
+
+    Worse, a flow that reaches that state exports as 500 on 1.24 — the group
+    cannot be pulled, planned or backed up any more. Found by the fuzz
+    harness's parameter-context cases.
+    """
+    from niflow.core import Parameter
+
+    flow = _with_context({"File Size": "#{sec}"},
+                         [Parameter(name="sec", value="s", sensitive=True)])
+    messages = [i["message"] for i in validate_flow(flow)]
+    assert any("is not sensitive but references sensitive parameter(s) 'sec'" in m
+               for m in messages)
+
+
+def test_a_plain_parameter_reference_is_fine():
+    from niflow.core import Parameter
+
+    flow = _with_context({"File Size": "#{ok}"}, [Parameter(name="ok", value="1 B")])
+    assert validate_flow(flow) == []
+
+
+def test_a_child_group_inherits_the_bound_context_for_this_check():
+    from niflow.core import Parameter, ParameterContext
+
+    flow = Flow("F")
+    flow.parameter_context = ParameterContext(
+        name="Ctx", parameters=[Parameter(name="sec", value="s", sensitive=True)])
+    with flow.process_group("Child") as child:
+        child.add_processor(Processor(name="A", type=GEN,
+                                      properties={"File Size": "#{sec}"},
+                                      auto_terminate=["success"]))
+    messages = [i["message"] for i in validate_flow(flow)]
+    assert any("references sensitive parameter(s) 'sec'" in m for m in messages)
+
+
+def test_a_service_reference_property_cannot_hold_a_parameter():
+    from niflow.core import Parameter
+
+    flow = _with_context({"Client Service": "#{sec}"},
+                         [Parameter(name="sec", value="s", sensitive=True)],
+                         type_=GRIDFS, terminate=("success", "failure", "duplicate"))
+    messages = [i["message"] for i in validate_flow(flow)]
+    assert any("identifies a controller service" in m and "1.24" in m
+               for m in messages)
+
+
+def test_a_service_reference_property_cannot_hold_an_expression():
+    flow = Flow("F")
+    flow.add(Processor(name="A", type=GRIDFS,
+                       properties={"Client Service": "${service.id}"},
+                       auto_terminate=["success", "failure", "duplicate"]))
+    messages = [i["message"] for i in validate_flow(flow)]
+    assert any("cannot be an expression" in m for m in messages)
+
+
+def test_a_property_the_import_fills_in_is_not_reported_missing():
+    """NiFi 2.x creates the AWS credentials service and wires it in itself.
+
+    Reporting it as an unset required property is a false alarm the server
+    disagrees with — which is exactly how the fuzz harness found it.
+    """
+    aws = "org.apache.nifi.processors.aws.ml.translate.GetAwsTranslateJobStatus"
+    flow = Flow("F")
+    flow.add(Processor(name="A", type=aws,
+                       auto_terminate=["success", "failure", "running",
+                                       "throttled"]))
+    messages = [i["message"] for i in validate_flow(flow, target_version="2.7.2")]
+    assert not any("AWS Credentials Provider Service" in m for m in messages)
+    # On 1.24 nothing creates it, so silence there would be the wrong answer.
+    on_1x = [i["message"] for i in validate_flow(flow, target_version="1.24")]
+    assert any("AWS Credentials Provider Service" in m for m in on_1x)

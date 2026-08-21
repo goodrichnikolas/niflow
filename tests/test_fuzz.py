@@ -297,3 +297,209 @@ def test_cleanup_gives_up_quietly_on_an_undeletable_group():
     client = _FakeClient([stuck, f"{SANDBOX_PREFIX}solo-ok"], undeletable=[stuck])
     assert cleanup_sandboxes(client) == 1
     assert list(client.groups.values()) == [stuck]
+
+
+# --- the coverage gaps closed on 2026-08-21 -----------------------------------
+
+def test_a_controller_service_is_a_case_in_its_own_right():
+    """`svc` exercises a service alone — not as some processor's far end.
+
+    That blind spot is exactly how every 2.x service property key came to land
+    on 1.24 as an inert dynamic property, and how a service kept a legacy key
+    through an offline emit.
+    """
+    from niflow.core import ControllerService
+
+    cases = [c for c in generate_cases(kinds=["svc"]) if c.spec.get("variant")]
+    assert cases, "no property variants generated for services"
+    flow = cases[0].build()
+    assert not flow.processors
+    assert len(flow.controller_services) == 1
+    assert isinstance(flow.controller_services[0], ControllerService)
+    assert check_offline(cases[0]).status == PASSED
+
+
+def test_a_params_case_carries_a_real_secret_in_the_model():
+    from niflow.fuzz import SECRET_VALUE
+
+    case = generate_cases(kinds=["params"])[0]
+    flow = case.build()
+    context = flow.parameter_context
+    assert context is not None
+    sensitive = [p for p in context.parameters if p.sensitive]
+    assert [p.value for p in sensitive] == [SECRET_VALUE]
+    assert any("#{fuzz." in str(v) for v in flow.processors[0].properties.values())
+
+
+def test_a_leaked_secret_is_a_finding():
+    """The check has to fail when a value really does reach a file."""
+    from niflow.fuzz import SECRET_VALUE, check_secret_containment
+
+    flow = generate_cases(kinds=["params"])[0].build()
+    clean = check_secret_containment(flow, {"JSON snapshot": '"fuzz.secret": null'})
+    assert clean == []
+
+    leaked = check_secret_containment(
+        flow, {"JSON snapshot": f'"fuzz.secret": "{SECRET_VALUE}"'})
+    assert [f.check for f in leaked] == ["secret_leak"]
+    assert "sensitive parameter" in leaked[0].message
+
+
+def test_dropping_the_parameter_is_not_a_way_to_pass_the_secret_check():
+    from niflow.fuzz import check_secret_containment
+
+    flow = generate_cases(kinds=["params"])[0].build()
+    findings = check_secret_containment(flow, {"JSON snapshot": "{}"})
+    assert [f.check for f in findings] == ["secret_dropped"]
+
+
+def test_nothing_niflow_emits_contains_the_secret():
+    from niflow.formats import to_python, to_xml
+    from niflow.fuzz import SECRET_VALUE
+
+    flow = generate_cases(kinds=["params"])[0].build()
+    for text in (to_json(flow), to_xml(flow), to_python(flow)):
+        assert SECRET_VALUE not in text
+
+
+# --- apply fault injection ----------------------------------------------------
+
+def _add_plan(flow):
+    from niflow.plan import diff_flows
+
+    live = Flow(name=flow.name)
+    return live, diff_flows(live, flow)
+
+
+def test_the_fake_server_fails_on_the_call_it_was_told_to():
+    from niflow.apply import ApplyError, PlanApplier
+    from niflow.fuzz import FakeServer
+
+    flow = build_case_flow("pair", {
+        "source": "org.apache.nifi.processors.standard.GenerateFlowFile",
+        "target": "org.apache.nifi.processors.standard.LogAttribute",
+        "relationship": "success"})
+    live, changes = _add_plan(flow)
+
+    clean = FakeServer()
+    PlanApplier(clean, "root-pg", live, flow).apply(changes)
+    assert clean.mutations == len(changes) and clean.failed_on is None
+
+    for position in range(1, clean.mutations + 1):
+        server = FakeServer(fail_at=position)
+        # The plan holds references into the models it was built from, so an
+        # attempt has to diff its own copies rather than reuse the first plan.
+        attempt_desired = flow.model_copy(deep=True)
+        attempt_live, attempt_changes = _add_plan(attempt_desired)
+        with pytest.raises(ApplyError) as caught:
+            PlanApplier(server, "root-pg", attempt_live,
+                        attempt_desired).apply(attempt_changes)
+        error = caught.value
+        assert server.failed_on, "the fault never fired"
+        # One change can be several REST calls (an add that also has to set a
+        # state, an update that stops and restarts), so the invariant is that
+        # the progress adds up — not that it equals the call index.
+        assert 0 <= error.applied <= len(attempt_changes)
+        assert error.applied + error.remaining == len(attempt_changes)
+        assert "were applied before the failure" in str(error)
+
+
+def test_apply_faults_finds_an_error_that_is_not_an_ApplyError(monkeypatch):
+    """The invariant that matters: no unreadable exception escapes a push."""
+    from niflow.apply import PlanApplier
+    from niflow.fuzz import check_apply_faults
+
+    case = Case("solo", {"type": "org.apache.nifi.processors.standard.LogAttribute"})
+
+    def explode(self, changes):
+        raise KeyError("0x7f9c deep inside")
+
+    monkeypatch.setattr(PlanApplier, "apply", explode)
+    findings, _ = check_apply_faults(case, case.build())
+    assert findings and all(f.classification == NIFLOW_BUG for f in findings)
+    assert any("apply_clean" in f.check for f in findings)
+
+
+def test_apply_faults_are_clean_on_the_real_applier():
+    from niflow.fuzz import check_apply_faults
+
+    for kind, spec in (
+        ("solo", {"type": "org.apache.nifi.processors.standard.LogAttribute"}),
+        ("service", {"type": "org.apache.nifi.processors.standard.ConvertRecord",
+                     "property": "Record Reader",
+                     "service_type": "org.apache.nifi.csv.CSVReader"}),
+    ):
+        case = Case(kind, spec)
+        findings, observation = check_apply_faults(case, case.build())
+        assert findings == []
+        assert observation["kind"] == "apply_faults" and observation["probes"] > 0
+
+
+def test_the_generated_context_is_named_so_a_sweep_can_clean_it_up():
+    """Parameter contexts are global and outlive the group that used them.
+
+    A stale one poisons the next run: a leftover sensitive parameter left
+    thirteen later cases unable to export their group at all on 1.24 (500 from
+    /download).
+    """
+    flow = generate_cases(kinds=["params"])[0].build()
+    assert flow.parameter_context.name.startswith(SANDBOX_PREFIX)
+
+
+def test_cleanup_removes_the_contexts_a_sweep_created():
+    deleted = []
+
+    class Client:
+        def walk_groups(self):
+            return []
+
+        def _get_json(self, path):
+            assert path == "/flow/parameter-contexts"
+            return {"parameterContexts": [
+                {"revision": {"version": 3},
+                 "component": {"id": "ctx-1", "name": f"{SANDBOX_PREFIX}context"}},
+                {"revision": {"version": 1},
+                 "component": {"id": "ctx-2", "name": "Production Secrets"}},
+            ]}
+
+        def _request(self, method, path, **kwargs):
+            deleted.append((method, path, kwargs.get("params", {}).get("version")))
+
+    assert cleanup_sandboxes(Client()) == 1
+    assert deleted == [("DELETE", "/parameter-contexts/ctx-1", 3)]
+
+
+def test_cleanup_leaves_a_context_it_did_not_create():
+    class Client:
+        def walk_groups(self):
+            return []
+
+        def _get_json(self, path):
+            return {"parameterContexts": [
+                {"revision": {"version": 1},
+                 "component": {"id": "ctx-2", "name": "Production Secrets"}}]}
+
+        def _request(self, method, path, **kwargs):  # pragma: no cover - must not run
+            raise AssertionError(f"deleted something it did not own: {path}")
+
+    assert cleanup_sandboxes(Client()) == 0
+
+
+def test_a_sensitive_only_change_is_not_a_convergence_failure():
+    """A password can never read back, so it is not evidence of drift."""
+    from niflow.core import ControllerService
+    from niflow.fuzz.checks import _comparable
+    from niflow.plan import diff_flows
+
+    def pool(properties):
+        flow = Flow("F")
+        flow.add(ControllerService(name="Pool",
+                                   type="org.apache.nifi.dbcp.DBCPConnectionPool",
+                                   properties=properties))
+        return flow
+
+    changes = diff_flows(pool({}), pool({"Password": "hunter2"}), 2)
+    assert changes
+    result = CaseResult(Case("svc", {"service_type": "x"}))
+    assert _comparable(changes, result) == []
+    assert result.observations == [{"kind": "sensitive_not_comparable", "changes": 1}]

@@ -10,9 +10,15 @@ Kinds: ``solo`` (one processor of a type, all relationships handled), ``props``
 (one type with a property variant — harvested defaults, allowable values,
 display names, 1.x legacy keys, Python ints/bools, hostile strings, expression
 language, dynamic properties), ``pair`` (``A -> B`` on one of A's
-relationships), ``service`` (a processor wired to a controller service), and
-``shape`` (structural adversaries: funnels, ports, nesting, parallel edges,
-self-loops, duplicate names, dangling endpoints, ...).
+relationships), ``service`` (a processor wired to a controller service),
+``svc`` (a controller service **on its own**, with the same property variants —
+services were exercised only as a processor's referenced type, which is exactly
+the blind spot that let every 2.x service key land on 1.24 as an inert dynamic
+property), ``params`` (a parameter context, including a **sensitive**
+parameter, referenced from a property — the one kind of value that must never
+appear in anything niflow emits), and ``shape`` (structural adversaries:
+funnels, ports, nesting, parallel edges, self-loops, duplicate names, dangling
+endpoints, ...).
 """
 from __future__ import annotations
 
@@ -113,7 +119,13 @@ SHAPES: Tuple[str, ...] = (
     "port_shares_processor_name",
 )
 
-KINDS: Tuple[str, ...] = ("solo", "props", "pair", "service", "shape")
+KINDS: Tuple[str, ...] = (
+    "solo", "props", "pair", "service", "svc", "params", "shape")
+
+#: The value a ``params`` case gives its sensitive parameter. A sweep asserts
+#: this string appears in **nothing** niflow emits — snapshot, template, or
+#: generated Python — because a secret in a flow file is a secret in git.
+SECRET_VALUE = "fuzz-secret-do-not-emit-1f0e3d"
 
 
 # =============================================================================
@@ -250,6 +262,64 @@ def _build_service(spec: Dict[str, Any], name: str) -> Flow:
     service = ControllerService(name="Svc", type=spec["service_type"])
     flow.add_controller_service(service)
     flow.add_processor(_proc("A", spec["type"], {spec["property"]: service}))
+    return flow
+
+
+def _build_svc(spec: Dict[str, Any], name: str) -> Flow:
+    """One controller service, alone. No processor, nothing referencing it.
+
+    A service is a first-class component of a flow — it round-trips, it gets
+    diffed, its property keys are translated per NiFi line — and until this
+    kind existed the harness only ever saw one as the far end of a processor's
+    property.
+    """
+    flow = Flow(name)
+    flow.add_controller_service(ControllerService(
+        name="Svc", type=spec["service_type"],
+        properties=dict(spec.get("properties") or {})))
+    return flow
+
+
+def _build_params(spec: Dict[str, Any], name: str) -> Flow:
+    """A parameter context — plain and sensitive — referenced from a property.
+
+    The sensitive parameter carries a real value in the *model*, which is what
+    a hand-written flow looks like before the value is moved into a secrets
+    file. Everything niflow emits from this flow has to leave it out.
+    """
+    flow = Flow(name)
+    context = ParameterContext(
+        # Prefixed like a sandbox group: parameter contexts are **global** and
+        # survive the group that used them, so a sweep that leaves one behind
+        # poisons the next (a stale sensitive parameter made a 1.24 group
+        # unexportable — 500 on /download — for thirteen later cases).
+        name=f"{SANDBOX_PREFIX}context",
+        description="fuzz",
+        parameters=[
+            Parameter(name="fuzz.plain", value=spec.get("plain", "plain-value")),
+            Parameter(name="fuzz.secret",
+                      value=spec.get("secret", SECRET_VALUE), sensitive=True),
+        ],
+    )
+    if spec.get("inherited"):
+        context.inherited_contexts = list(spec["inherited"])
+    flow.parameter_context = context
+    properties = {}
+    descriptors = _descriptors(spec["type"])
+    # Two rules NiFi enforces and niflow now checks, so generating flows that
+    # break them would only re-find the same refusal:
+    #   * a controller-service reference must hold a service, not a parameter
+    #     (on 1.24 the group then fails to download at all);
+    #   * only a *sensitive* property may reference a sensitive parameter.
+    plain_keys = [k for k in sorted(descriptors)
+                  if not (descriptors[k] or {}).get("service")
+                  and not (descriptors[k] or {}).get("sensitive")]
+    secret_keys = [k for k in sorted(descriptors)
+                   if (descriptors[k] or {}).get("sensitive")]
+    properties[plain_keys[0] if plain_keys else "fuzz.dynamic"] = "#{fuzz.plain}"
+    if spec.get("reference_secret", True) and secret_keys:
+        properties[secret_keys[0]] = "#{fuzz.secret}"
+    flow.add_processor(_proc("A", spec["type"], properties))
     return flow
 
 
@@ -455,6 +525,8 @@ _BUILDERS: Dict[str, Callable[[Dict[str, Any], str], Flow]] = {
     "props": _build_props,
     "pair": _build_pair,
     "service": _build_service,
+    "svc": _build_svc,
+    "params": _build_params,
     "shape": _build_shape,
 }
 
@@ -593,6 +665,32 @@ def generate_cases(
                                               "service_type": service_type}))
                 break  # one service-bearing property per type is enough
         per_kind["service"] = cases
+
+    if "svc" in kinds:
+        rng = _rng(seed, "svc")
+        cases = []
+        for service_type in service_types(type_pattern):
+            cases.append(Case("svc", {"service_type": service_type}))
+            for variant, props in _property_variants(service_type, rng):
+                cases.append(Case("svc", {"service_type": service_type,
+                                          "variant": variant, "properties": props}))
+        per_kind["svc"] = cases
+
+    if "params" in kinds:
+        rng = _rng(seed, "params")
+        cases = []
+        # A context is a property of the flow, not of a type, so a sample of
+        # types is enough — what varies is the shape of the context itself.
+        for _ in range(12):
+            type_str = rng.choice(types)
+            cases.append(Case("params", {"type": type_str}))
+        cases.append(Case("params", {"type": rng.choice(types),
+                                     "reference_secret": False}))
+        cases.append(Case("params", {"type": rng.choice(types),
+                                     "inherited": ["Parent Context"]}))
+        cases.append(Case("params", {"type": rng.choice(types),
+                                     "plain": "value with spaces and 'quotes'"}))
+        per_kind["params"] = cases
 
     if "shape" in kinds:
         rng = _rng(seed, "shape")

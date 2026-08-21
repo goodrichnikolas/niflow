@@ -25,6 +25,7 @@ from niflow.core import (
     Flow, Funnel, ProcessGroup, Processor, find_identity_collisions,
     find_unregistered_components,
 )
+from niflow.fuzz.fakeserver import FakeServer
 from niflow.fuzz.cases import (
     NIFI_REJECTED,
     NIFLOW_BUG,
@@ -80,8 +81,13 @@ def _finding(check: str, message: str, *, detail: str = "",
 
 
 def _exception_finding(check: str, exc: BaseException, *,
-                       classification: str = NIFLOW_BUG) -> Finding:
-    """Group crashes by the deepest *niflow* frame — that's the root cause."""
+                       classification: str = NIFLOW_BUG,
+                       message: str = "") -> Finding:
+    """Group crashes by the deepest *niflow* frame — that's the root cause.
+
+    ``message`` replaces the default "<type>: <exc>" line when the caller has
+    something more useful to say about *why* the exception matters.
+    """
     frames = traceback.extract_tb(exc.__traceback__)
     niflow_frames = [f for f in frames if f"{Path('niflow')}/" in f.filename.replace("\\", "/")]
     frame = (niflow_frames or frames or [None])[-1]
@@ -89,7 +95,7 @@ def _exception_finding(check: str, exc: BaseException, *,
     return Finding(
         check=check,
         classification=classification,
-        message=f"{type(exc).__name__}: {exc}  (raised in {where})",
+        message=message or f"{type(exc).__name__}: {exc}  (raised in {where})",
         signature=f"{check}:{type(exc).__name__}@{where}",
         detail="".join(traceback.format_exception(type(exc), exc, exc.__traceback__))[-4000:],
     )
@@ -171,6 +177,7 @@ def check_offline(case: Case, *, target_majors: Sequence[int] = (1,)) -> CaseRes
 
     result = CaseResult(case)
     started = time.perf_counter()
+    artifacts: Dict[str, str] = {}
     try:
         try:
             flow = case.build()
@@ -219,6 +226,8 @@ def check_offline(case: Case, *, target_majors: Sequence[int] = (1,)) -> CaseRes
                     f"wired but not in the flow, and to_json emitted anyway: "
                     f"{unregistered[0][1]}",
                     key="unregistered-emitted"))
+
+        artifacts["JSON snapshot"] = snapshot_text
 
         try:
             reparsed = from_json(snapshot_text)
@@ -269,6 +278,7 @@ def check_offline(case: Case, *, target_majors: Sequence[int] = (1,)) -> CaseRes
         # --- Python emission round trip --------------------------------------
         try:
             source = to_python(flow)
+            artifacts["generated Python"] = source
             namespace: Dict[str, Any] = {}
             exec(compile(source, f"<fuzz:{case.case_id}>", "exec"), namespace)
             rebuilt = namespace.get("flow")
@@ -293,6 +303,7 @@ def check_offline(case: Case, *, target_majors: Sequence[int] = (1,)) -> CaseRes
         # still a bug, so the round trip is held to the same bar as JSON.
         try:
             xml_text = to_xml(flow)
+            artifacts["XML template"] = xml_text
             xml_flow = from_xml(xml_text)
             xml_changes = diff_flows(xml_flow, flow)
             # A template's <snippet> has no DTO for the group its contents land
@@ -325,12 +336,216 @@ def check_offline(case: Case, *, target_majors: Sequence[int] = (1,)) -> CaseRes
         except Exception as exc:
             result.add(_exception_finding("validate", exc))
 
+        # --- a sensitive value must never reach a file ------------------------
+        for finding in check_secret_containment(flow, artifacts):
+            result.add(finding)
+
+        # --- the applier, one failed REST call at a time ----------------------
+        fault_findings, fault_observation = check_apply_faults(case, flow)
+        for finding in fault_findings:
+            result.add(finding)
+        result.observations.append(fault_observation)
+
         # --- cross-version property fidelity ----------------------------------
         for major in target_majors:
             _check_target_namespace(case, flow, major, result)
     finally:
         result.elapsed = time.perf_counter() - started
     return result
+
+
+def _sensitive_values(flow: Flow) -> Dict[str, str]:
+    """``{parameter name: value}`` for every sensitive parameter in the tree."""
+    found: Dict[str, str] = {}
+
+    def visit(group: ProcessGroup) -> None:
+        context = getattr(group, "parameter_context", None)
+        for parameter in (getattr(context, "parameters", None) or []):
+            if parameter.sensitive and parameter.value:
+                found[parameter.name] = parameter.value
+        for child in group.process_groups:
+            visit(child)
+
+    visit(flow)
+    return found
+
+
+def check_secret_containment(flow: Flow, artifacts: Dict[str, str]) -> List[Finding]:
+    """A sensitive parameter's *value* must appear in nothing niflow writes.
+
+    A hand-written flow can carry the real value in the model — that is what it
+    looks like before someone moves it into a secrets file — and NiFi never
+    hands one back, so nothing downstream should ever put one in a file. A leak
+    here is a secret in git, which is not a bug you can take back.
+
+    The parameter itself must still survive, or "no leak" would be satisfied by
+    quietly dropping the parameter and breaking every ``#{...}`` that uses it.
+    """
+    secrets = _sensitive_values(flow)
+    if not secrets:
+        return []
+    findings: List[Finding] = []
+    for name, value in sorted(secrets.items()):
+        for artifact, text in sorted(artifacts.items()):
+            if value in text:
+                findings.append(_finding(
+                    "secret_leak",
+                    f"the value of sensitive parameter {name!r} appears in the "
+                    f"{artifact}",
+                    detail=f"{artifact} contains {value!r}",
+                    key=f"leak:{artifact}"))
+    snapshot = artifacts.get("JSON snapshot")
+    if snapshot:
+        for name in sorted(secrets):
+            if f'"{name}"' not in snapshot:
+                findings.append(_finding(
+                    "secret_dropped",
+                    f"sensitive parameter {name!r} is missing from the snapshot "
+                    f"entirely — every #{{{name}}} reference would break",
+                    key="dropped"))
+    return findings
+
+
+# --- the applier, and what it does when a call fails --------------------------
+# Every mutating call in an apply can fail — a 409 on a stale revision, a 409
+# because something started running, a 500, a dropped socket — and there is no
+# transaction around the sequence. What the applier owes the user then is an
+# ApplyError that says how far it got, so `niflow rollback` has a starting
+# point. Until this check existed, apply.py was only ever exercised against a
+# real NiFi at tier 3, where a fault cannot be induced on demand.
+
+#: Fault positions probed per plan shape. The invariants are about the applier's
+#: error handling, which is the same code for every call, so a spread across the
+#: sequence finds what exhaustion would — at a fraction of the sweep cost.
+_APPLY_FAULT_PROBES = 6
+
+
+def _with_live_ids(flow: Flow, prefix: str = "live") -> Flow:
+    """A copy of *flow* that looks like it came off a server.
+
+    The applier resolves updates and removes through ``nifi_id``; a model built
+    from a case has none, so the update/remove halves of apply.py could not be
+    reached at all without this.
+    """
+    live = flow.model_copy(deep=True)
+    counter = [0]
+
+    def stamp(component: Any) -> None:
+        counter[0] += 1
+        component.nifi_id = f"{prefix}-{counter[0]}"
+
+    def visit(group: ProcessGroup) -> None:
+        stamp(group)
+        for member in (list(group.processors) + list(group.controller_services)
+                       + list(group.input_ports) + list(group.output_ports)
+                       + list(group.funnels) + list(group.labels)
+                       + list(group.connections)):
+            stamp(member)
+        for child in group.process_groups:
+            visit(child)
+
+    visit(live)
+    return live
+
+
+def _apply_plans(flow: Flow) -> List[Tuple[str, Flow, Flow]]:
+    """``(label, live, desired)`` triples covering add, update and remove."""
+    from niflow.core import Flow as _Flow
+
+    live_ids = _with_live_ids(flow)
+    updated = _with_live_ids(flow)
+    for proc in _walk_processors(updated):
+        proc.comments = "fuzz-apply-fault"
+        proc.properties = dict(proc.properties or {}, **{"fuzz.apply": "1"})
+    empty = _Flow(name=flow.name)
+    return [
+        ("add", empty, flow),
+        ("update", live_ids, updated),
+        ("remove", live_ids, _Flow(name=flow.name)),
+    ]
+
+
+def _fault_positions(total: int, probes: int = _APPLY_FAULT_PROBES) -> List[int]:
+    """Up to ``probes`` 1-based call indexes, spread across the sequence."""
+    if total <= 0:
+        return []
+    if total <= probes:
+        return list(range(1, total + 1))
+    step = total / float(probes)
+    return sorted({max(1, int(round((i + 1) * step))) for i in range(probes)})
+
+
+def check_apply_faults(case: Case, flow: Flow) -> Tuple[List[Finding], Dict[str, Any]]:
+    """Apply each plan shape against an in-memory NiFi, failing one call at a time.
+
+    Two invariants, both about honesty rather than about NiFi's state (tier 3
+    owns state):
+
+    * **a clean apply must not raise** — which also means apply.py finally sees
+      every generated shape, not just the ones a live server accepts;
+    * **a failing call must surface as an ApplyError whose progress adds up**.
+      A bare ``KeyError`` escaping mid-push is unreadable, and a wrong
+      ``applied``/``remaining`` sends someone rolling back the wrong thing.
+
+    Faults the applier deliberately swallows (the best-effort restart of what
+    it stopped) are counted as an observation, not a finding: tolerating them
+    is the documented behaviour — a failed apply must not *additionally* leave
+    components stopped.
+    """
+    from niflow.apply import ApplyError, PlanApplier
+    from niflow.plan import diff_flows
+
+    findings: List[Finding] = []
+    swallowed = 0
+    probed = 0
+    for label, live, desired in _apply_plans(flow):
+        try:
+            changes = diff_flows(live, desired)
+        except Exception as exc:
+            findings.append(_exception_finding(f"apply_plan:{label}", exc))
+            continue
+        if not changes:
+            continue
+
+        clean = FakeServer()
+        try:
+            PlanApplier(clean, "root-pg", live, desired).apply(changes)
+        except Exception as exc:
+            findings.append(_exception_finding(f"apply_clean:{label}", exc))
+            continue
+
+        for position in _fault_positions(clean.mutations):
+            probed += 1
+            server = FakeServer(fail_at=position)
+            # Applying mutates the models it is given (ids get stamped on),
+            # so each attempt starts from its own copies.
+            attempt_live = live.model_copy(deep=True)
+            attempt_desired = desired.model_copy(deep=True)
+            try:
+                attempt_changes = diff_flows(attempt_live, attempt_desired)
+                PlanApplier(server, "root-pg", attempt_live,
+                            attempt_desired).apply(attempt_changes)
+            except ApplyError as exc:
+                total = len(attempt_changes)
+                if not (0 <= exc.applied <= total
+                        and exc.applied + exc.remaining == total):
+                    findings.append(_finding(
+                        "apply_fault_progress",
+                        f"ApplyError reports {exc.applied} applied + "
+                        f"{exc.remaining} remaining for a {total}-change plan",
+                        detail=f"{label} plan, fault on {server.failed_on}",
+                        key=f"{label}:progress"))
+            except Exception as exc:
+                findings.append(_exception_finding(
+                    f"apply_fault:{label}", exc,
+                    message=(f"a failed REST call escaped as "
+                             f"{type(exc).__name__} instead of ApplyError "
+                             f"(fault on {server.failed_on})")))
+            else:
+                if server.failed_on:
+                    swallowed += 1
+    return findings, {"kind": "apply_faults", "probes": probed,
+                      "swallowed": swallowed}
 
 
 # --- plan sensitivity ---------------------------------------------------------
@@ -725,12 +940,25 @@ def check_live_validate(case: Case, client: Any) -> CaseResult:
         # the guard firing is correct behaviour, not a finding.
         return result
     try:
-        static = validate_flow(flow)
+        # Judge the flow against the line it is being pushed to. With no
+        # target, `validate` also checks the configured *baseline* (1.24 by
+        # default), and a 2.x-only type or property is then reported here while
+        # the 2.x server says the component is fine — a disagreement about
+        # which NiFi we are talking about, not a false positive.
+        static = validate_flow(flow, target_version=client.version())
     except Exception as exc:
         result.add(_exception_finding("validate", exc))
         return result
     try:
         live = client.validate_flow_live(flow)
+    except ValueError as exc:
+        # niflow refusing a model *before* touching the server is a designed
+        # outcome (duplicate names, a component wired but never added, a
+        # parameter context inherited from nowhere). Recorded, not blamed.
+        result.observations.append({"kind": "refused_by_niflow",
+                                    "message": str(exc)[:300]})
+        result.elapsed += time.perf_counter() - started
+        return result
     except Exception as exc:
         message = f"{type(exc).__name__}: {exc}"
         result.add(_exception_finding(
@@ -803,6 +1031,24 @@ def _types_absent_from_target(flow: Flow, client: Any) -> List[str]:
     return sorted(absent)
 
 
+def _comparable(changes: Sequence[Any], result: CaseResult) -> List[Any]:
+    """Drop changes NiFi will not let anyone compare, and say how many.
+
+    A sensitive property — a password, a token — reads back as nothing however
+    it was set, so a model that states one differs from the live flow forever.
+    That is a fact about NiFi, not a convergence bug, and counting it as one
+    would mean every flow with a password fails the sweep.
+    """
+    from niflow.plan import only_unknowable
+
+    kept = [change for change in changes if not only_unknowable(change)]
+    hidden = len(changes) - len(kept)
+    if hidden:
+        result.observations.append({"kind": "sensitive_not_comparable",
+                                    "changes": hidden})
+    return kept
+
+
 def check_live_roundtrip(case: Case, client: Any) -> CaseResult:
     """Tier 3: push -> pull -> plan must converge, and a re-push change nothing."""
     from niflow.formats import from_json, to_json
@@ -823,6 +1069,10 @@ def check_live_roundtrip(case: Case, client: Any) -> CaseResult:
     try:
         try:
             pg_id = client.push_flow(flow)
+        except ValueError as exc:
+            result.observations.append({"kind": "refused_by_niflow",
+                                        "message": str(exc)[:300]})
+            return result
         except Exception as exc:
             message = f"{type(exc).__name__}: {exc}"
             result.add(_exception_finding(
@@ -834,7 +1084,8 @@ def check_live_roundtrip(case: Case, client: Any) -> CaseResult:
         # adds components of its own on import (2.x creates an AWS credentials
         # service and wires it in), and those are not drift for a model that
         # never mentioned them.
-        changes = diff_flows(pulled, flow, client._major_version())
+        changes = _comparable(diff_flows(pulled, flow, client._major_version()),
+                              result)
         if changes:
             result.add(_finding(
                 "live_roundtrip_plan",
@@ -848,7 +1099,7 @@ def check_live_roundtrip(case: Case, client: Any) -> CaseResult:
                 "a pulled flow does not re-emit byte-identically",
                 key="unstable"))
         try:
-            update = client.push_update(flow)
+            update = _comparable(client.push_update(flow), result)
         except Exception as exc:
             result.add(_exception_finding("live_push_update", exc))
         else:

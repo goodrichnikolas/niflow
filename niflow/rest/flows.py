@@ -363,6 +363,7 @@ class FlowsMixin:
         """
         _assert_identity_safe(flow)
         self._warn_cross_version(flow)
+        self.assert_inherited_contexts_exist(flow)
         parent_id = self.resolve_group(flow.parent_pg or "root")
 
         position = {"x": 0.0, "y": 0.0}
@@ -474,8 +475,39 @@ class FlowsMixin:
             self.start_group(pg_id)
         return changes
 
+    def assert_inherited_contexts_exist(self, flow: Flow) -> None:
+        """Refuse a flow that inherits a parameter context nobody has.
+
+        NiFi's answer to an unresolvable ``inheritedParameterContexts`` entry is
+        ``500 An unexpected error has occurred. Please check the logs`` on the
+        *group create* — which points at niflow, not at the missing context,
+        and costs a push and a log dig to work out. Found by the fuzz harness's
+        parameter-context cases.
+        """
+        own = {ctx.name for ctx in _iter_contexts(flow)}
+        missing: Dict[str, List[str]] = {}
+        for ctx in _iter_contexts(flow):
+            for name in ctx.inherited_contexts:
+                if name in own:
+                    continue
+                if self._find_context_entity(name) is None:
+                    missing.setdefault(ctx.name, []).append(name)
+        if not missing:
+            return
+        lines = "\n".join(
+            f"  - context {ctx!r} inherits {', '.join(repr(n) for n in names)}"
+            for ctx, names in sorted(missing.items())
+        )
+        raise ValueError(
+            "flow inherits parameter context(s) that do not exist on this "
+            "server and are not part of the flow; NiFi answers a 500 with "
+            f"nothing useful in it, so nothing was pushed:\n{lines}\n"
+            "  Create them on the server first, or define them in the flow."
+        )
+
     def ensure_parameter_contexts(self, flow: Flow) -> None:
         """Create any parameter context the flow references that NiFi lacks."""
+        self.assert_inherited_contexts_exist(flow)
         for ctx in _iter_contexts(flow):
             if self._find_context_entity(ctx.name) is not None:
                 continue

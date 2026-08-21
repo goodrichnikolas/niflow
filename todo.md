@@ -9,9 +9,10 @@ events" means — see its entry.
 
 Every fuzz P-finding is closed too. Where verification stands after T7a:
 
-* **Unit:** 692 (`make test`).
-* **Fuzz:** offline **3,419 cases / 0 findings**; tier 3 **120 / 0 on 2.7.2**
-  and **120 / 0 on 1.24.0**.
+* **Unit:** 719 (`make test`).
+* **Fuzz:** offline **4,129 cases / 0 findings**; tier 3 **150 / 0 on 2.7.2**
+  and **150 / 0 on 1.24.0** (kinds now include `svc` and `params`, and every
+  case also fault-injects the applier).
 * **Live:** `make test-integration` on 2.7.2 — 396 passed, 44 xpassed, 0
   failed. On 1.24 the non-catalog integration suite passes (26); the only
   failures there remain the documented `test_catalog.py` sweep (a 2.x catalog
@@ -22,8 +23,6 @@ Still open, all of them enhancements rather than tickets:
 
 * fixture injection for `follow` (testing.py's injector as a `--source`-like
   input), watch expressions, replay-after-fix — the stepper's next step;
-* fuzz-harness coverage gaps: a controller-service *catalog* sweep, a case kind
-  for parameter contexts with real secrets, and `apply.py` failure injection;
 * **T7h** above (needs a cluster).
 
 
@@ -867,11 +866,77 @@ all produce a non-empty plan in both directions.
         with "no component could be found in the Process Group", which reads
         like a niflow bug and costs a whole push to discover.
 
-- [ ] **Follow-ups for the harness itself** (not bugs, just coverage gaps):
-      a controller-service *catalog* sweep (services get exercised only as
-      referenced types today), a case kind for parameter contexts with real
-      secrets, and `apply.py` failure injection (the incremental applier is only
-      covered through the live tier).
+- [x] **Follow-ups for the harness itself — all three closed 2026-08-21.**
+      Offline is now **4,129 cases / 0 findings**; tier 3 **150 / 0 on 2.7.2 and
+      150 / 0 on 1.24.0**. Each gap found something real on the way in:
+      - **`svc` — a controller service as a case in its own right** (every
+        service type, plus the same property variants processors get). Found
+        immediately: `json_format` only canonicalised a service's property keys
+        when a *target line* was known, so an offline emit kept
+        `character-set` where the catalog says `Character Set` — NiFi files
+        that as an inert dynamic property while the real one runs at its
+        default, and the format's round trip was not byte-stable. Processors
+        had always been canonicalised; services had not.
+      - **`params` — parameter contexts with a real secret in the model.** New
+        offline check: a sensitive parameter's *value* must appear in nothing
+        niflow writes (snapshot, template, generated Python) **and** the
+        parameter itself must survive, so "no leak" cannot be satisfied by
+        dropping it. Live, it found the two NiFi rules below.
+      - **`apply.py` failure injection.** `niflow/fuzz/fakeserver.py` is an
+        in-memory NiFi that fails on the Nth mutating call; every case's plan
+        is applied in add, update and remove shapes with faults spread across
+        the sequence. Two invariants — a clean apply must not raise, and a
+        failed call must surface as an `ApplyError` whose progress adds up
+        (a bare `KeyError` mid-push is unreadable; wrong `applied`/`remaining`
+        sends someone rolling back the wrong thing). The applier held up; what
+        this buys is that it will stay that way.
+
+- [x] **A sensitive property re-planned forever.** *(found by the `svc` sweep,
+      fixed 2026-08-21)* NiFi never returns a password, a token or a
+      passphrase — a pulled flow has `None` where the secret is, a live read
+      can return `********` — so any flow stating one (a DBCP pool's
+      `Password`, at work: all of them) planned the same phantom change on
+      every run, and `niflow drift` failed in CI forever.
+      `sensitive` is now harvested into the catalogs (`make catalog` /
+      `make catalog-v1`; 74 service properties on 2.7.2 alone), the differ
+      marks such a change `unknowable` and annotates it — *"NiFi never returns
+      Password, so this cannot be compared"* — and `plan.only_unknowable()`
+      lets the callers that answer "did anything drift?" tell it apart.
+      `niflow drift` ignores a change made only of secrets (and says how many
+      it ignored); the fuzz convergence checks do the same. The change itself
+      is **kept**, because sending the model's value is the only way an
+      intended secret change can ever land.
+
+- [x] **Two NiFi rules about secrets, learned the hard way.** *(live, 2026-08-21)*
+      - **A non-sensitive property may not reference a sensitive parameter.**
+        NiFi's own 409: *"Cannot add Parameter with name 'x' unless that
+        Parameter is Not Sensitive because a Parameter with that name is
+        already referenced from a Property that is not Sensitive"*. Worse, a
+        flow that reaches that state on **1.24** answers **500 on
+        `GET /process-groups/{id}/download`** — the group can no longer be
+        pulled, planned or backed up, and the error says nothing about why.
+      - **A controller-service reference must hold a service**, not `#{param}`
+        and not an expression; the parameter case is the same 500 on 1.24.
+      `validate` refuses both now, offline, by name.
+
+- [x] **Parameter contexts are global and outlive their group.** A fuzz sweep
+      left one behind and poisoned the next run: thirteen later cases could not
+      export their group at all on 1.24. The harness names its context like its
+      sandbox groups and `cleanup_sandboxes` deletes it. Worth remembering
+      outside the harness too — deleting a group does **not** delete the
+      context it was bound to.
+
+- [x] **A parameter context inherited from nowhere.** NiFi answers the *group
+      create* with `500 An unexpected error has occurred. Please check the
+      logs`, which points at niflow rather than at the missing context.
+      `assert_inherited_contexts_exist` refuses before any mutation and names
+      the context.
+
+- [x] **`validate` reported a required property the server fills in itself.**
+      NiFi 2.x's import creates the AWS credentials service and wires it into
+      every AWS processor's required credentials property, so "required
+      property is not set" was a false alarm the server disagreed with. The
+      required check now consults the target line's `IMPORT_SERVICES`.
 ## Fuzz round two — offline and live sweeps are clean (2026-08-20)
 Tier 3: **120 cases, 0 findings on 2.7.2 and 0 on 1.24.0** (2.7.2 started the
 day at 10 `live_push_update` + 2 `validate_false_positive`; 1.24 kept one

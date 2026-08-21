@@ -725,15 +725,17 @@ def _emit_service(
     identifiers: Dict[int, str],
     target_major: Optional[int] = None,
 ) -> dict:
-    # Offline emission passes service properties through untouched; with a
-    # known target the same canonical -> server-namespace translation as
-    # processors applies (the compat table covers service types too).
-    props = service.properties
-    if target_major is not None:
-        props = _server_properties(
-            service.type, canonical_properties(service.type, props),
-            target_major, service.name,
-        )
+    # Exactly what a processor gets, and for the same reason: a display-name or
+    # legacy key ("character-set" for a CSVReader's "Character Set") would be
+    # stored by NiFi as an inert *dynamic* property while the real one stayed
+    # at its default. Services used to skip this whenever no target was known,
+    # which also made the format's round trip unstable — the parse side
+    # canonicalises, so re-emitting produced a different file. Found by the
+    # controller-service fuzz sweep.
+    props = _server_properties(
+        service.type, canonical_properties(service.type, service.properties),
+        target_major, service.name,
+    )
     return {
         "componentType": "CONTROLLER_SERVICE",
         "identifier": identifiers[id(service)],

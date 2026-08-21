@@ -31,7 +31,7 @@ NiFi, since they can't be judged statically.
 from __future__ import annotations
 
 import re
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from niflow.core import (
     Flow, Port, ProcessGroup, find_identity_collisions,
@@ -40,6 +40,7 @@ from niflow.core import (
 from niflow.processors.rules import (
     canonical_properties,
     descriptors_for,
+    sensitive_properties,
     dynamic_relationships_for,
     relationships_for,
     supports_dynamic_relationships,
@@ -164,11 +165,60 @@ def _near_miss_issues(component, label: str) -> List[dict]:
     ]
 
 
-def _property_issues(proc, label: str) -> List[dict]:
-    """Required-property and allowable-value checks from harvested descriptors."""
+def _service_reference_issues(component, label: str) -> List[dict]:
+    """A service-reference property must hold a service, not a string.
+
+    NiFi stores whatever you put there, and then something else breaks in a
+    way that points nowhere near the cause. Verified live on 1.24.0: a
+    service-reference property set to a **sensitive** parameter reference
+    (``#{secret}``) pushes fine and then makes
+    ``GET /process-groups/{id}/download`` answer *500 An unexpected error has
+    occurred* — which means the group can no longer be pulled, planned, or
+    backed up, because all three download it.
+    """
+    from niflow.core import ControllerService
+
+    descriptors = descriptors_for(component.type) or {}
+    out: List[dict] = []
+    for key, value in (component.properties or {}).items():
+        entry = descriptors.get(key) or {}
+        if not entry.get("service") or isinstance(value, ControllerService):
+            continue
+        if value in (None, ""):
+            continue
+        if isinstance(value, str) and _PARAMETER_REF.search(value):
+            out.append({
+                "component": label,
+                "message": f"property {key!r} identifies a controller service, so "
+                           f"it cannot be a parameter reference ({value!r}) — on "
+                           f"NiFi 1.24 the group then fails to download at all "
+                           f"(HTTP 500), which breaks pull, plan and backup",
+            })
+        elif isinstance(value, str) and "${" in value:
+            out.append({
+                "component": label,
+                "message": f"property {key!r} identifies a controller service, so "
+                           f"it cannot be an expression ({value!r}) — wire it to a "
+                           f"ControllerService instead",
+            })
+    return out
+
+
+def _property_issues(proc, label: str, target_major: Optional[int] = None) -> List[dict]:
+    """Required-property and allowable-value checks from harvested descriptors.
+
+    ``target_major`` matters for one thing: a property the target line fills in
+    *itself* on import — NiFi 2.x creates an AWS credentials service and wires
+    it into every AWS processor's required credentials property — is not
+    something the flow has to set, and saying so is a false alarm the server
+    disagrees with.
+    """
+    from niflow.processors.rules import import_created_properties
+
     descriptors = descriptors_for(proc.type)
     if not descriptors:
         return []
+    server_filled = set(import_created_properties(proc.type, target_major))
     # Display-name keys ("Custom Text") count as setting the canonical
     # property — the emitter rewrites them the same way at push time.
     props = canonical_properties(proc.type, proc.properties or {})
@@ -179,8 +229,9 @@ def _property_issues(proc, label: str) -> List[dict]:
         value = props.get(name)
         unset = value in (None, "")
         if entry.get("required") and unset and "default" not in entry:
-            out.append({"component": label,
-                        "message": f"required property '{name}' is not set"})
+            if name not in server_filled:
+                out.append({"component": label,
+                            "message": f"required property '{name}' is not set"})
             continue
         allowable = entry.get("allowable")
         if (allowable and isinstance(value, str) and value
@@ -221,7 +272,8 @@ def _structural_issues(flow: Flow) -> List[dict]:
     index(flow, flow.name or ".")
     issues: List[dict] = []
 
-    def visit(group: ProcessGroup, path: str, context_bound: bool) -> None:
+    def visit(group: ProcessGroup, path: str, context_bound: bool,
+              inherited_sensitive: Set[str] = frozenset()) -> None:
         bound = context_bound or group.parameter_context is not None
         children = {id(child) for child in group.process_groups}
         for conn in group.connections:
@@ -240,6 +292,31 @@ def _structural_issues(flow: Flow) -> List[dict]:
                                f"{owner_path!r}, not in {path!r} — NiFi needs an "
                                f"input/output port to cross a group boundary",
                 })
+        # NiFi's own rule, in its own words: "Cannot add Parameter with name
+        # 'x' unless that Parameter is Not Sensitive because a Parameter with
+        # that name is already referenced from a Property that is not
+        # Sensitive" (409, verified live on 1.24). Worse, a flow that reaches
+        # that state some other way exports as **500** on 1.24 — the group
+        # cannot be pulled, planned or backed up any more.
+        sensitive_params = _sensitive_parameter_names(group, inherited_sensitive)
+        if sensitive_params:
+            for component in list(group.processors) + list(group.controller_services):
+                secret_props = sensitive_properties(component.type)
+                for key, value in (component.properties or {}).items():
+                    if key in secret_props or not isinstance(value, str):
+                        continue
+                    referenced = sorted(
+                        set(_parameter_references(value)) & sensitive_params)
+                    if referenced:
+                        issues.append({
+                            "component": f"{path}/{component.name}",
+                            "message": f"property {key!r} is not sensitive but "
+                                       f"references sensitive parameter(s) "
+                                       f"{', '.join(repr(r) for r in referenced)} "
+                                       f"— NiFi refuses the parameter update, and a "
+                                       f"flow that reaches this state cannot be "
+                                       f"downloaded at all on 1.24",
+                        })
         if not bound:
             for component in list(group.processors) + list(group.controller_services):
                 referenced = sorted({
@@ -256,10 +333,18 @@ def _structural_issues(flow: Flow) -> List[dict]:
                                    f"ancestor — NiFi refuses to run the component",
                     })
         for child in group.process_groups:
-            visit(child, f"{path}/{child.name}", bound)
+            visit(child, f"{path}/{child.name}", bound, sensitive_params)
 
     visit(flow, flow.name or ".", False)
     return issues
+
+
+def _sensitive_parameter_names(group: ProcessGroup, inherited: Set[str]) -> Set[str]:
+    """Sensitive parameter names in scope here — this group's context, or an
+    ancestor's (a child group inherits whatever is bound above it)."""
+    context = getattr(group, "parameter_context", None)
+    own = {p.name for p in (getattr(context, "parameters", None) or []) if p.sensitive}
+    return set(inherited) | own
 
 
 def _connection_label(conn) -> str:
@@ -401,8 +486,9 @@ def validate_flow(
                                "— NiFi will flag its relationships as unhandled",
                 })
 
-            issues.extend(_property_issues(proc, label))
+            issues.extend(_property_issues(proc, label, target_major))
             issues.extend(_near_miss_issues(proc, label))
+            issues.extend(_service_reference_issues(proc, label))
             issues.extend(_targeted_issues(proc, label))
 
         # Controller services were never checked here at all, which is the
@@ -412,8 +498,9 @@ def validate_flow(
         # on the canvas than one on a processor.
         for service in group.controller_services:
             label = f"{path}/{service.name}"
-            issues.extend(_property_issues(service, label))
+            issues.extend(_property_issues(service, label, target_major))
             issues.extend(_near_miss_issues(service, label))
+            issues.extend(_service_reference_issues(service, label))
 
         for child in group.process_groups:
             visit(child, path)
