@@ -11,6 +11,36 @@ from niflow.rest.common import (
 )
 
 
+# Two shapes NiFi answers with on a cluster whose membership is incomplete.
+# Both are accurate and neither says what to do about it, and both are far
+# more likely to be met at work (behind a load balancer, mid-rolling-restart)
+# than on a dev box — so the hint is attached once, here, and every command
+# gets it: push, plan, follow, test, both GUIs.
+_DISCONNECTED_SELF = "node is disconnected from its configured cluster"
+_DISCONNECTED_OTHER = "nodes are not connected"
+
+
+def _cluster_hint(body: str) -> str:
+    """An actionable sentence for NiFi's two disconnected-node refusals."""
+    lowered = (body or "").lower()
+    if _DISCONNECTED_SELF in lowered:
+        return ("\n  → the NiFi you are talking to has fallen out of its own "
+                "cluster, so it refuses changes that the rest of the cluster "
+                "would never see. Point niflow at a connected node (or wait "
+                "for this one to rejoin); `niflow doctor` names them. niflow "
+                "deliberately does not set disconnectedNodeAcknowledged — "
+                "that means 'apply this knowing a node will not get it', "
+                "which is not a tool's decision to make.")
+    if _DISCONNECTED_OTHER in lowered:
+        return ("\n  → a cluster node is disconnected, and NiFi will not let a "
+                "component be deleted while a node that still has it cannot "
+                "hear about it. (Creates and updates are still allowed — it is "
+                "deletion that cannot be un-done on the missing node.) "
+                "Reconnect the node, or remove it from the cluster, then "
+                "retry; `niflow doctor` shows the node states.")
+    return ""
+
+
 class TransportMixin:
     def __init__(self, config: Optional[NiFiConfig] = None, session: Any = None):
         self.config = config or NiFiConfig.from_env()
@@ -100,7 +130,9 @@ class TransportMixin:
             headers["Authorization"] = f"Bearer {self._token}"
             resp = self.session.request(method, f"{self.base}{path}", headers=headers, **kwargs)
         if resp.status_code >= 400:
-            raise NiFiApiError(resp.status_code, f"{method} {path}: {resp.text}")
+            raise NiFiApiError(
+                resp.status_code,
+                f"{method} {path}: {resp.text}{_cluster_hint(resp.text)}")
         return resp
 
     def probe(self, path: str, method: str = "GET", **kwargs: Any) -> Any:

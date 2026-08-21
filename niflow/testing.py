@@ -347,7 +347,11 @@ class FlowTester:
             if not queue["queued"]:
                 continue
             for summary in self.client.list_flowfiles(queue["id"]):
-                detail = self.client.flowfile_detail(queue["id"], summary["uuid"])
+                # node_id matters on a cluster: a queue is per-node, and NiFi
+                # answers 400 for a FlowFile it has not been told the node of.
+                detail = self.client.flowfile_detail(
+                    queue["id"], summary["uuid"],
+                    node_id=summary.get("node_id", ""))
                 collected.append(
                     {"attributes": detail["attributes"], "content": detail["content"]}
                 )

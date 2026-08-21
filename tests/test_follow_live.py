@@ -503,3 +503,92 @@ def test_a_watch_table_tracks_one_attribute_across_the_journey(follower):
         assert format_watch_table(columns, rows).startswith("hop")
     finally:
         follower.cleanup_injector()
+
+
+# ----------------------------------------------- back pressure and expiry
+
+
+def _connection(client, pg_id, source, destination):
+    for queue in client.list_queues(pg_id):
+        if queue["source"] == source and queue["destination"] == destination:
+            return queue
+    raise AssertionError(f"no connection {source} -> {destination}")
+
+
+def _set_connection(client, conn_id, **fields):
+    entity = client._get_json(f"/connections/{conn_id}")
+    client._request("PUT", f"/connections/{conn_id}", json={
+        "revision": entity["revision"],
+        "component": dict({"id": conn_id}, **fields),
+    })
+
+
+def test_back_pressure_is_named_instead_of_blamed_on_the_queue_index(follower):
+    """T7h: a full downstream queue looks exactly like "it didn't run".
+
+    NiFi refuses to let a component transfer into a connection that has hit
+    its back-pressure threshold — the component runs and produces nothing.
+    Before this, the stepper reported "ran X 8x and this FlowFile has not
+    moved", which sends you hunting an indexing bug instead of draining a
+    queue one hop downstream.
+    """
+    client = follower.client
+    downstream = _connection(client, follower.pg_id, "Mark1", "in")
+    _set_connection(client, downstream["id"], backPressureObjectThreshold=1)
+    try:
+        # Fill it: one injected file stepped through Mark1 lands there and is
+        # already at (or over) the threshold of one.
+        filler = follower.inject("L1/Mark1", content="filler")
+        follower.step()
+        follower.cleanup_injector()
+
+        follower.inject("L1/Mark1", content="blocked")
+        outcome = follower.step()
+        assert outcome["status"] == "blocked", outcome.get("message")
+        assert "BACK PRESSURE" in outcome["message"]
+        assert "Mark1 -> in" in outcome["message"]
+        assert outcome.get("retryable") is not True
+    finally:
+        follower.cleanup_injector()
+        _set_connection(client, downstream["id"], backPressureObjectThreshold=10000)
+        _drain(client, follower.pg_id)
+
+
+def test_a_flowfile_that_expires_mid_journey_says_so(follower):
+    """T7h: quiescing a group is exactly when a short expiration fires.
+
+    The file vanishes between two steps and every queue reports it missing.
+    "It was dropped, sent onward, or consumed" is true and unhelpful when the
+    queue it was sitting in deletes anything older than a second.
+    """
+    client = follower.client
+    picked = follower.inject("L1/Mark1", content="ephemeral")
+    try:
+        conn_id = picked["queue"]["id"]
+        _set_connection(client, conn_id, flowFileExpiration="1 sec")
+        # NiFi expires on its own housekeeping pass, not instantly.
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            if not any(q["id"] == conn_id and q.get("queued")
+                       for q in client.list_queues(follower.pg_id)):
+                break
+            time.sleep(2)
+        else:
+            pytest.skip("NiFi did not expire the FlowFile within 60s")
+
+        outcome = follower.step()
+        assert outcome["status"] == "gone"
+        # Either NiFi handed us the EXPIRE event or it did not; both answers
+        # have to name expiry rather than shrug at a vanished FlowFile.
+        assert ("EXPIRED out of its queue" in outcome["message"]
+                or "expires FlowFiles after 1 sec" in outcome["message"]), \
+            outcome["message"]
+    finally:
+        follower.cleanup_injector()
+        _drain(client, follower.pg_id)
+
+
+def _drain(client, pg_id):
+    for queue in client.list_queues(pg_id):
+        if queue.get("queued"):
+            client.drain_connection(queue["id"])

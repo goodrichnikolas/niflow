@@ -393,7 +393,10 @@ def dispatch(
             if method == "GET" and path == "/api/flowfiles":
                 return 200, client.list_flowfiles(q("connection_id"))
             if method == "GET" and path == "/api/flowfile":
-                return 200, client.flowfile_detail(q("connection_id"), q("uuid"))
+                # node_id: on a cluster a queue is per-node and NiFi refuses
+                # to hand over a FlowFile without being told which one.
+                return 200, client.flowfile_detail(q("connection_id"), q("uuid"),
+                                                   node_id=q("node_id") or "")
             if method == "GET" and path == "/api/trace":
                 from niflow.follow import annotate_hops
 
@@ -956,7 +959,7 @@ const TABS = [
   ["explain", "Explain"], ["flows", "Flows"],
 ];
 let active = "processors";
-let inspector = null;   // {connId, groupId, label, uuid} queues-tab drill-down
+let inspector = null;   // {connId, groupId, label, uuid, nodeId} queues drill-down
 let traceUuid = null;   // FlowFile the Trace tab is following (survives tab hops)
 let followFlash = [];   // event ids the last step produced -> those hops flash
 
@@ -1023,12 +1026,16 @@ async function render() {
 
     if (active === "queues") {
       if (inspector && inspector.uuid) {
-        const d = await api(`/api/flowfile?connection_id=${inspector.connId}&uuid=${inspector.uuid}`);
+        // node_id: a queue is per-node on a cluster, and NiFi refuses a
+        // FlowFile it has not been told the node of.
+        const d = await api(`/api/flowfile?connection_id=${inspector.connId}&uuid=${inspector.uuid}`
+                            + (inspector.nodeId ? `&node_id=${encodeURIComponent(inspector.nodeId)}` : ""));
         view.innerHTML = `
           <div class="bar"><button class="op" onclick="inspector.uuid=null;render()">← back to ${esc(inspector.label)}</button>
             <button class="op" title="how did this file get here? provenance journey with attribute diffs"
                 onclick="traceJump('${inspector.uuid}')">Trace journey</button>
-            <span class="muted">${compLink(inspector.groupId, inspector.connId, "show this queue in NiFi")}</span></div>
+            <span class="muted">${compLink(inspector.groupId, inspector.connId, "show this queue in NiFi")}</span>
+            ${d.node_address ? `<span class="pill" title="a queue is per-node on a cluster">on ${esc(d.node_address)}</span>` : ""}</div>
           <div class="split">
             <div><h3>Attributes</h3><pre>${esc(JSON.stringify(d.attributes ?? d, null, 2))}</pre></div>
             <div><h3>Content</h3><pre>${esc(d.content ?? "(no content view)")}</pre></div>
@@ -1046,10 +1053,14 @@ async function render() {
                 onclick="queueOp(inspector.connId,'destination')">Run destination once</button>
             <button class="op danger" title="drop every FlowFile in this queue"
                 onclick="purgeQueue(-1)">Purge queue</button></div>
-          <table><tr><th>UUID</th><th>Filename</th><th>Size</th><th>Queued</th></tr>
-          ${files.map(f => `<tr class="click" onclick="inspector.uuid='${f.uuid}';render()">
+          <table><tr><th>UUID</th><th>Filename</th><th>Size</th><th>Queued</th>
+            ${files.some(f => f.node_address) ? "<th>Node</th>" : ""}</tr>
+          ${files.map(f => `<tr class="click"
+              onclick="inspector.uuid='${f.uuid}';inspector.nodeId='${esc(f.node_id || "")}';render()">
             <td class="muted">${esc(f.uuid)}</td><td>${esc(f.filename ?? "")}</td>
-            <td>${esc(f.size ?? "")}</td><td>${esc(f.queued_duration ?? "")}</td></tr>`).join("")}
+            <td>${esc(f.size ?? "")}</td><td>${esc(f.queued_duration ?? "")}</td>
+            ${files.some(x => x.node_address)
+              ? `<td class="muted">${esc(f.node_address || "")}</td>` : ""}</tr>`).join("")}
           </table>`;
       } else {
         const [queues, tops] = await Promise.all([api("/api/queues"), flowTops(), procIndex()]);
@@ -1368,7 +1379,7 @@ async function render() {
 
 function openQueue(i) {
   const c = window._qRows[i];
-  inspector = {connId: c.id, groupId: c.group_id, uuid: null,
+  inspector = {connId: c.id, groupId: c.group_id, uuid: null, nodeId: null,
                label: `${c.source} → ${c.destination}`};
   render();
 }

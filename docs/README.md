@@ -15,6 +15,7 @@ says where the two lines differ — that gap is where most of the surprises live
 | [watch.md](watch.md) | "It was working, nothing changed, it broke at 14:02" |
 | [explain.md](explain.md) | LLM-written walkthroughs of a live group |
 | [guis.md](guis.md) | The browser helper and the desktop helper |
+| [clusters.md](clusters.md) | What changes on a clustered NiFi — and the calls that need a node id |
 | [catalog-and-versions.md](catalog-and-versions.md) | The harvested rulebooks and the 1.x↔2.x map |
 | [fuzz.md](fuzz.md) | Hunting niflow's own bugs in bulk |
 | [version-compat.md](version-compat.md) | Generated report: every property that differs between the lines |

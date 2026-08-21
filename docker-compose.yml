@@ -4,6 +4,8 @@
 #                                           + Registry 2.7.2 http://localhost:18080/nifi-registry
 #   docker compose --profile v1 up -d    -> NiFi 1.24.0 https://localhost:8444/nifi
 #                                           + Registry 1.24.0 http://localhost:18081/nifi-registry
+#   docker compose --profile cluster up -d -> a TWO-NODE NiFi 1.24.0 cluster
+#                                           http://localhost:8180 + :8181 (+ ZooKeeper)
 #
 # NiFi logs in as admin / adminpassword123. The registries are unsecured HTTP
 # (local dev only) and are reached from the NiFi containers by service name
@@ -58,6 +60,99 @@ services:
       interval: 15s
       timeout: 10s
       retries: 20
+      start_period: 60s
+
+  # ------------------------------------------------------------------ cluster
+  # A real two-node NiFi cluster (profile "cluster"), which is the only way to
+  # test primary-node-only scheduling, load-balanced connections actually
+  # redistributing, and what niflow does when a node is disconnected.
+  #
+  # Why 1.24 and why plain HTTP: node-to-node communication has to be mutually
+  # trusted, and a secured cluster means generating a cert per node plus a
+  # shared truststore — real, but a lot of moving parts for a test fixture.
+  # NiFi 1.x still allows `nifi.web.http.port`, so an unsecured cluster is two
+  # env vars; NiFi 2.x removed plain HTTP, so this profile is 1.x only. That
+  # is also the line work runs (1.24/1.28), which is the axis that matters.
+  # niflow speaks to it anonymously — no password configured, no token call
+  # (see TransportMixin.login).
+  cluster-zk:
+    image: zookeeper:3.9
+    logging: *default-logging
+    container_name: niflow-cluster-zk
+    profiles: ["cluster"]
+    hostname: cluster-zk
+    environment:
+      ZOO_4LW_COMMANDS_WHITELIST: "srvr,mntr,ruok"
+      ZOO_ADMINSERVER_ENABLED: "false"
+    healthcheck:
+      test: ["CMD-SHELL", "echo ruok | nc -w 2 localhost 2181 | grep -q imok"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 20s
+
+  # Both nodes are identical apart from their address and published port —
+  # which is the point: a cluster has no "main" node, only an elected
+  # coordinator and an elected primary, and niflow must not care which is which.
+  cluster-n1:
+    image: apache/nifi:1.24.0
+    logging: *default-logging
+    container_name: niflow-cluster-n1
+    profiles: ["cluster"]
+    hostname: cluster-n1
+    depends_on:
+      cluster-zk:
+        condition: service_healthy
+    ports:
+      - "8180:8080"
+    environment: &cluster-node-env
+      NIFI_WEB_HTTP_PORT: "8080"
+      # 1.x validates the Host header, and the host reaches the node through a
+      # published port; whitelist both spellings it can arrive as.
+      NIFI_WEB_PROXY_HOST: "localhost:8180,localhost:8181"
+      NIFI_CLUSTER_IS_NODE: "true"
+      NIFI_CLUSTER_NODE_PROTOCOL_PORT: "8082"
+      NIFI_ZK_CONNECT_STRING: "cluster-zk:2181"
+      # Non-obvious and fatal: a CLUSTERED 1.x node refuses to launch without
+      # an explicit shared sensitive-properties key ("Clustered Configuration
+      # Found: Shared Sensitive Properties Key required for cluster nodes"),
+      # and every node must use the SAME one or they cannot read each other's
+      # flow. Standalone nodes generate one per container, which is why this
+      # only bites here.
+      NIFI_SENSITIVE_PROPS_KEY: "niflow-cluster-sensitive-key"
+      # A test fixture must not sit through the default 5-minute flow election.
+      NIFI_ELECTION_MAX_WAIT: "20 sec"
+      NIFI_ELECTION_MAX_CANDIDATES: "2"
+      NIFI_JVM_HEAP_INIT: "512m"
+      NIFI_JVM_HEAP_MAX: "1g"
+    healthcheck:
+      # /flow/cluster/summary answers only once this node has joined, so a
+      # healthy container really does mean "clustered", not merely "listening".
+      # Probe by $$(hostname): NiFi binds the web server to the container's own
+      # name, not localhost (the same reason every other service here does).
+      test: ["CMD-SHELL", "curl -s http://$$(hostname):8080/nifi-api/flow/cluster/summary | grep -q '\"connectedToCluster\":true'"]
+      interval: 10s
+      timeout: 5s
+      retries: 40
+      start_period: 60s
+
+  cluster-n2:
+    image: apache/nifi:1.24.0
+    logging: *default-logging
+    container_name: niflow-cluster-n2
+    profiles: ["cluster"]
+    hostname: cluster-n2
+    depends_on:
+      cluster-zk:
+        condition: service_healthy
+    ports:
+      - "8181:8080"
+    environment: *cluster-node-env
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://$$(hostname):8080/nifi-api/flow/cluster/summary | grep -q '\"connectedToCluster\":true'"]
+      interval: 10s
+      timeout: 5s
+      retries: 40
       start_period: 60s
 
   # NiFi 1.24.0 secured with CLIENT CERTIFICATES (no username/password) —

@@ -173,7 +173,60 @@ def run_checks(config: Optional[NiFiConfig] = None, session=None) -> List[Check]
             "authenticated but cannot read the canvas — your account likely "
             f"lacks 'view the user interface'/component policies: {str(exc)[:160]}"
         )))
+    checks.append(_cluster_check(client))
     return checks
+
+
+def _cluster_check(client) -> Check:
+    """Say whether the cluster rules apply here — and whether they will bite.
+
+    Worth its own line because a cluster changes what niflow's own output
+    means: ``@PrimaryNodeOnly`` processors run on exactly one node,
+    load-balanced connections move FlowFiles between nodes behind your back,
+    and — the one that actually stops work — **while any node is disconnected,
+    NiFi refuses every mutating call** niflow makes. niflow sends
+    ``disconnectedNodeAcknowledged: false`` deliberately (acknowledging it
+    means "apply this change knowing that node will never get it", which is
+    not a tool's decision), so the diagnosis belongs here, before the push
+    fails with a 409 that does not explain itself.
+    """
+    summary = client.cluster_summary()
+    if not summary["clustered"]:
+        return Check(OK, "cluster", "standalone server (not clustered)")
+
+    if not summary["connected"]:
+        # The node answering us has fallen out of its own cluster. Everything
+        # reads fine and every *change* is refused — which, behind a load
+        # balancer, is a mystery worth naming out loud.
+        return Check(FAIL, "cluster", (
+            "this node is DISCONNECTED from its own cluster: reads work, but "
+            "NiFi refuses every change (push, plan apply, start/stop, "
+            "run-once) because the rest of the cluster would never see it. "
+            "Point NIFLOW_NIFI_HOST at a connected node, or wait for this one "
+            "to rejoin"
+        ))
+
+    nodes = client.cluster_nodes()
+    roles = ", ".join(
+        f"{node['address']} = {'/'.join(node['roles'])}"
+        for node in nodes if node["roles"]) or "roles not readable"
+    down = [node for node in nodes if node["status"] not in ("CONNECTED", "")]
+    if down:
+        names = ", ".join(f"{node['address']} ({node['status']})" for node in down)
+        return Check(WARN, "cluster", (
+            f"{summary['connected_nodes']}/{summary['total_nodes']} nodes "
+            f"connected — {names}. Creates, updates and starts still work, but "
+            "NiFi REFUSES every DELETE while a node that still holds the "
+            "component cannot hear about it — so a full `niflow push` (which "
+            "replaces the group) and any plan with a removal in it will fail. "
+            "Reconnect the node, or remove it from the cluster. "
+            f"Roles: {roles}"
+        ))
+    return Check(OK, "cluster", (
+        f"{summary['connected_nodes']}/{summary['total_nodes']} nodes "
+        f"connected. {roles}. Primary-node-only processors run on the primary "
+        "only; load-balanced connections redistribute between nodes"
+    ))
 
 
 def _trust_checks(config: NiFiConfig, client) -> List[Check]:

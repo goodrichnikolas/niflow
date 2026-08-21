@@ -127,7 +127,7 @@ class FakeClient:
         assert queue_id == "q-wa"
         return [{"uuid": ff["uuid"]} for ff in self.audit_queue]
 
-    def flowfile_detail(self, queue_id, uuid):
+    def flowfile_detail(self, queue_id, uuid, node_id=""):
         ff = next(f for f in self.audit_queue if f["uuid"] == uuid)
         return {"uuid": uuid, "attributes": ff["attributes"], "content": ff["content"]}
 

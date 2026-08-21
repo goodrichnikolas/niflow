@@ -1119,7 +1119,24 @@ class FlowFollower:
                 f"the injector minted nothing into {label!r}{detail} — "
                 "nothing was left on the canvas, so it is safe to retry") from exc
         picked["injected"] = label
+        picked["node"] = (picked.get("flowfile") or {}).get("node_address", "")
+        picked["siblings"] = self._injector_siblings(conn_id, picked["uuid"])
         return picked
+
+    def _injector_siblings(self, conn_id: str, uuid: str) -> int:
+        """How many *other* FlowFiles that one run-once minted.
+
+        On a cluster the answer is not zero: **run-once fires on every node**
+        (verified on a live two-node 1.24.0 — one trigger, one FlowFile per
+        node), so an injector mints a twin the stepper is not following. It is
+        not a problem — the twins sit in the injector's queue and go when the
+        injector does — but a stepper that silently followed one of two files
+        would be lying by omission.
+        """
+        try:
+            return max(len(self._list_flowfiles(conn_id)) - 1, 0)
+        except Exception:  # a counting nicety must never fail an injection
+            return 0
 
     def _injection_target(self, spec: str) -> dict:
         """Resolve an injection target to ``{kind,id,name,path,group_id,...}``."""
@@ -1550,15 +1567,50 @@ class FlowFollower:
         if outcome["hops"]:
             outcome["status"] = "gone"
             outcome["retryable"] = False
+            # NiFi records EXPIRE like any other terminal event, so the
+            # journey's own last hop can say why the file vanished — which is
+            # a much better answer than "it left every queue" when a short
+            # FlowFile Expiration deleted it while you were stepping.
+            expired = any(hop.get("event_type") == "EXPIRE"
+                          for hop in outcome["hops"])
             outcome["message"] = (
+                "the FlowFile EXPIRED out of its queue — it was deleted for "
+                "sitting there too long, not consumed" + self._expiry_note()
+                if expired else
                 "the FlowFile has left every queue — the events above are how "
                 "it ended")
             return outcome
         outcome["status"] = "gone"
         outcome["retryable"] = False
         outcome["message"] = ("the FlowFile is in no queue — it was dropped, "
-                              "sent onward, or consumed by the last hop")
+                              "sent onward, or consumed by the last hop"
+                              + self._expiry_note())
         return outcome
+
+    def _expiry_note(self) -> str:
+        """Did the queue we were watching expire FlowFiles out from under us?
+
+        A queue with a non-zero ``FlowFile Expiration`` deletes files that sit
+        in it too long, and NiFi records an EXPIRE event that arrives like any
+        other DROP. Quiescing a group to step through it is exactly the
+        situation where a file sits still long enough for that to fire, so
+        "it vanished" deserves the likeliest explanation attached.
+        """
+        record = self.session.branches.get(self.uuid or "") or {}
+        conn_id = record.get("queue_id")
+        if not conn_id:
+            return ""
+        try:
+            component = self.client._get_json(f"/connections/{conn_id}")["component"]
+        except Exception as exc:
+            logger.debug("Could not read connection %s: %s", conn_id, exc)
+            return ""
+        expiration = (component.get("flowFileExpiration") or "").strip()
+        if not expiration or expiration.startswith("0 "):
+            return ""
+        return (f". Note the queue it was in expires FlowFiles after "
+                f"{expiration} — stepping is slow enough that a short "
+                "expiration will delete the file mid-journey")
 
     def _refuses_to_run(self, end: dict) -> str:
         """Why run-once must NOT be sent to this processor, or ``""``.
@@ -1806,6 +1858,17 @@ class FlowFollower:
                 + " — NiFi accepts run-once on an invalid processor and silently "
                 "does nothing (1.24). Fix it, then step again.")
             return outcome
+        # Back pressure: the destination ran and had nowhere to put the
+        # result. Running it again cannot help, and the fix is downstream —
+        # so saying "ran it 8x, nothing moved" would send the reader hunting
+        # in the wrong place entirely.
+        blocked = self._back_pressure_note(end, queue)
+        if blocked:
+            outcome["status"] = "blocked"
+            outcome["retryable"] = False
+            outcome["runs"] = runs
+            outcome["message"] = blocked
+            return outcome
         # A merging destination has not failed to run — it ran and correctly
         # emitted nothing, because its bin is not full. Saying "ran it 8x and
         # nothing moved" there sends the reader hunting an indexing problem.
@@ -1880,6 +1943,49 @@ class FlowFollower:
     _BIN_ENTRY_KEYS = ("Minimum Number of Entries",)
     _BIN_RECORD_KEYS = ("Minimum Number of Records", "min-records")
     _BIN_AGE_KEYS = ("Max Bin Age", "max-bin-age")
+
+    def _back_pressure_note(self, end: dict, queue: dict) -> str:
+        """Is the destination's own outbound queue full? Then nothing can move.
+
+        NiFi stops a component transferring into a connection that has reached
+        its back-pressure threshold, and the component simply produces nothing
+        — indistinguishable, from the stepper's side, from "it did not run".
+        The threshold that matters is *downstream* of the destination, which
+        is why this looks at what the destination feeds rather than at the
+        queue being stepped.
+
+        Endpoints are matched by id when the server gives one and by name
+        within the same group when it does not: **NiFi's recursive status
+        snapshot carries no endpoint ids on either line** (measured on 1.24.0
+        and 2.7.2), which is the same fallback ``entry_points`` makes.
+        """
+        end_id, end_name = end.get("id", ""), end.get("name", "")
+        if not (end_id or end_name):
+            return ""
+        try:
+            queues = self._queues()
+        except FollowError:
+            return ""
+
+        def feeds_it(q: dict) -> bool:
+            if q.get("source_id"):
+                return q["source_id"] == end_id
+            return (bool(end_name) and q.get("source") == end_name
+                    and q.get("path", "") == queue.get("path", ""))
+
+        full = [q for q in queues
+                if feeds_it(q) and int(q.get("back_pressure_pct") or 0) >= 100]
+        if not full:
+            return ""
+        names = ", ".join(f"{q.get('source', '?')} -> {q.get('destination', '?')}"
+                          for q in full[:3])
+        return (
+            f"{end.get('name', '?')!r} is blocked by BACK PRESSURE: its "
+            f"outbound queue is full ({names}). NiFi will not let it transfer "
+            "anything until that queue drains, so stepping again cannot move "
+            "this FlowFile — drain the queue downstream (or raise its "
+            "threshold) first."
+        )
 
     def _binning_note(self, processor: Optional[dict],
                       queue: Optional[dict]) -> str:
@@ -2459,9 +2565,15 @@ def _start(
     if inject_at:
         picked = follower.inject(inject_at, content=content,
                                  attributes=attributes)
-        print_fn(f"Injected a fixture FlowFile at {picked['injected']!r} "
-                 f"({len(content)} byte(s) of content, "
+        where = f" on {picked['node']}" if picked.get("node") else ""
+        print_fn(f"Injected a fixture FlowFile at {picked['injected']!r}"
+                 f"{where} ({len(content)} byte(s) of content, "
                  f"{len(attributes or {})} attribute(s)).")
+        if picked.get("siblings"):
+            print_fn(f"Cluster: run-once fires on EVERY node, so it minted "
+                     f"{picked['siblings'] + 1} FlowFile(s) — one per node. "
+                     "Following the one above; the rest stay queued and go "
+                     "when the injector does.")
         return picked
     if uuid or queue:
         return follower.pick_flowfile(queue_id=queue, uuid=uuid)

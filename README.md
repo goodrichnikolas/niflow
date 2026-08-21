@@ -337,7 +337,8 @@ Tutorial-style walkthroughs of each part, in [docs/](docs/README.md):
 [validate](docs/validate.md) · [trace/follow](docs/trace-and-follow.md) ·
 [testing](docs/testing.md) · [backup/rollback](docs/backup-and-rollback.md) ·
 [watch](docs/watch.md) · [explain](docs/explain.md) · [GUIs](docs/guis.md) ·
-[catalog & versions](docs/catalog-and-versions.md) · [fuzz](docs/fuzz.md).
+[clusters](docs/clusters.md) · [catalog & versions](docs/catalog-and-versions.md) ·
+[fuzz](docs/fuzz.md).
 
 ## Project layout
 

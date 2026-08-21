@@ -182,6 +182,8 @@ def test_list_queues_walks_the_tree(client):
         "group_id": "root-id",
         "source_id": "g1", "source_group_id": "root-id",
         "destination_id": "p1", "destination_group_id": "root-id",
+        # 100 = the queue is full and its source cannot transfer into it.
+        "back_pressure_pct": 0,
     }]
 
 
@@ -201,7 +203,11 @@ def test_list_flowfiles_polls_and_cleans_up(client):
     files = client.list_flowfiles("c1")
     assert [f["uuid"] for f in files] == ["ff-1", "ff-2"]
     assert files[0] == {"uuid": "ff-1", "filename": "a.json", "size": 9,
-                        "position": 0, "penalized": False, "penalty_expires_in": 0}
+                        "position": 0, "penalized": False, "penalty_expires_in": 0,
+                        # Empty on a standalone server; on a cluster this says
+                        # which node holds the file (and NiFi needs it back
+                        # before it will hand over attributes or content).
+                        "node_id": "", "node_address": ""}
     assert "lr-1" in client.session.deleted
 
 

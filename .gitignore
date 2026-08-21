@@ -54,6 +54,7 @@ flows/*
 !flows/abc_to_json.py
 !flows/torture.py
 !flows/labyrinth.py
+!flows/cluster.py
 
 # `niflow explain` writes LLM prose about whatever flow you pointed it at —
 # same exposure as flows/, one step less obvious. Only the explanations of the

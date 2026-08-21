@@ -14,17 +14,22 @@ stepper's fixture/watch/replay work:
 * **Fuzz:** offline **4,129 cases / 0 findings**; tier 3 **150 / 0 on 2.7.2**
   and **150 / 0 on 1.24.0** (kinds now include `svc` and `params`, and every
   case also fault-injects the applier).
-* **Live:** `make test-integration` on 2.7.2 — 401 passed, 44 xpassed, 0
-  failed. On 1.24 the non-catalog integration suite passes (31); the only
+* **Live:** `make test-integration` on 2.7.2 — 403 passed, 44 xpassed, 0
+  failed. On 1.24 the non-catalog integration suite passes (33); the only
   failures there remain the documented `test_catalog.py` sweep (a 2.x catalog
   exercised against a 1.x server, which CI ignores).
-* `tests/test_follow_live.py` — **15/15 on both lines**.
+* `tests/test_follow_live.py` — **17/17 on both lines**.
+* `tests/test_cluster_live.py` — **12/12** against the two-node 1.24 cluster
+  (`make cluster-up cluster-wait && make test-cluster`); skips itself
+  everywhere else.
 
 Still open:
 
-* **T7h** (needs a cluster this machine does not have) — that is the whole
-  list. The stepper's own backlog (fixture injection, watch expressions,
-  replay-after-fix) closed on 2026-08-21; see "Live stepper" below.
+* **T7h**, down to its last three items — real load, a rolled-over provenance
+  repository, and work's own NARs. The cluster half closed on 2026-08-21:
+  there is a two-node cluster in `docker-compose.yml` now (`make cluster-up`),
+  and it found four real bugs. The stepper's own backlog (fixture injection,
+  watch expressions, replay-after-fix) closed the same day.
 
 
 ## Push & version control
@@ -1402,13 +1407,82 @@ on both lines).
       takes `--max-events N`, and the Trace tab says "hop #1 below is not
       where this FlowFile began". Hop #1 of a capped journey being read as the
       origin is exactly the wrong conclusion to let someone draw.
-- [ ] **T7h — not testable locally.** No cluster, so: primary-node-only
-      scheduling, load-balanced connections actually redistributing, and
-      `disconnectedNodeAcknowledged` semantics are all untested. Nor is real
-      load (the provenance findings above were measured on a container with
-      one client), a rolled-over/rebuilding provenance repository, back
-      pressure engaged hard enough to block a port crossing, FlowFile
-      expiry firing mid-journey, or work's own NARs.
+- [~] **T7h — mostly closed 2026-08-21: there IS a cluster now.**
+      "Not testable locally" turned out to be a missing compose profile, not a
+      missing machine. `docker-compose.yml` gained a **`cluster` profile** —
+      ZooKeeper + two NiFi 1.24 nodes on plain HTTP (`:8180`/`:8181`) —
+      with `make cluster-up / cluster-wait / cluster-down / test-cluster`, the
+      `flows/cluster.py` fixture and **`tests/test_cluster_live.py` (12 tests,
+      all green)**, which skips itself when the target is not clustered.
+      1.x and HTTP because node-to-node has to be mutually trusted and a
+      secured cluster is a cert per node plus a shared truststore; 2.x removed
+      plain HTTP. 1.24/1.28 is the work line anyway.
+      Gotcha worth keeping: a **clustered** 1.x node will not launch without an
+      explicit shared `nifi.sensitive.props.key`, identical on every node.
+      What the cluster proved, and what it broke:
+      * **A queue is per-node, and niflow did not know.**
+        `GET /flowfile-queues/{id}/flowfiles/{uuid}` answers **400 "The id of
+        the node in the cluster"** without `clusterNodeId`. Everything that
+        reads a single FlowFile went through it, so on *every* clustered NiFi:
+        the queue browser's attribute/content drill-down failed with a raw 400
+        in both GUIs, `niflow test` could not collect its results at all, and
+        the stepper's lookup past the 100-file listing cap answered "not
+        there" for a file that was right there. Fixed: `list_flowfiles` now
+        carries `node_id`/`node_address` per file, `locate_flowfile` /
+        `flowfile_detail` take an optional `node_id` (and try every connected
+        node when they are not given one — wrong nodes cleanly 404), the web
+        GUI shows a **Node** column and threads the id through the drill-down.
+      * **Primary-node-only scheduling — proved where PRIMARY is not a
+        formality.** ListFTP pushed with the model default `ALL` lands as
+        `executionNode=PRIMARY`, and `plan` converges to **zero** against a
+        real cluster. That fix (harvesting `executionNodeRestricted`) had only
+        ever been tested where the value could not matter.
+      * **Load balancing really redistributes.** ROUND_ROBIN over two nodes
+        splits 40/40; strategy, `partitioning_attribute` and — the field most
+        likely to be dropped — `loadBalanceCompression` all survive a push.
+        Measure it from the **queue listing**, not the nodewise status: the
+        status snapshot is heartbeat-driven and two nodes can report from
+        different instants (that is how "80 + 40 = 80" happens).
+      * **`disconnectedNodeAcknowledged`, measured rather than assumed.**
+        niflow sends `false` everywhere (acknowledging means "apply this
+        knowing a node will never see it" — not a tool's call). From a
+        CONNECTED node, creates/updates/starts still work and **DELETEs are
+        refused** (409 "Cannot delete component because the following Nodes are
+        not connected"), which is what fails a full `niflow push`. From the
+        DISCONNECTED node itself, every change is refused (400). Both
+        refusals now carry an actionable sentence, attached in
+        `rest/transport.py` so every command gets it, and `niflow doctor`
+        gained a **cluster** check: roles when healthy, a warning naming the
+        disconnected node, and a **fail** when the node you are talking to has
+        fallen out of its own cluster — the load-balancer scenario where every
+        read works and every write is refused.
+      * **Run-once fires on EVERY node.** One trigger, one FlowFile per node.
+        Harmless but invisible from a standalone server, and it changes what
+        "I injected one file" means — `follow` now says so and names the node
+        its file is on.
+      * **The stepper works on a cluster** end to end: inject, step, port
+        crossing, provenance.
+      Two of the non-cluster leftovers are closed too, both on the single-node
+      containers and both live on 1.24 + 2.7.2:
+      * **back pressure blocking a hop** — a full downstream queue is
+        indistinguishable from "it did not run", and the stepper used to say
+        "ran X 8x and this FlowFile has not moved", sending you hunting an
+        indexing bug instead of draining a queue one hop downstream. It now
+        reports `blocked` and names the full queue. `list_queues` gained
+        `back_pressure_pct` (NiFi's snapshot carries no endpoint ids on
+        either line, so outbound queues are matched by name within the group —
+        the same fallback `entry_points` makes).
+      * **FlowFile expiry mid-journey** — quiescing a group is exactly when a
+        short expiration fires. NiFi records EXPIRE like any other terminal
+        event, so the stepper now says "the FlowFile EXPIRED out of its queue
+        — it was deleted for sitting there too long, not consumed", and falls
+        back to reading the connection's `flowFileExpiration` when the event
+        is not there.
+      **Still open** (honestly, not for want of trying): real load — the
+      provenance findings were measured on a container with one client — a
+      rolled-over or rebuilding provenance repository, and work's own NARs.
+      A two-node dev cluster does not reproduce any of those.
+      Docs: **docs/clusters.md**.
 
 ### Found while here — not trace/follow, for whoever owns those files
 

@@ -85,8 +85,10 @@ class FakeClient:
         self.ops.append(("list_flowfiles", connection_id))
         return [dict(f) for f in self.queued]
 
-    def flowfile_detail(self, connection_id, uuid):
-        return {"attributes": {"filename": "f.txt"}, "content": "hello"}
+    def flowfile_detail(self, connection_id, uuid, node_id=""):
+        # node_id is what a cluster needs; a standalone stub just records it.
+        return {"attributes": {"filename": "f.txt"}, "content": "hello",
+                "node_id": node_id, "node_address": ""}
 
     def trace_flowfile(self, uuid, max_events=100):
         self.ops.append(("trace", uuid))

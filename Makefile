@@ -122,6 +122,31 @@ nifi1-up:
 	@echo "  Registry: http://localhost:18081/nifi-registry"
 	@echo "Run 'make nifi1-wait' to block until it's ready."
 
+# A REAL two-node cluster (1.24, plain HTTP — see docker-compose.yml for why).
+# The only way to exercise primary-node-only scheduling, load-balanced
+# connections actually redistributing, and what niflow does when a node drops.
+cluster-up:
+	docker compose --profile cluster up -d cluster-zk cluster-n1 cluster-n2
+	@echo ""
+	@echo "NiFi 1.24.0 cluster starting (2 nodes, no auth):"
+	@echo "  node 1: http://localhost:8180/nifi   API http://localhost:8180/nifi-api"
+	@echo "  node 2: http://localhost:8181/nifi   API http://localhost:8181/nifi-api"
+	@echo "Run 'make cluster-wait' to block until BOTH nodes have joined."
+
+cluster-wait:
+	@echo "Waiting for both cluster nodes to join..."
+	@until [ "$$(docker inspect -f '{{.State.Health.Status}}' niflow-cluster-n1 2>/dev/null)" = "healthy" ] \
+	    && [ "$$(docker inspect -f '{{.State.Health.Status}}' niflow-cluster-n2 2>/dev/null)" = "healthy" ]; do \
+		printf "."; sleep 5; \
+	done; echo " ready."
+	@curl -s http://localhost:8180/nifi-api/flow/cluster/summary; echo ""
+
+cluster-down:
+	docker compose --profile cluster down
+
+cluster-logs:
+	docker compose --profile cluster logs -f cluster-n1 cluster-n2
+
 nifi-wait:
 	@echo "Waiting for NiFi 2.x to become healthy..."
 	@until [ "$$(docker inspect -f '{{.State.Health.Status}}' niflow-nifi 2>/dev/null)" = "healthy" ]; do \
@@ -175,6 +200,13 @@ test-integration:
 
 test-integration-v1:
 	NIFLOW_NIFI_HOST=https://localhost:8444/nifi-api $(PY) -m pytest -m integration -v
+
+# The cluster-only suite (T7h). Skips itself unless a clustered NiFi answers
+# at NIFLOW_CLUSTER_HOST, so it is safe to leave in the default run.
+test-cluster:
+	NIFLOW_NIFI_HOST=$(CLUSTER_HOST) NIFLOW_NIFI_PASSWORD= $(PY) -m pytest -m integration tests/test_cluster_live.py -v
+
+CLUSTER_HOST ?= http://localhost:8180/nifi-api
 
 # Bug-hunting sweep: thousands of generated micro-flows through niflow's own
 # pipeline. Tier 1 needs no NiFi at all and takes seconds; tiers 2/3 push

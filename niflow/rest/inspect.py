@@ -171,6 +171,76 @@ class InspectMixin:
 
         yield from visit(self.resolve_group(group), "")
 
+    # ------------------------------------------------------------ cluster
+
+    def cluster_summary(self) -> dict:
+        """Is this server a cluster, and is it whole?
+
+        Returns ``{"clustered", "connected", "connected_nodes", "total_nodes"}``.
+        A standalone server answers ``clustered: False`` — this endpoint exists
+        on both lines and needs no elevated permission, so it is the cheap way
+        to ask "do the cluster rules apply here" before doing anything that
+        depends on the answer.
+
+        A server that will not answer at all is reported as standalone rather
+        than raising: not knowing must not stop a command that would have
+        worked.
+        """
+        try:
+            summary = self._get_json("/flow/cluster/summary")["clusterSummary"]
+        except Exception as exc:  # an old/locked-down server simply won't say
+            logger.debug("Cluster summary unavailable: %s", exc)
+            return {"clustered": False, "connected": False,
+                    "connected_nodes": 0, "total_nodes": 0}
+        return {
+            "clustered": bool(summary.get("clustered")),
+            "connected": bool(summary.get("connectedToCluster")),
+            "connected_nodes": int(summary.get("connectedNodeCount") or 0),
+            "total_nodes": int(summary.get("totalNodeCount") or 0),
+        }
+
+    def cluster_nodes(self) -> List[dict]:
+        """Every node, with its status and the roles it currently holds.
+
+        ``{"id", "address", "port", "status", "roles", "queued",
+        "active_threads", "heartbeat"}``. Empty on a standalone server (or one
+        that refuses ``/controller/cluster``, which needs more permission than
+        the summary does).
+
+        The roles are elected and can move at any moment — "Primary Node" is
+        why a ``@PrimaryNodeOnly`` processor runs on exactly one node, and
+        "Cluster Coordinator" is the node that answers cluster-wide reads.
+        """
+        try:
+            cluster = self._get_json("/controller/cluster")["cluster"]
+        except Exception as exc:
+            logger.debug("Cluster node listing unavailable: %s", exc)
+            return []
+        return [
+            {
+                "id": node.get("nodeId", ""),
+                "address": node.get("address", ""),
+                "port": node.get("apiPort"),
+                "status": node.get("status", ""),
+                "roles": list(node.get("roles") or []),
+                "queued": node.get("queued", ""),
+                "active_threads": node.get("activeThreadCount"),
+                "heartbeat": node.get("heartbeat", ""),
+            }
+            for node in cluster.get("nodes") or []
+        ]
+
+    def disconnected_nodes(self) -> List[dict]:
+        """Nodes that are not CONNECTED — the ones that block every write.
+
+        niflow sends ``disconnectedNodeAcknowledged: false`` on every mutating
+        call (acknowledging it means "apply this change knowing that node will
+        not get it", which is not a decision a tool should take for you), so
+        while this list is non-empty NiFi refuses those calls.
+        """
+        return [node for node in self.cluster_nodes()
+                if node["status"] not in ("CONNECTED", "")]
+
     def bulletins(self, limit: int = 100) -> List[dict]:
         """Recent bulletins across the instance, newest first, as flat dicts.
 
@@ -369,7 +439,11 @@ class InspectMixin:
 
         Each dict carries ``id`` (the connection id, used to list contents),
         ``source``/``destination`` names, the group ``path``, and ``queued``
-        (FlowFile count) / ``queued_label`` (NiFi's "n / size" string).
+        (FlowFile count) / ``queued_label`` (NiFi's "n / size" string), plus
+        ``back_pressure_pct`` — the higher of NiFi's count and size
+        percentages. At 100 the queue is FULL and its source cannot transfer
+        into it at all, which is the real reason behind a whole class of
+        "nothing is moving" (see :meth:`~niflow.follow.FlowFollower.step`).
 
         It also carries the ids needed to deep-link into the NiFi canvas:
         ``group_id`` (the group the connection is drawn in) plus
@@ -400,6 +474,9 @@ class InspectMixin:
                         "source_group_id": group_id,
                         "destination_id": conn.get("destinationId", ""),
                         "destination_group_id": group_id,
+                        "back_pressure_pct": max(
+                            int(conn.get("percentUseCount") or 0),
+                            int(conn.get("percentUseBytes") or 0)),
                     })
                 for wrapper in snap.get("processGroupStatusSnapshots", []):
                     child = wrapper.get("processGroupStatusSnapshot") or {}
@@ -429,6 +506,9 @@ class InspectMixin:
                     "source_group_id": src.get("groupId", "") or group_id,
                     "destination_id": dst.get("id", ""),
                     "destination_group_id": dst.get("groupId", "") or group_id,
+                    "back_pressure_pct": max(
+                        int(snap.get("percentUseCount") or 0),
+                        int(snap.get("percentUseBytes") or 0)),
                 })
             for child in flow.get("processGroups", []):
                 c = child["component"]
@@ -514,6 +594,12 @@ class InspectMixin:
         ``maxResults: 500`` still comes back with ``maxResults: 100``. A queue
         holding thousands therefore shows only its first hundred, which is
         why :meth:`locate_flowfile` exists.
+
+        On a **cluster** each summary also carries ``node_id``/``node_address``:
+        a queue is per-node, so "which node is this FlowFile on" is both the
+        answer to "did load balancing work" and the thing NiFi *requires*
+        before it will hand over the FlowFile's attributes or content (see
+        :meth:`flowfile_detail`). Empty strings on a standalone server.
         """
         base = f"/flowfile-queues/{connection_id}/listing-requests"
         req = self._request("POST", base).json()["listingRequest"]
@@ -536,11 +622,67 @@ class InspectMixin:
                 "position": s.get("position", 0),
                 "penalized": bool(s.get("penalized")),
                 "penalty_expires_in": s.get("penaltyExpiresIn", 0) or 0,
+                "node_id": s.get("clusterNodeId", "") or "",
+                "node_address": s.get("clusterNodeAddress", "") or "",
             }
             for s in summaries[:max_results]
         ]
 
-    def locate_flowfile(self, connection_id: str, uuid: str) -> Optional[dict]:
+    def _node_ids(self) -> List[str]:
+        """Connected node ids, cached — empty on a standalone server.
+
+        Cached because the per-FlowFile endpoints below need it on *every*
+        call, and a cluster's membership does not change between two hops of
+        one journey. A node that joins or leaves mid-session is picked up by
+        the next process, which is the same bargain the rest of niflow makes
+        with the canvas.
+        """
+        cached = getattr(self, "_node_id_cache", None)
+        if cached is None:
+            cached = [node["id"] for node in self.cluster_nodes()
+                      if node["status"] == "CONNECTED" and node["id"]]
+            self._node_id_cache = cached
+        return cached
+
+    def _flowfile_nodes(self, node_id: Optional[str]) -> List[Optional[str]]:
+        """Which ``clusterNodeId`` values to try for a single-FlowFile call.
+
+        A queue lives on one node, and NiFi will not answer for a FlowFile
+        without being told which — ``GET /flowfile-queues/{id}/flowfiles/{uuid}``
+        on a cluster answers **400 "The id of the node in the cluster"**
+        (verified on a live 1.24.0 two-node cluster). With the id from a
+        listing it is one call; without one, every connected node is asked and
+        the wrong ones cleanly 404, so the answer is still exact.
+        """
+        if node_id:
+            return [node_id]
+        nodes = self._node_ids()
+        return list(nodes) if nodes else [None]
+
+    def _flowfile_dto(self, connection_id: str, uuid: str,
+                      node_id: str = "") -> Tuple[Optional[dict], str]:
+        """``(FlowFileDTO, node id it was found on)``, or ``(None, "")``.
+
+        One GET per node tried, and exactly one on a standalone server or when
+        the caller already knows the node — so the two public methods below
+        cost a single round trip each in the common case.
+        """
+        for candidate in self._flowfile_nodes(node_id):
+            params = {"clusterNodeId": candidate} if candidate else None
+            try:
+                dto = self._request(
+                    "GET", f"/flowfile-queues/{connection_id}/flowfiles/{uuid}",
+                    params=params,
+                ).json()["flowFile"]
+            except NiFiApiError as exc:
+                if getattr(exc, "status", None) in (404, 400):
+                    continue
+                raise
+            return dto, (candidate or "")
+        return None, ""
+
+    def locate_flowfile(self, connection_id: str, uuid: str,
+                        node_id: str = "") -> Optional[dict]:
         """Is ``uuid`` in this queue? Works past the 100-file listing cap.
 
         NiFi will not list more than 100 FlowFiles from a queue, but it *will*
@@ -550,15 +692,13 @@ class InspectMixin:
         shape :meth:`list_flowfiles` yields — minus ``position``, which the
         single-FlowFile DTO does not carry — or ``None`` when the queue does
         not hold it (NiFi answers 404).
+
+        ``node_id`` pins which cluster node to ask (take it from a listing
+        summary); without it every connected node is tried.
         """
-        try:
-            ff = self._get_json(
-                f"/flowfile-queues/{connection_id}/flowfiles/{uuid}"
-            )["flowFile"]
-        except NiFiApiError as exc:
-            if getattr(exc, "status", None) in (404, 400):
-                return None
-            raise
+        ff, found_on = self._flowfile_dto(connection_id, uuid, node_id)
+        if ff is None:
+            return None
         return {
             "uuid": ff.get("uuid", uuid),
             "filename": ff.get("filename", ""),
@@ -566,25 +706,51 @@ class InspectMixin:
             "position": None,  # unknown: NiFi only reports it in a listing
             "penalized": bool(ff.get("penalized")),
             "penalty_expires_in": ff.get("penaltyExpiresIn", 0) or 0,
+            "node_id": found_on,
+            "node_address": self._node_address(found_on),
         }
 
-    def flowfile_detail(self, connection_id: str, uuid: str) -> dict:
-        """A queued FlowFile's attributes *and* content payload, in one call."""
-        ff = self._get_json(
-            f"/flowfile-queues/{connection_id}/flowfiles/{uuid}"
-        )["flowFile"]
+    def _node_address(self, node_id: Optional[str]) -> str:
+        if not node_id:
+            return ""
+        for node in self.cluster_nodes():
+            if node["id"] == node_id:
+                return f"{node['address']}:{node['port']}" if node["port"] else node["address"]
+        return ""
+
+    def flowfile_detail(self, connection_id: str, uuid: str,
+                        node_id: str = "") -> dict:
+        """A queued FlowFile's attributes *and* content payload, in one call.
+
+        ``node_id`` matters on a cluster, where a queue is per-node and NiFi
+        answers 400 for a FlowFile it has not been told the node of (see
+        :meth:`_flowfile_nodes`): pass the one from the listing when you have
+        it, and every connected node is tried when you do not.
+        """
+        ff, found_on = self._flowfile_dto(connection_id, uuid, node_id)
+        if ff is None:
+            raise NiFiApiError(
+                404,
+                f"FlowFile {uuid} is not in queue {connection_id}"
+                + (" on any connected node" if self._node_ids() else ""),
+            )
+        params = {"clusterNodeId": found_on} if found_on else None
         size = ff.get("size", 0)
         return {
             "uuid": uuid,
             "filename": ff.get("filename", ""),
             "size": size,
             "attributes": dict(ff.get("attributes") or {}),
+            "node_id": found_on,
+            "node_address": self._node_address(found_on),
             "content": self._content(
-                f"/flowfile-queues/{connection_id}/flowfiles/{uuid}/content", size
+                f"/flowfile-queues/{connection_id}/flowfiles/{uuid}/content",
+                size, params=params,
             ),
         }
 
-    def _content(self, path: str, size: int) -> str:
+    def _content(self, path: str, size: int,
+                 params: Optional[dict] = None) -> str:
         """Fetch a content payload, tolerating empty/unavailable content.
 
         NiFi returns 409 when asked for the content of a zero-byte FlowFile
@@ -595,7 +761,7 @@ class InspectMixin:
         if not size:
             return ""
         try:
-            resp = self._request("GET", path)
+            resp = self._request("GET", path, params=params)
         except NiFiApiError as exc:
             return f"(content unavailable: {exc})"
         return getattr(resp, "text", "") or ""
