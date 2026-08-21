@@ -7,9 +7,16 @@ recorded fact about MergeContent's hop counts, not a task. T7a (bounding
 "recent events" by time) landed 2026-08-20 without changing what "recent
 events" means — see its entry.
 
-Every fuzz P-finding is closed too. Sweeps as of today: offline **3,419 cases /
-0 findings**; tier 3 **120 / 0 on 2.7.2 and 120 / 0 on 1.24.0**. Unit tests 685;
-`make test-integration` green on 2.7.2.
+Every fuzz P-finding is closed too. Where verification stands after T7a:
+
+* **Unit:** 692 (`make test`).
+* **Fuzz:** offline **3,419 cases / 0 findings**; tier 3 **120 / 0 on 2.7.2**
+  and **120 / 0 on 1.24.0**.
+* **Live:** `make test-integration` on 2.7.2 — 396 passed, 44 xpassed, 0
+  failed. On 1.24 the non-catalog integration suite passes (26); the only
+  failures there remain the documented `test_catalog.py` sweep (a 2.x catalog
+  exercised against a 1.x server, which CI ignores).
+* `tests/test_follow_live.py` — 10/10 on **both** lines.
 
 Still open, all of them enhancements rather than tickets:
 
@@ -17,7 +24,7 @@ Still open, all of them enhancements rather than tickets:
   input), watch expressions, replay-after-fix — the stepper's next step;
 * fuzz-harness coverage gaps: a controller-service *catalog* sweep, a case kind
   for parameter contexts with real secrets, and `apply.py` failure injection;
-* T7a and T7h above.
+* **T7h** above (needs a cluster).
 
 
 ## Push & version control
