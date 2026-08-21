@@ -532,3 +532,54 @@ def test_a_masked_live_value_is_unknowable():
     desired = _pool({"Password": "hunter2"})
     changes = diff_flows(live, desired, 2)
     assert only_unknowable(changes[0])
+
+
+def test_a_custom_types_secret_is_unknowable_from_the_servers_own_descriptors():
+    """The catalog has never seen a custom NAR — but the snapshot has.
+
+    Live-found on a real custom processor: every plan re-proposed the password
+    and `niflow drift` failed in CI forever, because the catalogs were the only
+    thing that knew which properties NiFi refuses to read back. The server says
+    so itself in the snapshot's propertyDescriptors, and `from_json` now
+    records them on the model.
+    """
+    from niflow.core import Flow, Processor
+    from niflow.plan import only_unknowable
+
+    def flow(props, sensitive=()):
+        f = Flow("F")
+        f.add_processor(Processor(name="Stamp", type="com.example.NoSuchType",
+                                  properties=dict(props),
+                                  sensitive_keys=list(sensitive)))
+        return f
+
+    live = flow({"Stamp Value": "v"}, sensitive=["Stamp Secret"])
+    desired = flow({"Stamp Value": "v", "Stamp Secret": "hunter2"})
+    changes = diff_flows(live, desired, 1)
+
+    assert len(changes) == 1
+    assert changes[0].unknowable == ("properties[Stamp Secret]",)
+    assert only_unknowable(changes[0])
+
+    # Without the server's word for it there is nothing to go on, and the
+    # change is ordinary drift — which is the right answer, not a silent guess.
+    plain = diff_flows(flow({"Stamp Value": "v"}), desired, 1)
+    assert plain[0].unknowable == ()
+
+
+def test_sensitive_keys_never_reach_the_wire_or_the_diff():
+    """It is knowledge about the type, not part of the flow's definition."""
+    from niflow.core import Processor
+
+    proc = Processor(name="Stamp", type="com.example.NoSuchType",
+                     properties={"a": "1"}, sensitive_keys=["Secret"])
+    assert "sensitive_keys" not in proc.model_dump()
+
+    other = Processor(name="Stamp", type="com.example.NoSuchType",
+                      properties={"a": "1"})
+    live = Flow("F")
+    live.add_processor(other)
+    desired = Flow("F")
+    desired.add_processor(proc)
+    # Differing only in sensitive_keys is not a change.
+    assert diff_flows(live, desired, 2) == []

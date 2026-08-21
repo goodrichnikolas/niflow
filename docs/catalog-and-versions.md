@@ -85,6 +85,44 @@ property and delete the service, on every single plan. Now silence means "what
 the server will really put there", and naming the service in your flow makes it
 an ordinary, fully diffed component again.
 
+## Custom NARs — the types no catalog ships with
+
+Everything above is harvested from stock Apache containers, so it knows exactly
+the types Apache ships. Work runs its own NARs. Here is what niflow does with a
+type it has never seen, all of it measured against a real custom processor on
+1.24 (`scripts/custom-nar/build.sh` builds one, and `make nifi1-up` mounts it):
+
+* **It pushes correctly.** Property keys are sent untranslated, which is right:
+  a custom NAR's keys are already in the server's own namespace. They land on
+  the real descriptors, not as inert dynamic properties, and `plan` converges
+  to zero.
+* **It says it cannot translate.** Pushing to a 1.x server logs the types with
+  no 1.x data by name, and points at the one-line fix. Silent identity
+  translation was the actual danger; it is no longer silent.
+* **`validate` says it did not look.** Relationships and properties are checked
+  against the rulebooks, and for an unknown type there is nothing to check
+  against — so `niflow validate` passes and then adds a note naming the types
+  it skipped. "No issues" and "I could not look" are different answers.
+* **A sensitive property is not eternal drift.** This one was a bug. NiFi never
+  reads a sensitive value back, so a model that sets one differs from the live
+  flow forever; the catalogs are what tell the differ which properties those
+  are, and they have never seen a custom type. Every plan re-proposed the
+  password and `niflow drift` failed in CI for good. The server knew all
+  along — the snapshot's own `propertyDescriptors` carry `sensitive: true` —
+  and `from_json` now reads them, so the change is marked *unknowable* like
+  any other secret.
+
+The fix for all of it is one harvest against the server that runs your NARs:
+
+```bash
+NIFLOW_NIFI_HOST=https://your-nifi/nifi-api make catalog      # a 2.x server
+NIFLOW_NIFI_HOST=https://your-nifi/nifi-api make catalog-v1   # a 1.x server
+```
+
+That picks up custom types like any other — relationships, defaults,
+required-ness and which properties are sensitive — and from then on they are
+validated, translated and diffed the same as everything else.
+
 ## Rulebook dumps
 
 `python -m niflow.codegen --dump-rulebook out.json` writes the *complete*

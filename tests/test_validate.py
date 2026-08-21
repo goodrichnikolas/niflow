@@ -599,3 +599,32 @@ def test_a_property_the_import_fills_in_is_not_reported_missing():
     # On 1.24 nothing creates it, so silence there would be the wrong answer.
     on_1x = [i["message"] for i in validate_flow(flow, target_version="1.24")]
     assert any("AWS Credentials Provider Service" in m for m in on_1x)
+
+
+def test_unchecked_types_names_what_no_rulebook_knows():
+    """"No issues" and "I could not look" are different answers.
+
+    validate judges relationships and properties against the harvested
+    rulebooks; for a custom NAR there is nothing to judge against, so the
+    checks quietly pass. The CLI reports these as a note — never a failure,
+    because running your own processors is legitimate.
+    """
+    from niflow.validate import unchecked_types
+
+    flow = Flow("F")
+    known = Processor(name="Log", type="org.apache.nifi.processors.standard.LogAttribute",
+                      auto_terminate=["success"])
+    custom = Processor(name="Stamp", type="com.example.NoSuchType",
+                       auto_terminate=["success"])
+    with flow.process_group("Inner") as inner:
+        inner.add_processor(Processor(name="Nested", type="com.example.AlsoUnknown",
+                                      auto_terminate=["success"]))
+    flow.add_processor(known, custom)
+
+    unchecked = unchecked_types(flow)
+    assert sorted(e["type"] for e in unchecked) == [
+        "com.example.AlsoUnknown", "com.example.NoSuchType"]
+    # Reported by path, so a nested one is findable.
+    assert {e["component"] for e in unchecked} == {"F/Stamp", "F/Inner/Nested"}
+    # And it is a note, not an issue: the flow still validates.
+    assert validate_flow(flow, baseline=False) == []

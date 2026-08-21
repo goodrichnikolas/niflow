@@ -243,6 +243,7 @@ def _populate_group(
             bundle=_parse_bundle(
                 service_dto.get("bundle"), service_dto.get("type", ""), service=True
             ),
+            sensitive_keys=_sensitive_keys(service_dto),
         )
         # Register under the versioned identifier AND the live instance id:
         # NiFi 1.x service-ref property values carry the latter.
@@ -320,6 +321,7 @@ def _populate_group(
             backoff_mechanism=proc_dto.get("backoffMechanism") or "PENALIZE_FLOWFILE",
             max_backoff_period=proc_dto.get("maxBackoffPeriod") or "10 mins",
             bundle=_parse_bundle(proc_dto.get("bundle"), proc_dto.get("type", "")),
+            sensitive_keys=_sensitive_keys(proc_dto),
         )
         identifier = proc_dto.get("identifier")
         if identifier:
@@ -347,6 +349,27 @@ def _parse_position(raw: Any) -> Optional[Tuple[float, float]]:
     if not raw:
         return None
     return (float(raw.get("x", 0.0)), float(raw.get("y", 0.0)))
+
+
+def _sensitive_keys(dto: dict) -> List[str]:
+    """Property names this snapshot's own descriptors mark sensitive.
+
+    The server answers a question no catalog can for a **custom NAR**: which
+    of this type's properties it will never read back. A sensitive value is
+    simply absent from the ``properties`` map (verified on 1.24.0 against a
+    real custom processor), so without the descriptors a model that states one
+    differs from the live flow forever.
+
+    Canonicalised alongside the property keys so the names line up with what
+    the differ compares.
+    """
+    descriptors = dto.get("propertyDescriptors") or {}
+    names = sorted(key for key, descriptor in descriptors.items()
+                   if isinstance(descriptor, dict) and descriptor.get("sensitive"))
+    if not names:
+        return []
+    canonical = canonical_properties(dto.get("type", ""), {n: "" for n in names})
+    return sorted(canonical)
 
 
 def _clean_properties(raw: Any) -> dict:

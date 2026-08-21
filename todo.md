@@ -10,14 +10,20 @@ events" means — see its entry.
 Every fuzz P-finding is closed too. Where verification stands after the
 stepper's fixture/watch/replay work:
 
-* **Unit:** 750 (`make test`).
+* **Unit:** 753 (`make test`).
 * **Fuzz:** offline **4,129 cases / 0 findings**; tier 3 **150 / 0 on 2.7.2**
   and **150 / 0 on 1.24.0** (kinds now include `svc` and `params`, and every
   case also fault-injects the applier).
-* **Live:** `make test-integration` on 2.7.2 — 403 passed, 44 xpassed, 0
-  failed. On 1.24 the non-catalog integration suite passes (33); the only
-  failures there remain the documented `test_catalog.py` sweep (a 2.x catalog
-  exercised against a 1.x server, which CI ignores).
+* **Live:** `make test-integration` on 2.7.2 — 409 passed, 44 xpassed, 0
+  failed. On 1.24 the non-catalog integration suite passes (48, the custom-NAR
+  suite among them); the only failures there remain the documented
+  `test_catalog.py` sweep (a 2.x catalog exercised against a 1.x server, which
+  CI ignores).
+* **The three opt-in fixtures**, each skipped unless its server is up:
+  cluster **12/12** (`make cluster-up cluster-wait && make test-cluster`),
+  custom NAR **9/9** (`make nifi1-up` builds and mounts it, then
+  `make test-custom-nar`), provenance-under-load **6/6**
+  (`make load-up load-wait && make test-load`).
 * `tests/test_follow_live.py` — **17/17 on both lines**.
 * `tests/test_cluster_live.py` — **12/12** against the two-node 1.24 cluster
   (`make cluster-up cluster-wait && make test-cluster`); skips itself
@@ -25,11 +31,13 @@ stepper's fixture/watch/replay work:
 
 Still open:
 
-* **T7h**, down to its last three items — real load, a rolled-over provenance
-  repository, and work's own NARs. The cluster half closed on 2026-08-21:
-  there is a two-node cluster in `docker-compose.yml` now (`make cluster-up`),
-  and it found four real bugs. The stepper's own backlog (fixture injection,
-  watch expressions, replay-after-fix) closed the same day.
+**Nothing.** T7h — the last open ticket — closed on 2026-08-21, and with it
+the 2026-08-19 sweep. What "not testable locally" actually needed was three
+compose profiles and a NAR built from source: a two-node cluster
+(`make cluster-up`), a NiFi with a deliberately tiny provenance repository
+(`make load-up`), and a real custom processor (`make nifi1-up`). Between them
+they found five bugs — see T7h. The stepper's own backlog (fixture injection,
+watch expressions, replay-after-fix) closed the same day.
 
 
 ## Push & version control
@@ -453,10 +461,12 @@ by ticket number, not priority; the priority axis is "things that hurt at work".
       while an input/select has focus, while the FlowFile drill-down is open,
       on a hidden tab, and on Trace/Explain/Flows (provenance queries and
       flow fingerprinting are far too expensive for a 3s poll).
-- [~] **T7 — Harden trace on 1.24.** Main pass done 2026-08-19 against the
+- [x] **T7 — Harden trace on 1.24.** Main pass done 2026-08-19 against the
       live 1.24 container — see "T7 — trace/follow hardened against NiFi 1.24"
-      below for what was fixed and what was proved. Eight leftovers (T7a–T7h)
-      are written up there and still open.
+      below for what was fixed and what was proved. The eight leftovers
+      (T7a–T7h) are written up there: T7a–T7c and T7e–T7g landed 2026-08-20,
+      **T7h closed 2026-08-21**, and T7d is a recorded fact about
+      MergeContent's hop counts rather than a task.
 - [x] **T8 — Makefile tolerant of python/python3/uv/.venv.** Done 2026-08-19:
       `PY` is discovered as $VIRTUAL_ENV → ./.venv → `uv run python` (only when
       uv is installed *and* uv.lock exists) → python3 → python, `PIP` follows
@@ -1407,7 +1417,7 @@ on both lines).
       takes `--max-events N`, and the Trace tab says "hop #1 below is not
       where this FlowFile began". Hop #1 of a capped journey being read as the
       origin is exactly the wrong conclusion to let someone draw.
-- [~] **T7h — mostly closed 2026-08-21: there IS a cluster now.**
+- [x] **T7h — CLOSED 2026-08-21. There is a cluster now — and a NAR, and load.**
       "Not testable locally" turned out to be a missing compose profile, not a
       missing machine. `docker-compose.yml` gained a **`cluster` profile** —
       ZooKeeper + two NiFi 1.24 nodes on plain HTTP (`:8180`/`:8181`) —
@@ -1478,11 +1488,66 @@ on both lines).
         — it was deleted for sitting there too long, not consumed", and falls
         back to reading the connection's `flowFileExpiration` when the event
         is not there.
-      **Still open** (honestly, not for want of trying): real load — the
-      provenance findings were measured on a container with one client — a
-      rolled-over or rebuilding provenance repository, and work's own NARs.
-      A two-node dev cluster does not reproduce any of those.
-      Docs: **docs/clusters.md**.
+      **The last three closed 2026-08-21 too** — real load, a rolled-over
+      repository, and a custom NAR. Two more compose profiles and a NAR built
+      from source, so T7h is now done end to end.
+      * **`load` profile + `make load-up` / `test-load`** — a NiFi whose
+        provenance repository is deliberately tiny (5 MB, one minute of
+        history, rolling over every ten seconds), with the properties patched
+        into `nifi.properties` before start.sh runs because the image maps no
+        env var for them. `tests/test_provenance_load_live.py` (6 tests) then
+        generates millions of events and asserts what T7a could only reason
+        about: **a single second overflows the query ceiling**, which is the
+        exact last-resort case the window walk narrows to — it answers in
+        about a second, returns that second, and sets `capped` instead of
+        handing back an arbitrary slice of the day; two queries with different
+        `max_results` agree on which event is newest (NiFi's own cap does
+        not); six concurrent queries all succeed; queries straight through a
+        rollover do not raise; an aged-out uuid traces to an empty journey and
+        `niflow trace` says so; and a node restarted mid-suite comes back and
+        answers (or refuses with a NiFiApiError) while it re-indexes, rather
+        than hanging.
+        **NiFi fact worth keeping: the repository purges only when it ROLLS
+        OVER.** On an idle server events outlive their retention indefinitely
+        — which is why the expiry test keeps a trickle of traffic going, and
+        why "still there after the retention window" is not a bug.
+      * **A real custom NAR.** `scripts/custom-nar/build.sh` compiles one
+        processor against the nifi-api jar taken out of the NiFi image and
+        packages it the way the nar-maven-plugin does — Docker only, no Maven,
+        no JDK on the host (the NiFi image ships a JRE). `make nifi1-up`
+        builds it and mounts `.nifi-nars/` into the 1.24 container's
+        `extensions/`, which NiFi 1.9+ hot-loads.
+        `tests/test_custom_nar_live.py` (9 tests) then answers the question
+        that could only be hand-waved before: properties land on the **real**
+        descriptors rather than as inert dynamic ones and `plan` converges to
+        zero; the flow round-trips through `to_python`; the push warning names
+        the type; the stepper follows a FlowFile through it; and the harvest
+        advice the warning gives actually works (one type, so it is a couple
+        of calls).
+        **The bug it found: a custom NAR's SENSITIVE property drifted
+        forever.** NiFi never reads a sensitive value back, and the catalogs
+        were the only thing that knew which properties those are — so a work
+        flow with a custom processor's password re-planned that change on
+        every run and `niflow drift` failed in CI for good. The server knew
+        all along: the snapshot's own `propertyDescriptors` say
+        `sensitive: true`. `from_json` now reads them onto
+        `Processor.sensitive_keys` (excluded from emission, diffing and
+        identity — it is knowledge about the type, not part of the flow), and
+        the differ unions that with the catalog. Verified live: the change is
+        now `only_unknowable`, which is what stops `drift` crying wolf.
+      * Two smaller things found on the way: `_harvest_rules` only accepted
+        nipyapi DTOs, so harvesting a single type from `/flow/processor-types`
+        raised — *and its own "skipped, un-instantiable" handler raised an
+        `AttributeError` while reporting the skip*; it now takes either shape.
+        And `python -m niflow.codegen --help` connected to NiFi before parsing
+        its arguments, so it ended in a connection-refused traceback on a
+        laptop with no server.
+      * `niflow validate` now adds a **note** (never a failure) naming types no
+        rulebook knows: "no issues" and "I could not look" are different
+        answers, and a custom NAR is the second one.
+      Docs: **docs/clusters.md**, plus "Custom NARs" in
+      docs/catalog-and-versions.md and "Provenance under real load" in
+      docs/trace-and-follow.md.
 
 ### Found while here — not trace/follow, for whoever owns those files
 

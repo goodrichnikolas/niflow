@@ -112,7 +112,10 @@ nifi-up:
 	@echo "  Registry: http://localhost:18080/nifi-registry"
 	@echo "Run 'make nifi-wait' to block until it's ready."
 
-nifi1-up:
+custom-nar:
+	./scripts/custom-nar/build.sh
+
+nifi1-up: custom-nar
 	mkdir -p .nifi-data/in .nifi-data/out
 	docker compose --profile v1 up -d nifi1 registry1
 	@echo ""
@@ -125,6 +128,24 @@ nifi1-up:
 # A REAL two-node cluster (1.24, plain HTTP — see docker-compose.yml for why).
 # The only way to exercise primary-node-only scheduling, load-balanced
 # connections actually redistributing, and what niflow does when a node drops.
+# A NiFi whose provenance repository is deliberately tiny (5 MB, two minutes
+# of history, rolling over every ten seconds) so a test can generate real
+# volume and watch events age out underneath a query — see T7h.
+load-up:
+	docker compose --profile load up -d nifi-load
+	@echo ""
+	@echo "Tiny-provenance NiFi 1.24.0 starting at https://localhost:8446/nifi"
+	@echo "Run 'make load-wait' to block until it's ready."
+
+load-wait:
+	@echo "Waiting for the load NiFi to become healthy..."
+	@until [ "$$(docker inspect -f '{{.State.Health.Status}}' niflow-nifi-load 2>/dev/null)" = "healthy" ]; do \
+		printf "."; sleep 5; \
+	done; echo " ready."
+
+load-down:
+	docker compose --profile load down
+
 cluster-up:
 	docker compose --profile cluster up -d cluster-zk cluster-n1 cluster-n2
 	@echo ""
@@ -200,6 +221,18 @@ test-integration:
 
 test-integration-v1:
 	NIFLOW_NIFI_HOST=https://localhost:8444/nifi-api $(PY) -m pytest -m integration -v
+
+# Provenance under real load + a rolling-over repository (T7h). Slow by
+# design: it waits for events to age out. Skips itself without `make load-up`.
+test-load:
+	$(PY) -m pytest -m integration tests/test_provenance_load_live.py -v
+
+# The custom-NAR suite (T7h): a processor type no catalog has ever seen.
+# `make nifi1-up` builds and mounts the NAR.
+test-custom-nar:
+	NIFLOW_NIFI_HOST=$(V1_HOST) $(PY) -m pytest -m integration tests/test_custom_nar_live.py -v
+
+V1_HOST ?= https://localhost:8444/nifi-api
 
 # The cluster-only suite (T7h). Skips itself unless a clustered NiFi answers
 # at NIFLOW_CLUSTER_HOST, so it is safe to leave in the default run.

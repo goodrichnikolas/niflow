@@ -657,6 +657,12 @@ def _annotate_sensitive(changes: List[Change], target_major: Optional[int]) -> N
     only way an intended change can ever land, but it is labelled: an eternal
     "1 to change" with no explanation is how people learn to ignore a plan.
 
+    Two sources, because one of them cannot cover work: the harvested catalogs
+    know every type Apache ships, and the live snapshot's own
+    ``propertyDescriptors`` know the rest — a **custom NAR**'s password is
+    invisible to any catalog, and its flow would otherwise re-plan that change
+    on every run forever (measured against a real custom NAR on 1.24.0).
+
     :func:`niflow.plan.only_unknowable` then lets the callers that answer
     "has anything drifted?" — ``niflow drift``, the fuzz convergence checks —
     tell this apart from real drift.
@@ -669,7 +675,10 @@ def _annotate_sensitive(changes: List[Change], target_major: Optional[int]) -> N
         type_str = getattr(change.desired, "type", "") or getattr(change.live, "type", "")
         if not type_str:
             continue
-        secret = sensitive_properties(type_str, target_major)
+        secret = set(sensitive_properties(type_str, target_major))
+        # The server is the authority for anything the catalog has never seen.
+        secret.update(getattr(change.live, "sensitive_keys", None) or ())
+        secret.update(getattr(change.desired, "sensitive_keys", None) or ())
         if not secret:
             continue
         unknowable = tuple(

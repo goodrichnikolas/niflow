@@ -51,6 +51,28 @@ Things worth knowing:
 * Content in/out is fetchable per hop where NiFi still has it (the GUI has
   buttons; `--full` shows attributes).
 
+### Provenance under real load
+
+Measured on a NiFi whose provenance repository was deliberately tiny (5 MB, one
+minute of history, rolling over every ten seconds — `make load-up`) while a
+processor produced millions of events:
+
+* **A single second can overflow the query ceiling.** That is the last-resort
+  case the window walk narrows down to: it cannot do better than "the newest
+  second", so it returns that second's events and sets `capped` rather than
+  handing back an arbitrary slice of the day. It answers in about a second.
+* **Asking for more does not change what "newest" means.** Two queries with
+  different `max_results` agree on the newest event — which is exactly what
+  NiFi's own cap does *not* guarantee.
+* **Queries straight through a rollover are fine**, as are several at once.
+* **"No provenance events" really does mean aged out.** Trace an old FlowFile
+  and you get an empty journey with that message, not an empty screen.
+
+One NiFi behaviour worth knowing before you go looking for a bug: **the
+repository purges only when it rolls over**. On an idle server, events outlive
+their configured retention indefinitely — so "my events are still there after
+the retention window" is NiFi working as designed, not a stuck setting.
+
 ## follow
 
 ```bash

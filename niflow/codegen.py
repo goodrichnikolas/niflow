@@ -530,6 +530,26 @@ def _probe_relationships(
     return dynamic, conditional
 
 
+def _type_ref(dt: Any) -> Tuple[str, dict]:
+    """``(type, bundle)`` from either a nipyapi DTO or NiFi's own JSON.
+
+    The generators walk nipyapi objects; someone harvesting one type — a
+    **custom NAR**, typically — has the raw dicts ``/flow/processor-types``
+    returns and no reason to build DTOs for them. Accepting both also stops
+    the "skipped, un-instantiable" handler below from raising an
+    ``AttributeError`` of its own while reporting a skip.
+    """
+    if isinstance(dt, dict):
+        bundle = dt.get("bundle") or {}
+        return dt.get("type", ""), {
+            "group": bundle.get("group"),
+            "artifact": bundle.get("artifact"),
+            "version": bundle.get("version"),
+        }
+    return dt.type, {"group": dt.bundle.group, "artifact": dt.bundle.artifact,
+                     "version": dt.bundle.version}
+
+
 def _harvest_rules(client: Any, proc_types: List[Any]) -> dict:
     """Instantiate one of each processor type to read its relationships.
 
@@ -553,15 +573,14 @@ def _harvest_rules(client: Any, proc_types: List[Any]) -> dict:
     logger.info("Harvesting rules from %d types into temp group %s", len(proc_types), group_id)
     try:
         for i, dt in enumerate(proc_types):
+            type_str, bundle = _type_ref(dt)
             try:
                 resp = client._request(
                     "POST", f"/process-groups/{group_id}/processors",
                     json={"revision": {"version": 0, "clientId": _CLIENT_ID},
                           "component": {
-                              "type": dt.type,
-                              "bundle": {"group": dt.bundle.group,
-                                         "artifact": dt.bundle.artifact,
-                                         "version": dt.bundle.version},
+                              "type": type_str,
+                              "bundle": bundle,
                               "position": {"x": 0.0, "y": float(i)}}},
                 ).json()
                 component = resp.get("component", {})
@@ -570,7 +589,7 @@ def _harvest_rules(client: Any, proc_types: List[Any]) -> dict:
                     r["name"] for r in component.get("relationships", [])]
                 dynamic_rel, conditional_rel = _probe_relationships(
                     client, resp, base_relationships, descriptors)
-                rules[dt.type] = {
+                rules[type_str] = {
                     "relationships": base_relationships,
                     # A relationship set is not a per-type constant: some are
                     # switched on by a property value, and some types turn every
@@ -594,7 +613,7 @@ def _harvest_rules(client: Any, proc_types: List[Any]) -> dict:
                     "raw": _full_descriptors(descriptors),
                 }
             except Exception as exc:  # restricted / un-instantiable type — skip it
-                logger.warning("Skipped %s while harvesting: %s", dt.type, exc)
+                logger.warning("Skipped %s while harvesting: %s", type_str, exc)
     finally:
         try:
             version = client._pg_entity(group_id)["revision"]["version"]
@@ -1092,6 +1111,22 @@ def main() -> None:
     import sys
 
     args = sys.argv[1:]
+    if "-h" in args or "--help" in args:
+        # Printing usage must never need a server: `--help` on a laptop with
+        # no NiFi reachable used to end in a connection-refused traceback.
+        print(
+            "usage: python -m niflow.codegen [--compat | --import-defaults | "
+            "--dump-rulebook PATH]\n\n"
+            "Harvests rulebooks from the live NiFi at $NIFLOW_NIFI_HOST.\n"
+            "  (no flag)          regenerate the processor + service catalogs\n"
+            "  --compat           regenerate the 1.x compatibility rulebook\n"
+            "  --import-defaults  record what NiFi writes on import that no\n"
+            "                     descriptor predicts\n"
+            "  --dump-rulebook P  write the raw harvest to P as JSON\n\n"
+            "Custom NARs are harvested like any other type: point\n"
+            "NIFLOW_NIFI_HOST at the server that runs them."
+        )
+        return
     if "--dump-rulebook" in args:
         import json
 

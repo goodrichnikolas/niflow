@@ -65,3 +65,6 @@ docs/explanations/*
 !docs/explanations/NiflowTorture.md
 !docs/explanations/NiflowTorture__Stage.md
 !docs/explanations/NiflowTorture__Stage 2.md
+
+# Built test NAR (scripts/custom-nar/build.sh); a binary, rebuilt on demand.
+.nifi-nars/

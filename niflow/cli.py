@@ -161,6 +161,23 @@ def cmd_validate(args: argparse.Namespace) -> int:
     else:
         print(f"{flow.name!r} passes static validation.")
 
+    # "No issues" and "I could not look" are different answers, and a custom
+    # NAR is the second one. Reported as a note, never as a failure: running
+    # your own processors is legitimate.
+    from niflow.validate import unchecked_types
+
+    unchecked = unchecked_types(flow)
+    if unchecked:
+        types = sorted({entry["type"] for entry in unchecked})
+        print(f"Note: {len(unchecked)} component(s) use {len(types)} type(s) no "
+              "rulebook knows, so their properties and relationships were NOT "
+              "checked:")
+        for type_str in types:
+            print(f"  • {type_str}")
+        print("  A custom NAR? Harvest the server that runs it once — "
+              "NIFLOW_NIFI_HOST=… make catalog (or catalog-v1 for a 1.x "
+              "server) — and these get checked like everything else.")
+
     live_errors = []
     if args.live:
         live_errors = _client().validate_flow_live(flow)

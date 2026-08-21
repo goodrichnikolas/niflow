@@ -6,6 +6,8 @@
 #                                           + Registry 1.24.0 http://localhost:18081/nifi-registry
 #   docker compose --profile cluster up -d -> a TWO-NODE NiFi 1.24.0 cluster
 #                                           http://localhost:8180 + :8181 (+ ZooKeeper)
+#   docker compose --profile load up -d  -> NiFi 1.24.0 with a DELIBERATELY TINY
+#                                           provenance repo https://localhost:8446
 #
 # NiFi logs in as admin / adminpassword123. The registries are unsecured HTTP
 # (local dev only) and are reached from the NiFi containers by service name
@@ -39,6 +41,12 @@ services:
     volumes:
       - ./.nifi-data/in:/in
       - ./.nifi-data/out:/out
+      # A CUSTOM NAR, which is the one thing a stock container cannot give us:
+      # work runs its own processors, and niflow's rulebooks only know the
+      # types Apache ships. `make custom-nar` builds one into .nifi-nars/;
+      # NiFi 1.9+ hot-loads whatever it finds in ./extensions, and an empty
+      # (or absent) directory is simply a NiFi with no extra types.
+      - ./.nifi-nars:/opt/nifi/nifi-current/extensions
     healthcheck:
       test: ["CMD-SHELL", "curl -k -s -o /dev/null https://$$(hostname):8443/nifi-api/access/config || exit 1"]
       interval: 15s
@@ -61,6 +69,56 @@ services:
       timeout: 10s
       retries: 20
       start_period: 60s
+
+  # ------------------------------------------------------------------- load
+  # NiFi with a deliberately TINY provenance repository (profile "load").
+  #
+  # Every provenance finding niflow acts on — the per-shard maxResults cap, the
+  # time-window walk that replaced count escalation, "no events" meaning the
+  # uuid aged out — was measured on a quiet container with one client and a
+  # repository that never rolled over. Neither is true at work. This one rolls
+  # over every 10 seconds and keeps one minute of history in 5 MB, so a test
+  # can generate real volume, watch events age out underneath a query, and
+  # restart the node to catch it re-indexing. Note NiFi only purges when the
+  # repository ROLLS OVER, so events on an idle server outlive their retention
+  # — ageing something out takes a trickle of traffic, not just patience.
+  #
+  # The image's start.sh does not map these properties to env vars, so they are
+  # patched into nifi.properties before it runs. sed-then-start is safe: the
+  # properties start.sh rewrites from the environment are a fixed list, and
+  # none of them is a provenance one.
+  nifi-load:
+    image: apache/nifi:1.24.0
+    logging: *default-logging
+    container_name: niflow-nifi-load
+    profiles: ["load"]
+    ports:
+      - "8446:8443"
+    environment:
+      NIFI_WEB_HTTPS_PORT: "8443"
+      NIFI_WEB_PROXY_HOST: "localhost:8446"
+      SINGLE_USER_CREDENTIALS_USERNAME: "admin"
+      SINGLE_USER_CREDENTIALS_PASSWORD: "adminpassword123"
+      NIFI_JVM_HEAP_INIT: "1g"
+      NIFI_JVM_HEAP_MAX: "2g"
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        conf=/opt/nifi/nifi-current/conf/nifi.properties
+        set_prop() { sed -i "s|^$$1=.*|$$1=$$2|" "$$conf"; }
+        set_prop nifi.provenance.repository.max.storage.time "1 min"
+        set_prop nifi.provenance.repository.max.storage.size "5 MB"
+        set_prop nifi.provenance.repository.rollover.time "10 secs"
+        set_prop nifi.provenance.repository.rollover.size "1 MB"
+        set_prop nifi.provenance.repository.index.shard.size "1 MB"
+        exec ../scripts/start.sh
+    healthcheck:
+      test: ["CMD-SHELL", "curl -k -s -o /dev/null https://$$(hostname):8443/nifi-api/access/config || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 90s
 
   # ------------------------------------------------------------------ cluster
   # A real two-node NiFi cluster (profile "cluster"), which is the only way to

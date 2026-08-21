@@ -96,6 +96,19 @@ class NiFiComponent(BaseModel):
     nifi_id: Optional[str] = Field(default=None, exclude=True)
     nifi_entity: Any = Field(default=None, exclude=True, repr=False)
 
+    # Property names THIS SERVER says are sensitive, read off the snapshot's
+    # own propertyDescriptors by from_json. It is knowledge about the type,
+    # not part of the flow's definition — hence exclude=True, and hence no
+    # emitter, differ or identity seed looks at it.
+    #
+    # The catalogs answer the same question for every type Apache ships; this
+    # answers it for the ones it does not, which is what a custom NAR is. A
+    # sensitive property reads back empty however it was set, so without this
+    # a work flow with a custom processor's password re-planned that change
+    # forever and `niflow drift` cried wolf on it every run.
+    sensitive_keys: List[str] = Field(default_factory=list, exclude=True,
+                                      repr=False)
+
     def __init__(self, name: Optional[str] = None, **data: Any) -> None:
         # Allow the name to be passed positionally: Flow("x"), InputPort("in").
         if name is not None:

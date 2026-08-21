@@ -351,6 +351,38 @@ def _connection_label(conn) -> str:
     return f"{getattr(conn.source, 'name', '?')} -> {getattr(conn.target, 'name', '?')}"
 
 
+def unchecked_types(flow: Flow) -> List[dict]:
+    """Components whose type no rulebook knows — so nothing was checked.
+
+    ``validate`` judges relationships and properties against the harvested
+    rulebooks. For a type that is in none of them — a **custom NAR**, which is
+    what work actually runs — there is nothing to judge against, so the checks
+    quietly pass. Quietly is the problem: "no issues" then means "I could not
+    look", and those are very different answers.
+
+    Not an *issue*: a custom processor is legitimate and must not fail the
+    command. The caller reports these as a note, and the fix is one harvest
+    against the server that runs them.
+    """
+    from niflow.processors.rules import descriptors_for, relationships_for
+
+    out: List[dict] = []
+
+    def visit(group: ProcessGroup, prefix: str) -> None:
+        path = f"{prefix}/{group.name}" if prefix else group.name
+        for component in list(group.processors) + list(group.controller_services):
+            known = (descriptors_for(component.type) is not None
+                     or relationships_for(component.type) is not None)
+            if not known:
+                out.append({"component": f"{path}/{component.name}",
+                            "type": component.type})
+        for child in group.process_groups:
+            visit(child, path)
+
+    visit(flow, "")
+    return out
+
+
 def validate_flow(
     flow: Flow, target_version: object = None, *, baseline: bool = True
 ) -> List[dict]:
