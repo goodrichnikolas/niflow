@@ -89,8 +89,16 @@ def _branch_rows(follower) -> List[dict]:
 
 
 def _follow_payload(follower, **extra: Any) -> dict:
-    """The whole tab state: branches, the current branch's hops, mutes."""
+    """The whole tab state: branches, the current branch's hops, mutes.
+
+    The watch table is computed here rather than in the page: it is the same
+    :func:`niflow.follow.watch_rows` the CLI prints, so both views agree about
+    which hop changed which attribute.
+    """
+    from niflow.follow import watch_rows
+
     session = follower.session
+    columns, rows = watch_rows(session.history(), session.watches)
     payload = {
         "active": True,
         "group": session.group,
@@ -103,6 +111,12 @@ def _follow_payload(follower, **extra: Any) -> dict:
         "branches": _branch_rows(follower),
         "hops": session.history(),
         "restorable": len(session.prior_running),
+        "watches": list(session.watches),
+        "watch_columns": columns,
+        "watch_rows": rows,
+        "fixture": session.fixture,
+        "runs": len(session.runs),
+        "injector": (session.injector or {}).get("label"),
     }
     payload.update(extra)
     return payload
@@ -115,7 +129,13 @@ def _follow_route(client: NiFiClient, method: str, path: str,
     Muting routes never touch NiFi: they change what is followed and drawn,
     nothing else.
     """
-    from niflow.follow import FollowSession, FlowFollower, entry_points
+    from niflow.follow import (
+        FollowSession,
+        FlowFollower,
+        compare_runs,
+        entry_points,
+        format_run_comparison,
+    )
 
     follower = _FOLLOW["follower"]
     if method == "GET" and path == "/api/follow/entrypoints":
@@ -144,7 +164,15 @@ def _follow_route(client: NiFiClient, method: str, path: str,
             stopped = follower.quiesce()
             for spec in body.get("mutes") or []:
                 follower.mute(spec)
-            follower.start_from(body.get("entry") or {})
+            for spec in body.get("watches") or []:
+                follower.watch(spec)
+            fixture = body.get("inject") or None
+            if fixture:
+                follower.inject(fixture.get("target") or "",
+                                content=fixture.get("content") or "",
+                                attributes=fixture.get("attributes") or {})
+            else:
+                follower.start_from(body.get("entry") or {})
         _FOLLOW["follower"] = follower
         return 200, _follow_payload(follower, stopped=stopped)
     if follower is None:
@@ -157,6 +185,34 @@ def _follow_route(client: NiFiClient, method: str, path: str,
         outcome = dict(follower.mute(body.get("spec") or ""), status="muted")
     elif method == "POST" and path == "/api/follow/unmute":
         outcome = dict(follower.unmute(body.get("spec") or ""), status="unmuted")
+    elif method == "POST" and path == "/api/follow/replay":
+        picked = follower.replay()
+        outcome = {"status": "replayed", "run": picked["run"],
+                   "uuid": picked["uuid"],
+                   "message": f"run {picked['run']} injected at "
+                              f"{picked['injected']}"}
+    elif method == "POST" and path == "/api/follow/watch":
+        spec = (body.get("spec") or "").strip()
+        if not spec:
+            follower.session.watches = []
+            follower._save()
+        elif body.get("remove"):
+            follower.unwatch(spec)
+        else:
+            follower.watch(spec)
+        outcome = {"status": "watching"}
+    elif method == "GET" and path == "/api/follow/compare":
+        runs = follower.session.runs
+        if not runs:
+            return 200, {"text": "Only one run so far — replay the fixture, "
+                                 "then compare."}
+        which = int(q("run") or len(runs))
+        if not 1 <= which <= len(runs):
+            return 404, {"error": f"no run {which} (there are {len(runs)})"}
+        rows = compare_runs(follower.session.run_hops(which),
+                            follower.session.flat_hops())
+        return 200, {"run": which,
+                     "text": format_run_comparison(which, len(runs) + 1, rows)}
     elif method == "POST" and path == "/api/follow/switch":
         follower.switch_to(body.get("uuid") or "")
         outcome = {"status": "switched", "uuid": follower.uuid}
@@ -167,8 +223,14 @@ def _follow_route(client: NiFiClient, method: str, path: str,
         outcome = {"status": "switched" if nxt else "none", "uuid": nxt}
     elif method == "POST" and path == "/api/follow/stop":
         restored = follower.restore() if body.get("restore") else 0
+        # Removing the injector drains its connection, and an unstepped
+        # fixture IS that queue — so it is left behind rather than dropped.
+        kept = bool(follower.session.injector) and follower.injector_holds_file()
+        if not kept:
+            follower.cleanup_injector()
         _FOLLOW["follower"] = None
         return 200, {"active": False, "restored": restored,
+                     "injector_kept": kept,
                      "session": str(follower.session.path or "")}
     else:
         return 404, {"error": f"no route for {method} {path}"}
@@ -1095,7 +1157,19 @@ async function render() {
                 <td class="muted">${esc(e.detail || "")}</td>
                 <td><button class="op primary" onclick="followStart(${i})">Start here</button></td>
               </tr>`).join("")}
-             </table>`);
+             </table>`)
+          + `<h3>…or inject your own FlowFile</h3>
+             <p class="muted">A temporary GenerateFlowFile mints exactly the file you
+               describe at the component you name, and the stepper follows that — the
+               debugger's own input, instead of waiting for the flow to produce one.
+               It is removed when the session ends.</p>
+             <div class="bar">
+               <input type="text" id="ftarget" placeholder="inject at: processor name, Group/Name or id">
+               <input type="text" id="fattrs" placeholder="attributes: k=v, k2=v2">
+               <button class="op primary" onclick="followInject()">Inject &amp; start</button>
+             </div>
+             <textarea id="fcontent" rows="4" style="width:100%"
+                       placeholder="content of the injected FlowFile (optional)"></textarea>`;
         bindFlowSelect();
         const pm = $("#premute");
         if (pm) pm.onchange = e => localStorage.setItem("niflow.premute", e.target.value);
@@ -1140,6 +1214,23 @@ async function render() {
                 <button class="op" onclick="traceJump(window._branches[${i}].uuid)">Trace</button>
               </td></tr>`).join("")}
           </table>
+          <div class="bar">
+            <input type="text" id="wspec" placeholder="watch an attribute: filename, http.*, @size">
+            <button class="op" onclick="followWatch()">Watch</button>
+            <span class="muted">${st.watches.length
+              ? st.watches.map(w => `<button class="op" onclick="followUnwatch('${esc(w)}')"
+                    title="stop watching">${esc(w)} ✕</button>`).join(" ")
+              : "watching nothing yet"}</span>
+            <span style="flex:1"></span>
+            ${st.fixture ? `<button class="op" onclick="followReplay()"
+                 title="re-inject the same FlowFile and step it again">↻ Replay fixture</button>` : ""}
+            ${st.runs ? `<button class="op" onclick="followCompare()"
+                 title="what changed since the previous run">Compare runs</button>` : ""}
+          </div>
+          ${st.fixture ? `<p class="muted">Fixture: ${st.fixture.content.length} byte(s) at
+             ${esc(st.fixture.label || st.fixture.target)}${st.runs ? ` · run ${st.runs + 1}` : ""}</p>` : ""}
+          <pre id="cmpout" class="muted" style="display:none;white-space:pre-wrap"></pre>
+          ${watchTable(st)}
           <h3>Hops on this branch</h3>` + (st.hops.length
             ? st.hops.map((h, i) => hopCard(h, i, flash.has(h.event_id))).join("")
             : `<p class="muted">No hops yet — hit Step.</p>`);
@@ -1369,6 +1460,64 @@ races the stepper (End & restore puts it back).`)) return;
   followAct("start", {group, entry,
                       mutes: premute.split(",").map(x => x.trim()).filter(Boolean)});
 }
+function watchTable(st) {
+  // The same hop x attribute table `w` prints in the CLI: rows are hops,
+  // columns are the watched attributes, and a cell says whether this hop
+  // added (+), changed (~) or removed (-) it.
+  if (!st.watch_columns.length) return "";
+  if (!st.watch_rows.length) return `<p class="muted">Nothing to tabulate yet — hit Step.</p>`;
+  const mark = {changed: "~", added: "+", removed: "-"};
+  return `<h3>Watching</h3><table>
+    <tr><th>Hop</th><th>Component</th>${st.watch_columns.map(c => `<th>${esc(c)}</th>`).join("")}</tr>
+    ${st.watch_rows.map(r => `<tr>
+      <td>${esc(r.hop)}</td><td class="muted">${esc(r.component)}</td>
+      ${st.watch_columns.map(c => {
+        const cell = r.cells[c];
+        const m = mark[cell.status] || "";
+        return `<td class="${cell.status === "same" ? "muted" : ""}"
+                    title="${esc(cell.status)}">${esc(m)}${cell.value === null
+                      ? "·" : esc(cell.value)}</td>`;
+      }).join("")}
+    </tr>`).join("")}
+  </table>`;
+}
+async function followInject() {
+  const tops = await flowTops();
+  const sel = currentFlow(tops);
+  const group = (sel === "*" || sel === "") ? "root" : sel;
+  const target = ($("#ftarget") || {}).value.trim();
+  if (!target) { status("name the processor (or nested input port) to inject at"); return; }
+  const attributes = {};
+  for (const pair of (($("#fattrs") || {}).value || "").split(",")) {
+    const [k, ...rest] = pair.split("=");
+    if (k.trim() && rest.length) attributes[k.trim()] = rest.join("=");
+  }
+  const premute = ($("#premute") || {}).value || "";
+  if (!ask(`Inject a FlowFile at ${target} and start stepping?\n\n${group} will be
+STOPPED so nothing races the stepper (End & restore puts it back).`)) return;
+  followAct("start", {group,
+                      inject: {target, content: ($("#fcontent") || {}).value || "", attributes},
+                      mutes: premute.split(",").map(x => x.trim()).filter(Boolean)});
+}
+function followWatch() {
+  const spec = ($("#wspec") || {}).value.trim();
+  if (spec) followAct("watch", {spec});
+}
+function followUnwatch(spec) { followAct("watch", {spec, remove: true}); }
+function followReplay() {
+  if (!ask("Re-inject the same FlowFile and start the journey again?\n\nThe run so far is kept, so Compare can show what changed.")) return;
+  followAct("replay");
+}
+async function followCompare() {
+  status("comparing…");
+  try {
+    const r = await api("/api/follow/compare");
+    const box = $("#cmpout");
+    box.style.display = "block";
+    box.textContent = r.text;
+    status("compare ✓");
+  } catch (e) { status(`compare failed: ${e.message}`); }
+}
 function followSwitch(i) { followAct("switch", {uuid: window._branches[i].uuid}); }
 function followMuteBranch(i) { followAct("mute", {spec: "uuid:" + window._branches[i].uuid}); }
 function followUnmute(spec) { followAct("unmute", {spec}); }
@@ -1380,8 +1529,9 @@ async function followStop(restore) {
   status("ending session…");
   try {
     const r = await post("/api/follow/stop", {restore});
-    status(restore ? `session ended — restarted ${r.restored} processor(s)`
-                   : "session ended — the group is left stopped");
+    const kept = r.injector_kept ? " (the injector stays: its FlowFile has not moved)" : "";
+    status((restore ? `session ended — restarted ${r.restored} processor(s)`
+                    : "session ended — the group is left stopped") + kept);
   } catch (e) { status(`stop failed: ${e.message}`); }
   render();
 }

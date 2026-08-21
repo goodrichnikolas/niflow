@@ -25,8 +25,13 @@ import labyrinth  # noqa: E402
 
 from niflow.follow import (  # noqa: E402
     FlowFollower,
+    FollowError,
     annotate_hops,
+    compare_runs,
     entry_points,
+    format_run_comparison,
+    format_watch_table,
+    watch_rows,
 )
 
 pytestmark = pytest.mark.integration
@@ -366,3 +371,135 @@ def test_a_fan_in_destination_advances_the_queue_we_are_following(follower):
     assert outcome["status"] in ("advanced", "moved"), outcome.get("message")
     assert [hop["component"] for hop in outcome["hops"]] == ["Collector"] \
         or outcome["status"] == "moved"
+
+
+# ------------------------------------------------------ fixture injection
+
+
+def test_injecting_a_fixture_mints_exactly_the_file_you_asked_for(follower):
+    """The debugger's own input: your bytes, your attributes, your processor.
+
+    Everything else about the stepper waits for the flow to produce something.
+    This is the half that lets you ask "what does this processor do to THIS
+    file" without arranging for the flow to make one.
+    """
+    picked = follower.inject("L1/Mark1", content="fixture-body",
+                             attributes={"case": "urgent"})
+    try:
+        assert picked["injected"] == "L1/Mark1"
+        outcome = follower.step()
+        assert outcome["status"] == "advanced", outcome.get("message")
+        hop = outcome["hops"][0]
+        # Mark1 stamps depth=1; our attributes rode in with the file, and the
+        # body is the custom text (the per-line property name has to be right
+        # or NiFi files it as an inert dynamic property and mints 0 bytes).
+        assert hop["attributes"]["case"] == "urgent"
+        assert hop["attributes"]["depth"] == "1"
+        assert hop["attributes"]["filename"] == "niflow-fixture"
+        assert hop["size"] == len("fixture-body")
+        assert follower.client.event_content(hop["event_id"], "input") == "fixture-body"
+    finally:
+        follower.cleanup_injector()
+
+
+def test_the_injector_is_removed_once_its_file_has_moved_on(follower):
+    follower.inject("L1/Mark1", content="x")
+    injector = dict(follower.session.injector)
+    assert follower.injector_holds_file()      # unstepped: removing it drops the file
+
+    follower.step()
+    assert follower.injector_holds_file() is False
+    assert follower.cleanup_injector() is True
+    live = {p["id"] for p in follower.client.find_processors(group=follower.pg_id)}
+    assert injector["processor"] not in live
+
+
+def test_injecting_at_a_nested_input_port_crosses_into_the_group(follower):
+    """A port is fed from OUTSIDE, so the injector has to live in the parent.
+
+    Which also means the followed group's OWN port cannot be injected at: the
+    connection would sit outside the journey entirely.
+    """
+    # Four groups deep, every one of them with a port called "in".
+    with pytest.raises(FollowError, match="ambiguous"):
+        follower.inject("in")
+
+    inner = FlowFollower(follower.client, f"{GROUP}/L1/L2/L3/L4",
+                         poll_timeout=8.0)
+    with pytest.raises(FollowError, match="fed from outside"):
+        inner.inject("in")
+
+    follower.inject("L1/L2/in", content="ported")
+    try:
+        outcome = follower.step()
+        # Crossing a port records no provenance event of its own.
+        assert outcome["status"] in ("advanced", "crossed"), outcome.get("message")
+        depth = None
+        for _ in range(3):
+            for hop in outcome["hops"]:
+                depth = hop["attributes"].get("depth", depth)
+            if depth:
+                break
+            outcome = follower.step()
+        assert depth == "2", "the fixture never reached Mark2 inside L2"
+    finally:
+        follower.cleanup_injector()
+
+
+# ------------------------------------------------------- replay after a fix
+
+
+def test_replaying_a_fixture_reruns_the_same_journey_and_compares(follower):
+    """The fix-push-retest loop, end to end on a real server.
+
+    Router routes on ``${filename:isEmpty():not()}``, so a pinned filename
+    always takes the ``hot`` lane — which makes two runs of the same fixture
+    genuinely comparable, and any difference a difference the flow made.
+    """
+    follower.inject("Router", content="one", attributes={"case": "urgent"})
+    for _ in range(2):
+        if follower.step()["status"] not in ("advanced", "crossed"):
+            break
+    first = list(follower.session.flat_hops())
+    assert first, "the fixture produced no hops to compare against"
+
+    picked = follower.replay()
+    assert picked["run"] == 2
+    assert len(follower.session.runs) == 1
+    for _ in range(2):
+        if follower.step()["status"] not in ("advanced", "crossed"):
+            break
+    second = follower.session.flat_hops()
+    try:
+        rows = compare_runs(follower.session.run_hops(1), second)
+        # Same flow, same fixture, no fix in between: the journeys match, and
+        # the per-file identity attributes are excluded so they can.
+        assert [row["status"] for row in rows] == ["same"] * len(rows)
+        assert "Identical journey" in format_run_comparison(1, 2, rows)
+        assert [h["component"] for h in first] == [h["component"] for h in second]
+        assert any(h.get("relationship") == "hot" for h in second)
+    finally:
+        follower.cleanup_injector()
+
+
+def test_a_watch_table_tracks_one_attribute_across_the_journey(follower):
+    follower.inject("L1/Mark1", content="x", attributes={"case": "urgent"})
+    try:
+        for _ in range(3):
+            if follower.step()["status"] not in ("advanced", "crossed"):
+                break
+        columns, rows = watch_rows(follower.session.history(),
+                                   ["case", "depth", "@size"])
+        assert columns == ["case", "depth", "@size"]
+        assert rows, "no hops to tabulate"
+        # `case` rode in with the fixture and nothing touches it; `depth` is
+        # stamped by Mark1 at the first hop.
+        # Port crossings are synthetic: they carry no attributes of their own,
+        # so their cells are blank rather than "everything was removed".
+        real = [row for row in rows if row["cells"]["case"]["status"] != "n/a"]
+        assert real and all(row["cells"]["case"]["value"] == "urgent"
+                            for row in real)
+        assert real[0]["cells"]["depth"]["value"] == "1"
+        assert format_watch_table(columns, rows).startswith("hop")
+    finally:
+        follower.cleanup_injector()

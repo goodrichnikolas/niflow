@@ -541,14 +541,35 @@ def cmd_watch(args: argparse.Namespace) -> int:
     )
 
 
+def _attributes(pairs: Optional[list]) -> dict:
+    """``--attr k=v`` pairs as a dict, with a readable error for a bad one."""
+    out = {}
+    for pair in pairs or []:
+        key, sep, value = pair.partition("=")
+        if not sep or not key.strip():
+            raise SystemExit(f"--attr expects KEY=VALUE, got {pair!r}")
+        out[key.strip()] = value
+    return out
+
+
 def cmd_follow(args: argparse.Namespace) -> int:
     """Quiesce a group and live-step one FlowFile through it via run-once."""
     from niflow.follow import follow_command
 
+    content = args.content or ""
+    if args.content_file:
+        content = Path(args.content_file).read_text(encoding="utf-8")
+    attributes = _attributes(args.attr)
+    if (content or attributes) and not args.inject_at:
+        raise SystemExit("--content/--attr describe the FlowFile to inject; "
+                         "say where with --inject-at NAME")
+
     return follow_command(
         _client(), args.group,
         uuid=args.uuid, queue=args.queue, source=args.source,
-        start=args.start, list_only=args.list, mute=args.mute or [],
+        start=args.start, inject_at=args.inject_at, content=content,
+        attributes=attributes, watch=args.watch or [], replay=args.replay,
+        list_only=args.list, mute=args.mute or [],
         resume=args.resume, auto=args.auto, max_hops=args.max_hops,
         restore=args.restore, full=args.full,
     )
@@ -862,6 +883,22 @@ def main(argv: Optional[list] = None) -> int:
                    "to mint the FlowFile to follow")
     p.add_argument("--start", help="Start point to begin at: a number from "
                    "--list, a connection/processor id, or 'kind:id'")
+    p.add_argument("--inject-at", metavar="NAME",
+                   help="Mint your own FlowFile at this processor (or nested "
+                        "input port) and follow that — the debugger's own "
+                        "input, instead of waiting for the flow to produce one")
+    p.add_argument("--content", help="Body of the injected FlowFile")
+    p.add_argument("--content-file", metavar="PATH",
+                   help="Read the injected FlowFile's body from a file")
+    p.add_argument("--attr", action="append", metavar="KEY=VALUE",
+                   help="Attribute on the injected FlowFile. Repeatable")
+    p.add_argument("--watch", action="append", metavar="NAME",
+                   help="Watch an attribute across every hop — a name, a glob "
+                        "('http.*') or '@size'. `w` prints the table. Repeatable")
+    p.add_argument("--replay", action="store_true",
+                   help="With --resume: re-inject the fixture the saved "
+                        "session recorded and step it again ('cmp' then "
+                        "compares the two runs)")
     p.add_argument("--list", action="store_true",
                    help="List the plausible start points and exit "
                    "(read-only: the group is not quiesced)")

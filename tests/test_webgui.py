@@ -379,6 +379,48 @@ def test_follow_session_offers_the_saved_one_after_a_restart():
     assert status == 200 and payload["current"] == "u1"
 
 
+def test_follow_watch_route_builds_the_hop_table():
+    client = FakeClient()
+    _start(client)
+    before = list(client.ops)
+
+    status, payload = _call(client, "POST", "/api/follow/watch",
+                            body={"spec": "filename"})
+    assert status == 200 and payload["watches"] == ["filename"]
+    assert client.ops == before          # watching is a view decision, like muting
+
+    _call(client, "POST", "/api/follow/step")
+    payload = _call(client, "GET", "/api/follow/session")[1]
+    assert payload["watch_columns"] == ["filename"]
+    assert [row["hop"] for row in payload["watch_rows"]] == [1]
+
+    payload = _call(client, "POST", "/api/follow/watch",
+                    body={"spec": "filename", "remove": True})[1]
+    assert payload["watches"] == [] and payload["watch_columns"] == []
+
+
+def test_follow_compare_needs_a_second_run():
+    client = FakeClient()
+    _start(client)
+    status, payload = _call(client, "GET", "/api/follow/compare")
+    assert status == 200 and "replay the fixture" in payload["text"]
+
+
+def test_follow_stop_reports_whether_an_injector_was_left_behind():
+    client = FakeClient()
+    _start(client)
+    payload = _call(client, "POST", "/api/follow/stop", body={"restore": False})[1]
+    # This session injected nothing, so there is nothing to keep or delete.
+    assert payload["injector_kept"] is False
+
+
+def test_page_offers_a_fixture_a_watch_table_and_a_replay():
+    assert 'onclick="followInject()"' in PAGE      # inject your own FlowFile
+    assert "function watchTable(" in PAGE          # hop x attribute table
+    assert 'onclick="followReplay()"' in PAGE      # replay-after-fix
+    assert 'onclick="followCompare()"' in PAGE     # and what it changed
+
+
 def test_trace_route_annotates_hops_like_the_stepper_does():
     client = FakeClient()
     payload = _call(client, "GET", "/api/trace", query={"uuid": ["u1"]})[1]

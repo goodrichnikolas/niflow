@@ -1,29 +1,30 @@
 # niflow — TODO / future work
 
-## Where things stand — 2026-08-20
+## Where things stand — 2026-08-21
 The 2026-08-19 ticket sweep (T1–T17) is **closed**: every ticket is done except
 **T7h**, which needs a cluster this machine does not have. **T7d** is a
 recorded fact about MergeContent's hop counts, not a task. T7a (bounding
 "recent events" by time) landed 2026-08-20 without changing what "recent
 events" means — see its entry.
 
-Every fuzz P-finding is closed too. Where verification stands after T7a:
+Every fuzz P-finding is closed too. Where verification stands after the
+stepper's fixture/watch/replay work:
 
-* **Unit:** 719 (`make test`).
+* **Unit:** 750 (`make test`).
 * **Fuzz:** offline **4,129 cases / 0 findings**; tier 3 **150 / 0 on 2.7.2**
   and **150 / 0 on 1.24.0** (kinds now include `svc` and `params`, and every
   case also fault-injects the applier).
-* **Live:** `make test-integration` on 2.7.2 — 396 passed, 44 xpassed, 0
-  failed. On 1.24 the non-catalog integration suite passes (26); the only
+* **Live:** `make test-integration` on 2.7.2 — 401 passed, 44 xpassed, 0
+  failed. On 1.24 the non-catalog integration suite passes (31); the only
   failures there remain the documented `test_catalog.py` sweep (a 2.x catalog
   exercised against a 1.x server, which CI ignores).
-* `tests/test_follow_live.py` — 10/10 on **both** lines.
+* `tests/test_follow_live.py` — **15/15 on both lines**.
 
-Still open, all of them enhancements rather than tickets:
+Still open:
 
-* fixture injection for `follow` (testing.py's injector as a `--source`-like
-  input), watch expressions, replay-after-fix — the stepper's next step;
-* **T7h** above (needs a cluster).
+* **T7h** (needs a cluster this machine does not have) — that is the whole
+  list. The stepper's own backlog (fixture injection, watch expressions,
+  replay-after-fix) closed on 2026-08-21; see "Live stepper" below.
 
 
 ## Push & version control
@@ -297,8 +298,49 @@ the P0 fixes.
       and the SAME hop card as the Trace tab (`hopCard()` is now shared, the
       way `format_hop` is on the CLI side). `/api/follow/*` keeps one session
       in module state and on disk, so a page refresh re-attaches.
-- [ ] Fixture injection for follow (testing.py's injector as `--source`-like
-      input), watch expressions (hop × attribute table), replay-after-fix.
+- [x] **Fixture injection, watch expressions, replay-after-fix** *(done
+      2026-08-21)* — the three things the stepper was missing to be a
+      debugger rather than a viewer.
+      * **`--inject-at NAME` (+ `--content` / `--content-file` / `--attr
+        k=v`)** mints your own FlowFile at the processor (or **nested** input
+        port) you name and follows it, instead of waiting for the flow to
+        produce something. `testing.py`'s injector was extracted for it
+        (`inject_flowfile` / `injector_properties` / `remove_injector`), so
+        the test harness and the stepper mint files exactly the same way —
+        including the per-line custom-text property name, which a REST create
+        does not migrate. The injector is recorded on the session, replaced on
+        replay, and taken away when the session ends — **unless the fixture is
+        still in its queue**, because removing it means draining that queue
+        and the drain would be the file.
+        The followed group's OWN input port is refused with a reason: it is
+        fed from outside, so the injector (and the queue holding the file)
+        would land outside the journey entirely. A fixture's `filename` is
+        pinned to `niflow-fixture` unless you set one, or GenerateFlowFile's
+        random name would make every replay differ at every hop.
+      * **Watch expressions** — `--watch NAME` / `w NAME` build the hop ×
+        attribute table (`~` changed, `+` added, `-` removed, `·` absent).
+        Globs expand to the names the flow actually set; an exact name nothing
+        sets stays as a column, because "never set" is usually the answer.
+        `@size`/`@component`/`@event`/`@rel` watch the hop itself. Synthetic
+        and lineage hops are blank and are not baselines — the same rule the
+        per-hop diff already follows.
+      * **Replay-after-fix** — `rr` archives the finished run, drops the old
+        injector and re-injects the same bytes at the same place; `cmp [N]`
+        compares positionally, hop by hop. `--resume --replay` does it from a
+        fresh shell, which is the shape of the fix-push-retest loop. Runs are
+        compared on component/event/relationship/size/attributes minus the
+        three per-file identity attributes (`uuid`, `entryDate`,
+        `lineageStartDate`) that can never match and can never be the fix.
+      * All three are in the **web GUI** too: an "inject your own FlowFile"
+        panel on the start-point screen, the watch table (same
+        `watch_rows`), Replay and Compare buttons, `/api/follow/watch`,
+        `/api/follow/replay`, `/api/follow/compare`.
+      * **Verified live on 2.7.2 and 1.24.0**: 15/15 in
+        `tests/test_follow_live.py` on both lines (5 of them new), plus a
+        hand-run of the whole loop — inject at Router, step to the `hot`
+        lane, break the router's expression, `--resume --replay`, and `cmp`
+        reported exactly `relationship: hot -> unmatched` and
+        `component: RouteSink -> Router`.
 
 ## Cross-version property fidelity (found 2026-08-18) — FIXED same day
 - [x] **Pushing with a 2.x-harvested catalog to a 1.x server silently mis-sets

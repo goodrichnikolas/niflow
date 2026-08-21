@@ -5,6 +5,8 @@ and run-once side effects move the file and append provenance hops, so the
 follower's quiesce/step/fork/auto/restore logic runs without a live NiFi.
 """
 import argparse
+import json
+
 import pytest
 
 from niflow.follow import (
@@ -13,9 +15,14 @@ from niflow.follow import (
     FollowError,
     FollowSession,
     annotate_hops,
+    compare_runs,
     entry_points,
+    expand_watches,
     follow_command,
     format_hop,
+    format_run_comparison,
+    format_watch_table,
+    watch_rows,
 )
 
 
@@ -80,6 +87,14 @@ class StubClient:
         self.proc_types = {}      # processor id -> FQCN
         self.proc_properties = {}  # processor id -> materialised property map
         self.cap = 100            # how many FlowFiles a listing will show
+        self.major = 2            # which NiFi line the stub pretends to be
+        self.created = []         # (kind, group id, payload) of temp components
+        self.deleted = []         # (kind, id)
+        self.drained = []         # connection ids
+        self.parents = {"pg-1": "root"}   # group id -> parent group id
+        self.mints = True         # does the injector actually produce a file?
+        self.minted = []          # uuids the injector produced
+        self._seq = 0
 
     # --- the client surface the follower uses ---
 
@@ -100,6 +115,75 @@ class StubClient:
         effect = self.on_run_once.get(proc_id)
         if effect:
             effect()
+        elif self.mints and proc_id.startswith("tmp-"):
+            # An injector mints exactly one FlowFile into its own connection,
+            # which is the whole of what run-once does to a GenerateFlowFile.
+            conn = next((q["id"] for q in self.queues
+                         if q.get("source_id") == proc_id), None)
+            if conn:
+                self._seq += 1
+                uuid = f"ff-inj{self._seq}"
+                self.put(conn, uuid)
+                self.events[uuid] = [hop(100 + self._seq, "CREATE",
+                                         "niflow-inject")]
+                self.minted.append(uuid)
+
+    # --- component creation (the injector's half of the client) ---
+
+    def _major_version(self):
+        return self.major
+
+    def _name_of(self, comp_id):
+        for comp in self.procs + self.ports:
+            if comp["id"] == comp_id:
+                return comp["name"]
+        return "?"
+
+    def create_processor(self, pg_id, component):
+        self._seq += 1
+        proc_id = f"tmp-{self._seq}"
+        self.created.append(("processor", pg_id, dict(component, id=proc_id)))
+        self.procs.append({"id": proc_id, "name": component["name"],
+                           "state": "STOPPED", "path": "",
+                           "type": component["type"], "group_id": pg_id})
+        self.proc_properties[proc_id] = dict(component["config"]["properties"])
+        return proc_id
+
+    def create_connection(self, pg_id, source, destination, relationships=None):
+        self._seq += 1
+        conn_id = f"tmp-c{self._seq}"
+        self.created.append(("connection", pg_id,
+                             {"id": conn_id, "source": source,
+                              "destination": destination}))
+        self.queues.append({"id": conn_id, "source": self._name_of(source["id"]),
+                            "destination": self._name_of(destination["id"]),
+                            "path": "", "source_id": source["id"],
+                            "destination_id": destination["id"]})
+        self.queue_files[conn_id] = []
+        self.rels[conn_id] = list(relationships or [])
+        self.dests[conn_id] = {"id": destination["id"],
+                               "name": self._name_of(destination["id"]),
+                               "type": destination.get("type", "PROCESSOR")}
+        return conn_id
+
+    def drain_connection(self, conn_id):
+        self.drained.append(conn_id)
+        self.queue_files[conn_id] = []
+        return "1 / 3 bytes"
+
+    def _delete_component(self, kind, comp_id):
+        self.deleted.append((kind, comp_id))
+        if kind == "processors":
+            self.procs = [p for p in self.procs if p["id"] != comp_id]
+        else:
+            self.queues = [q for q in self.queues if q["id"] != comp_id]
+            self.queue_files.pop(comp_id, None)
+
+    def _get_json(self, path):
+        assert path.startswith("/process-groups/"), path
+        pg_id = path.rsplit("/", 1)[-1]
+        return {"component": {"id": pg_id,
+                              "parentGroupId": self.parents.get(pg_id, "")}}
 
     def list_queues(self, group="root"):
         return [dict(q, queued=len(self.queue_files[q["id"]]))
@@ -1327,3 +1411,338 @@ def test_a_narrow_fork_still_prints_every_branch(stub):
     _show_branches(f, lines.append)
     assert "group(s)" not in "\n".join(lines)
     assert "\n".join(lines).count("ff-c") == 3
+
+
+# --------------------------------------------------------- fixture injection
+
+
+def test_inject_mints_a_chosen_flowfile_and_follows_it(stub):
+    f = follower(stub)
+    picked = f.inject("Mid", content="id,priority\n1,urgent\n",
+                      attributes={"case": "urgent"})
+
+    kind, group, component = stub.created[0]
+    assert (kind, group) == ("processor", "pg-1")
+    assert component["type"].endswith("GenerateFlowFile")
+    props = component["config"]["properties"]
+    assert props["Custom Text"] == "id,priority\n1,urgent\n"
+    assert props["case"] == "urgent"       # dynamic props become attributes
+    assert props["File Size"] == "0B"      # the body comes from Custom Text
+    # Pinned, so a replay is not "different" at every hop for a reason that
+    # has nothing to do with the flow.
+    assert props["filename"] == "niflow-fixture"
+
+    # The target is NOT started: the stepper drives it with run-once itself.
+    assert "mid" not in stub.started
+    assert picked["uuid"] == stub.minted[0]
+    assert picked["queue"]["destination"] == "Mid"
+    assert f.session.fixture == {
+        "target": "Mid", "kind": "processor", "label": "Mid",
+        "content": "id,priority\n1,urgent\n",
+        "attributes": {"filename": "niflow-fixture", "case": "urgent"},
+    }
+    assert f.session.injector["processor"] == component["id"]
+
+
+def test_inject_uses_the_1x_custom_text_key_on_a_1x_server(stub):
+    stub.major = 1
+    follower(stub).inject("Mid", content="hello")
+    props = stub.created[0][2]["config"]["properties"]
+    # 2.x renamed it, and a REST create is not config-migrated: the wrong key
+    # lands as a dynamic property and the file arrives empty.
+    assert props["generate-ff-custom-text"] == "hello"
+    assert "Custom Text" not in props
+
+
+def test_inject_at_a_nested_input_port_generates_from_the_parent(stub):
+    stub.ports = [{"kind": "input_port", "id": "in", "name": "In",
+                   "path": "Child", "group_id": "pg-2", "state": "STOPPED"}]
+    stub.parents["pg-2"] = "pg-1"
+    f = follower(stub)
+    f.inject("Child/In")
+
+    # The port is fed from OUTSIDE its own group, so the generator lives in
+    # the parent and the connection crosses the boundary.
+    assert stub.created[0][1] == "pg-1"
+    _, group, conn = stub.created[1]
+    assert group == "pg-1"
+    assert conn["destination"] == {"id": "in", "groupId": "pg-2",
+                                   "type": "INPUT_PORT"}
+
+
+def test_inject_refuses_the_followed_groups_own_input_port(stub):
+    stub.ports = [{"kind": "input_port", "id": "in", "name": "In", "path": "",
+                   "group_id": "pg-1", "state": "STOPPED"}]
+    with pytest.raises(FollowError, match="fed from outside"):
+        follower(stub).inject("In")
+    assert stub.created == []   # nothing half-built left behind
+
+
+def test_inject_is_ambiguous_when_two_components_share_a_name(stub):
+    stub.procs.append({"id": "mid2", "name": "Mid", "state": "STOPPED",
+                       "path": "Child", "type": "UpdateAttribute",
+                       "group_id": "pg-2"})
+    with pytest.raises(FollowError, match="ambiguous"):
+        follower(stub).inject("Mid")
+
+
+def test_inject_cleans_up_when_the_generator_mints_nothing(stub):
+    stub.mints = False
+    f = follower(stub)
+    with pytest.raises(FollowError, match="minted nothing"):
+        f.inject("Mid")
+    # Nothing on the canvas: the queue is drained, both components deleted.
+    assert [k for k, _ in stub.deleted] == ["connections", "processors"]
+    assert f.session.injector is None
+
+
+def test_inject_quotes_the_generators_validation_errors(stub):
+    stub.mints = False
+    stub.invalid = {"tmp-1": ["'Custom Text' is invalid"]}
+    with pytest.raises(FollowError, match="Custom Text"):
+        follower(stub).inject("Mid")
+
+
+def test_a_second_inject_replaces_the_first_injector(stub):
+    f = follower(stub)
+    f.inject("Mid")
+    first = dict(f.session.injector)
+    f.inject("Mid")
+    assert ("processors", first["processor"]) in stub.deleted
+    assert f.session.injector["processor"] != first["processor"]
+
+
+def test_cleanup_injector_survives_a_server_that_refuses(stub):
+    f = follower(stub)
+    f.inject("Mid")
+    stub.drain_connection = lambda conn_id: (_ for _ in ()).throw(Exception("409"))
+    assert f.cleanup_injector() is False
+    # The ids are KEPT on a failure: they are the only way to find it again.
+    assert f.session.injector is not None
+
+
+# --------------------------------------------------------- replay-after-fix
+
+
+def test_replay_archives_the_run_and_reinjects_the_same_fixture(stub):
+    f = follower(stub)
+    f.inject("Mid", content="body", attributes={"case": "urgent"})
+    f.session.record_hops(f.uuid, [hop(2, component="Mid")])
+    first_uuid, first_injector = f.uuid, dict(f.session.injector)
+
+    picked = f.replay()
+
+    assert picked["run"] == 2
+    assert [run["n"] for run in f.session.runs] == [1]
+    assert f.session.run_hops(1)[0]["component"] == "Mid"
+    assert f.session.branches and first_uuid not in f.session.branches
+    assert f.uuid != first_uuid
+    assert ("processors", first_injector["processor"]) in stub.deleted
+    # Same bytes, same attributes, same place — that is what makes it a replay.
+    props = stub.created[-2][2]["config"]["properties"]
+    assert props["Custom Text"] == "body" and props["case"] == "urgent"
+
+
+def test_replay_keeps_the_mutes_and_watches(stub):
+    f = follower(stub)
+    f.inject("Mid")
+    f.mute("rel:failure")
+    f.watch("filename")
+    f.replay()
+    assert f.session.watches == ["filename"]
+    assert "failure" in f.mutes.describe()
+
+
+def test_replay_without_a_fixture_says_how_to_get_one(stub):
+    f = follower(stub)
+    f.pick_flowfile()
+    with pytest.raises(FollowError, match="--inject-at"):
+        f.replay()
+
+
+def test_compare_runs_names_only_what_changed():
+    before = [hop(1, component="Mid", changes=[{"name": "a", "before": "1",
+                                                "after": "2"}]),
+              hop(2, "DROP", component="Sink")]
+    after = [hop(1, component="Mid", changes=[{"name": "a", "before": "1",
+                                               "after": "2"}]),
+             hop(2, component="Mid", relationship="success"),
+             hop(3, "SEND", component="Sink")]
+    rows = compare_runs(before, after)
+
+    assert [row["status"] for row in rows] == ["same", "changed", "only_after"]
+    text = format_run_comparison(1, 2, rows)
+    assert "2 hop(s) -> 3" in text and "2 differ" in text
+    assert "event: DROP -> ATTRIBUTES_MODIFIED" in text
+    assert "only in run 2" in text
+
+
+def test_compare_runs_says_when_the_fix_changed_nothing():
+    hops = [hop(1, component="Mid")]
+    rows = compare_runs(hops, [dict(h) for h in hops])
+    assert all(row["status"] == "same" for row in rows)
+    assert "Identical journey" in format_run_comparison(1, 2, rows)
+
+
+# ---------------------------------------------------------------- watches
+
+
+def test_watch_table_marks_added_changed_and_removed():
+    hops = [hop(1, component="Gen"),
+            hop(2, component="Mid", changes=[{"name": "a", "before": "1",
+                                              "after": "2"}]),
+            hop(3, component="Mid", drop=("a",)),
+            hop(4, component="Sink", drop=("a",))]
+    annotate_hops(hops)
+    columns, rows = watch_rows(hops, ["a", "@size"])
+
+    assert columns == ["a", "@size"]
+    assert [row["cells"]["a"]["status"] for row in rows] == [
+        "set", "changed", "removed", "absent"]
+    assert [row["cells"]["a"]["value"] for row in rows] == ["1", "2", None, None]
+    assert all(row["cells"]["@size"]["value"] == "3" for row in rows)
+
+    text = format_watch_table(columns, rows)
+    assert "~2" in text and "·" in text
+    assert text.splitlines()[0].startswith("hop")
+
+
+def test_watch_globs_expand_to_the_names_the_flow_actually_set():
+    hops = [hop(1, changes=[{"name": "http.status", "before": None, "after": "200"},
+                            {"name": "http.url", "before": None, "after": "/x"}])]
+    assert expand_watches(hops, ["http.*"]) == ["http.status", "http.url"]
+    # An exact name nobody sets is kept: "never set" is a real answer.
+    assert expand_watches(hops, ["missing"]) == ["missing"]
+
+
+def test_a_borrowed_hop_leaves_the_watch_row_blank():
+    hops = [hop(1, changes=[{"name": "a", "before": None, "after": "1"}]),
+            dict(hop(2), own=False, flowfile_uuid="other-uuid",
+                 event_type="JOIN"),
+            hop(3)]
+    annotate_hops(hops)
+    columns, rows = watch_rows(hops, ["a"])
+    # The JOIN belongs to the merged file, not this one: blank, and it does
+    # not become the baseline, so hop 3 is still compared against hop 1.
+    assert rows[1]["cells"]["a"] == {"value": None, "status": "n/a"}
+    assert rows[2]["cells"]["a"]["status"] == "same"
+
+
+def test_watch_table_explains_itself_when_nothing_is_watched():
+    assert "globs allowed" in format_watch_table([], [])
+
+
+def test_watches_are_added_once_and_removable(stub):
+    f = follower(stub)
+    assert f.watch("filename") is True
+    assert f.watch("filename") is False
+    assert f.unwatch("filename") is True
+    assert f.unwatch("filename") is False
+
+
+# ------------------------------------------------------------- persistence
+
+
+def test_session_round_trips_watches_fixture_runs_and_injector(tmp_path):
+    session = FollowSession.open("Flow", "pg-1", tmp_path)
+    session.branch("ff-1", queue_id="c1")
+    session.record_hops("ff-1", [hop(1)])
+    session.watches = ["filename"]
+    session.fixture = {"target": "Mid", "content": "x", "attributes": {}}
+    session.injector = {"processor": "tmp-1", "connection": "tmp-c2"}
+    session.archive_run()
+    session.branch("ff-2")
+    path = session.save()
+
+    reloaded = FollowSession.load(path)
+    assert reloaded.watches == ["filename"]
+    assert reloaded.fixture["target"] == "Mid"
+    assert reloaded.injector["connection"] == "tmp-c2"
+    assert reloaded.run_hops(1)[0]["event_id"] == 1
+    assert reloaded.order == ["ff-2"]
+
+
+def test_a_version_1_session_still_loads(tmp_path):
+    # Older files predate fixtures entirely; they must resume as a journey
+    # that simply has nothing to replay, not fail to load.
+    old = {"version": 1, "id": "x", "group": "Flow", "pg_id": "pg-1",
+           "current": "ff-1", "last_event_id": 4, "order": ["ff-1"],
+           "branches": {"ff-1": {"uuid": "ff-1", "state": "live", "hops": []}}}
+    path = tmp_path / "old.json"
+    path.write_text(json.dumps(old), encoding="utf-8")
+    session = FollowSession.load(path)
+    assert session.current == "ff-1"
+    assert (session.watches, session.fixture, session.runs) == ([], None, [])
+
+
+# ------------------------------------------------------- command plumbing
+
+
+def test_follow_command_injects_and_retires_the_injector(stub):
+    script_step_then_quit = iter(["", "q"])
+    printed = []
+
+    def run_mid():
+        uuid = stub.minted[0]
+        stub.take(stub.queues[-1]["id"], uuid)
+        stub.put("c2", uuid)
+        stub.events[uuid].append(hop(200, component="Mid"))
+
+    stub.on_run_once["mid"] = run_mid
+    code = follow_command(
+        stub, "pg-1", inject_at="Mid", content="hello",
+        attributes={"case": "urgent"}, watch=["case"], poll_timeout=0,
+        input_fn=lambda prompt: next(script_step_then_quit),
+        print_fn=printed.append)
+
+    out = "\n".join(printed)
+    assert code == 0
+    assert "Injected a fixture FlowFile at 'Mid'" in out
+    assert "Watching case" in out
+    # The fixture has moved on, so the temporary generator is taken away.
+    assert "Removed the temporary 'niflow-inject' processor." in out
+    assert ("processors", "tmp-1") in stub.deleted
+
+
+def test_follow_command_keeps_an_injector_whose_file_never_moved(stub):
+    printed = []
+    follow_command(stub, "pg-1", inject_at="Mid", poll_timeout=0,
+                   input_fn=lambda prompt: "q", print_fn=printed.append)
+    out = "\n".join(printed)
+    # Removing it means draining its queue, and the fixture IS that queue.
+    assert "still in its queue" in out
+    assert stub.deleted == []
+
+
+def test_replay_without_resume_is_refused_before_anything_is_stopped(stub):
+    printed = []
+    code = follow_command(stub, "pg-1", replay=True, poll_timeout=0,
+                          input_fn=lambda prompt: "q", print_fn=printed.append)
+    assert code == 1
+    assert "--replay needs a saved session" in "\n".join(printed)
+    assert stub.stopped_groups == []   # refused before the group was quiesced
+
+
+def test_the_key_help_lists_the_new_keys(stub):
+    printed = []
+    follow_command(stub, "pg-1", uuid="ff-1", poll_timeout=0,
+                   input_fn=lambda prompt: "q", print_fn=printed.append)
+    out = "\n".join(printed)
+    assert "w=watch table" in out and "rr=replay" in out and "cmp=compare" in out
+
+
+def test_a_caller_supplied_filename_beats_the_pinned_one(stub):
+    follower(stub).inject("Mid", attributes={"filename": "sample.csv"})
+    assert stub.created[0][2]["config"]["properties"]["filename"] == "sample.csv"
+
+
+def test_compare_runs_ignores_the_attributes_that_identify_the_file():
+    def with_identity(uuid):
+        h = hop(1, component="Mid")
+        h["attributes"] = dict(h["attributes"], uuid=uuid,
+                               entryDate=f"date-{uuid}")
+        return h
+    rows = compare_runs([with_identity("a")], [with_identity("b")])
+    # A different uuid is not a difference the fix made — reporting it would
+    # make every replay look changed at every hop.
+    assert rows[0]["status"] == "same"

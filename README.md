@@ -17,6 +17,7 @@ niflow diff flows/prod_flow.py               # raw JSON diff vs the live canvas
 niflow test flows/prod_flow.py               # inject FlowFiles, assert what comes out
 niflow trace <flowfile-uuid>                 # replay one file's journey, attr diffs per hop
 niflow follow "Prod Flow (copy)"             # step ONE file hop by hop, like a debugger
+niflow follow "Prod Flow (copy)" --inject-at Stamp --content 'id,x' --watch mime.type
 niflow push flows/prod_flow.py --start       # or: full replace and start
 
 niflow pull --all -o flows/                  # mirror EVERY top-level group
@@ -282,8 +283,10 @@ make test-integration-v1             # integration tests against 1.24
   inspection, a Trace tab that replays one FlowFile's provenance journey hop
   by hop (attribute before/after, relationship taken, payload on demand), a
   Follow tab that steps a live FlowFile through a quiesced group one hop at a
-  time (changed/added/removed attributes flash; fork branches you don't care
-  about can be muted — they keep running in NiFi, they're just not followed),
+  time (changed/added/removed attributes flash; inject a FlowFile of your own
+  to step; watch attributes in a hop × attribute table; replay the same fixture
+  after a fix and compare the runs; fork branches you don't care about can be
+  muted — they keep running in NiFi, they're just not followed),
   bulletins/error panels, and plan-preview + incremental push for
   `flows/*.py`. Under WSL it opens the *Windows* default browser.
 - **`niflow-gui`** (`make gui`) — the PyQt6 desktop helper (`pip install -e

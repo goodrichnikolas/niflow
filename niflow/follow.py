@@ -44,14 +44,18 @@ a "retry?" affordance rather than a silent empty result.
 """
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
 import re
 import time
 from datetime import datetime
+from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+
+from niflow.testing import INJECTOR_NAME, inject_flowfile, remove_injector
 
 logger = logging.getLogger("niflow")
 
@@ -76,6 +80,9 @@ _RUN_ATTEMPTS = 8
 # far it got instead of pretending the file vanished.
 _RUN_CAP = 500
 _STEP_TIMEOUT_S = 60.0
+
+#: Filename given to an injected fixture unless the caller names one.
+FIXTURE_FILENAME = "niflow-fixture"
 
 _UUID_RE = re.compile(r"^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$")
 
@@ -273,6 +280,201 @@ def annotate_hops(
     return previous, previous_size
 
 
+# ------------------------------------------------------------------ watches
+
+#: Watch specs that are not attributes: a hop has a size and a shape too, and
+#: "did this processor stop rewriting the content" is a debugging question.
+_WATCH_PSEUDO: Dict[str, Callable[[dict], Any]] = {
+    "@size": lambda hop: hop.get("size"),
+    "@component": lambda hop: hop.get("component"),
+    "@event": lambda hop: hop.get("event_type"),
+    "@rel": lambda hop: hop.get("relationship"),
+}
+
+_WATCH_MARKS = {"changed": "~", "added": "+", "removed": "-"}
+
+#: How wide one watched column is printed. Values are clipped, not wrapped —
+#: the table is for spotting *when* something changed, and `a` shows the full
+#: attribute set of a hop.
+_WATCH_CELL = 22
+
+
+def _clip(value: Any, limit: int) -> str:
+    text = "" if value is None else str(value)
+    text = text.replace("\n", "⏎").replace("\t", " ")
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def expand_watches(hops: Sequence[dict], watches: Sequence[str]) -> List[str]:
+    """Concrete columns for a watch list: a glob becomes the names it matched.
+
+    ``w http.*`` is one thing to type and however many columns the flow turns
+    out to set. An exact name that no hop carries is kept as a column anyway —
+    "this attribute is never set" is often exactly what was being watched.
+    """
+    columns: List[str] = []
+    for spec in watches:
+        if spec in _WATCH_PSEUDO or not any(ch in spec for ch in "*?["):
+            if spec not in columns:
+                columns.append(spec)
+            continue
+        matched = sorted({name for hop in hops
+                          for name in (hop.get("attributes") or {})
+                          if fnmatch(name, spec)})
+        for name in matched or [spec]:
+            if name not in columns:
+                columns.append(name)
+    return columns
+
+
+def watch_value(hop: dict, column: str) -> Optional[str]:
+    """One watched value at one hop, or ``None`` when it is not set there."""
+    if column in _WATCH_PSEUDO:
+        value = _WATCH_PSEUDO[column](hop)
+        return None if value in (None, "") else str(value)
+    return (hop.get("attributes") or {}).get(column)
+
+
+def watch_rows(hops: Sequence[dict],
+               watches: Sequence[str]) -> Tuple[List[str], List[dict]]:
+    """The hop x attribute table: one row per hop, one cell per watch.
+
+    Each cell carries its ``value`` and a ``status`` (``set`` at the first
+    hop, then ``added`` / ``changed`` / ``removed`` / ``same``, or ``absent``
+    when it was never there) — the same vocabulary the per-hop diff uses, so
+    the table and the hops agree about what changed where.
+
+    Hops that belong to a relative (a lineage event) or are synthetic carry no
+    attributes of their own; their cells are blank and do not become the
+    baseline, or every attribute would read as removed and then re-added.
+    """
+    columns = expand_watches(hops, watches)
+    previous: Dict[str, Optional[str]] = {}
+    rows: List[dict] = []
+    for index, hop in enumerate(hops, 1):
+        borrowed = bool(hop.get("lineage")) or bool(hop.get("synthetic"))
+        cells: Dict[str, dict] = {}
+        for column in columns:
+            if borrowed:
+                cells[column] = {"value": None, "status": "n/a"}
+                continue
+            value = watch_value(hop, column)
+            before = previous.get(column)
+            if not previous:
+                status = "set" if value is not None else "absent"
+            elif value is None:
+                status = "removed" if before is not None else "absent"
+            elif before is None:
+                status = "added"
+            else:
+                status = "changed" if before != value else "same"
+            cells[column] = {"value": value, "status": status}
+        if not borrowed:
+            for column in columns:
+                previous[column] = cells[column]["value"]
+        rows.append({
+            "hop": index, "component": hop.get("component") or "(flow)",
+            "event": hop.get("event_type", ""),
+            "relationship": hop.get("relationship", ""),
+            "cells": cells,
+        })
+    return columns, rows
+
+
+def format_watch_table(columns: Sequence[str], rows: Sequence[dict],
+                       width: int = _WATCH_CELL) -> str:
+    """Render :func:`watch_rows` as the table the `w` key prints."""
+    if not columns:
+        return ("Watching nothing yet — `w NAME` watches an attribute "
+                "(globs allowed: `w http.*`; `@size` watches the payload).")
+    if not rows:
+        return "No hops on this branch yet — step first."
+    head = f"{'hop':>3}  {'component':<20}" + "".join(
+        f"  {_clip(c, width):<{width}}" for c in columns)
+    lines = [head, "-" * len(head)]
+    for row in rows:
+        line = f"{row['hop']:>3}  {_clip(row['component'], 20):<20}"
+        for column in columns:
+            cell = row["cells"][column]
+            text = "·" if cell["value"] is None else _clip(cell["value"], width - 2)
+            line += f"  {_WATCH_MARKS.get(cell['status'], ' ')}{text:<{width - 1}}"
+        lines.append(line.rstrip())
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------- replay-after-fix
+
+
+#: Attributes that identify a *particular* FlowFile rather than describe it.
+#: They can never match across two runs and can never be what a fix changed,
+#: so a replay comparison that reported them would be pure noise. (The
+#: per-hop diff still shows them: there they mean "this hop rewrote it".)
+_RUN_IDENTITY_ATTRIBUTES = frozenset({"uuid", "entryDate", "lineageStartDate"})
+
+
+def compare_runs(before: Sequence[dict],
+                 after: Sequence[dict]) -> List[dict]:
+    """Hop-by-hop divergence between two runs of the same fixture.
+
+    The question replay answers is "did my fix change what happens", so the
+    comparison is positional: hop 3 against hop 3. Anything an attribute diff
+    would hide — a different processor, a different relationship, a hop only
+    one run has — becomes a note of its own.
+    """
+    rows: List[dict] = []
+    for index in range(max(len(before), len(after))):
+        b = before[index] if index < len(before) else None
+        a = after[index] if index < len(after) else None
+        notes: List[str] = []
+        if b is None:
+            status = "only_after"
+        elif a is None:
+            status = "only_before"
+        else:
+            for field, label in (("component", "component"),
+                                 ("event_type", "event"),
+                                 ("relationship", "relationship")):
+                # Backslash-free f-string expressions: 3.9 is a supported line.
+                was = b.get(field) or "—"
+                now = a.get(field) or "—"
+                if was != now:
+                    notes.append(f"{label}: {was} -> {now}")
+            if (b.get("size") or 0) != (a.get("size") or 0):
+                notes.append(f"size: {b.get('size') or 0} B -> {a.get('size') or 0} B")
+            notes += [_diff_line(entry) for entry in _ordered_diff(
+                diff_attributes(dict(b.get("attributes") or {}), a))
+                if entry["name"] not in _RUN_IDENTITY_ATTRIBUTES]
+            status = "changed" if notes else "same"
+        rows.append({"hop": index + 1, "status": status, "notes": notes,
+                     "before": b, "after": a})
+    return rows
+
+
+def format_run_comparison(before_n: int, after_n: int,
+                          rows: Sequence[dict]) -> str:
+    """Render :func:`compare_runs` as the block the `cmp` key prints."""
+    before_hops = sum(1 for row in rows if row["before"])
+    after_hops = sum(1 for row in rows if row["after"])
+    differing = [row for row in rows if row["status"] != "same"]
+    lines = [f"Run {before_n} vs run {after_n}: {before_hops} hop(s) -> "
+             f"{after_hops}; {len(differing)} differ."]
+    if not differing:
+        lines.append("      Identical journey — nothing this FlowFile can "
+                     "see changed.")
+        return "\n".join(lines)
+    for row in differing:
+        hop = row["after"] or row["before"]
+        label = f"{hop.get('component') or '(flow)'} [{hop.get('event_type', '')}]"
+        if row["status"] == "only_after":
+            lines.append(f"{row['hop']:>3}. + only in run {after_n}: {label}")
+        elif row["status"] == "only_before":
+            lines.append(f"{row['hop']:>3}. - only in run {before_n}: {label}")
+        else:
+            lines.append(f"{row['hop']:>3}. {label}")
+            lines += [f"       {note}" for note in row["notes"]]
+    return "\n".join(lines)
+
+
 # ------------------------------------------------------------------- mutes
 
 _MUTE_KINDS = ("uuid", "rel", "dest", "queue")
@@ -406,9 +608,15 @@ class FollowSession:
     branch, the provenance cursor, the mute rules, and the pre-quiesce
     RUNNING set. It is written after every step, so a refreshed GUI page or a
     restarted process re-attaches to the same journey instead of losing it.
+    It also holds the *fixture* (what was injected, and the injector minting
+    it) and the runs already finished, which is what makes replay-after-fix a
+    comparison rather than a fresh start.
     """
 
-    VERSION = 1
+    #: 2 added watches/fixture/injector/runs. Older files still load: every
+    #: one of those fields defaults to empty, so a v1 session resumes as a
+    #: journey that simply has no fixture to replay.
+    VERSION = 2
 
     def __init__(self, group: str, pg_id: str, path: Optional[Path] = None,
                  session_id: Optional[str] = None) -> None:
@@ -423,6 +631,10 @@ class FollowSession:
         self.mutes = BranchMutes()
         self.branches: Dict[str, dict] = {}
         self.order: List[str] = []
+        self.watches: List[str] = []
+        self.fixture: Optional[dict] = None      # what to inject on replay
+        self.injector: Optional[dict] = None     # the temp components doing it
+        self.runs: List[dict] = []               # finished runs, for `cmp`
 
     # --- branches -------------------------------------------------------
 
@@ -442,6 +654,55 @@ class FollowSession:
             self.order.append(uuid)
         record.update({k: v for k, v in fields.items() if v is not None})
         return record
+
+    # --- watches --------------------------------------------------------
+
+    def add_watch(self, spec: str) -> bool:
+        """Start watching an attribute (or glob); False if already watched."""
+        spec = spec.strip()
+        if not spec or spec in self.watches:
+            return False
+        self.watches.append(spec)
+        return True
+
+    def remove_watch(self, spec: str) -> bool:
+        """Stop watching; False if it was not being watched."""
+        spec = spec.strip()
+        if spec not in self.watches:
+            return False
+        self.watches.remove(spec)
+        return True
+
+    # --- runs -----------------------------------------------------------
+
+    def flat_hops(self) -> List[dict]:
+        """Every hop of the run in progress, in branch order."""
+        return [hop for _, hop in self.all_hops()]
+
+    def run_hops(self, n: int) -> List[dict]:
+        """Every hop of finished run ``n`` (1-based), in branch order."""
+        run = self.runs[n - 1]
+        return [hop for uuid in run["order"] for hop in run["branches"][uuid]["hops"]]
+
+    def archive_run(self) -> dict:
+        """Freeze the journey so far as a finished run and start a clean one.
+
+        Replay compares what happens *this* time against what happened last
+        time, so the hops cannot simply be dropped. Mutes and watches survive
+        deliberately: they are how you are looking at the flow, not what the
+        flow did.
+        """
+        run = {
+            "n": len(self.runs) + 1,
+            "at": datetime.now().isoformat(timespec="seconds"),
+            "fixture": copy.deepcopy(self.fixture),
+            "order": list(self.order),
+            "branches": copy.deepcopy(self.branches),
+        }
+        self.runs.append(run)
+        self.branches, self.order = {}, []
+        self.current, self.last_event_id = None, -1
+        return run
 
     def record_hops(self, uuid: str, hops: Sequence[dict]) -> None:
         """Append hops to a branch's history, diffed against its baseline."""
@@ -494,6 +755,8 @@ class FollowSession:
             "prior_running": self.prior_running,
             "mutes": self.mutes.to_dict(),
             "order": list(self.order), "branches": self.branches,
+            "watches": list(self.watches), "fixture": self.fixture,
+            "injector": self.injector, "runs": self.runs,
         }
 
     @classmethod
@@ -508,6 +771,10 @@ class FollowSession:
         session.branches = dict(data.get("branches") or {})
         session.order = [u for u in (data.get("order") or [])
                          if u in session.branches]
+        session.watches = list(data.get("watches") or [])
+        session.fixture = data.get("fixture") or None
+        session.injector = data.get("injector") or None
+        session.runs = list(data.get("runs") or [])
         return session
 
     def save(self) -> Optional[Path]:
@@ -802,6 +1069,180 @@ class FlowFollower:
                 f"{source!r} is ambiguous ({paths}); use a path or id")
         self._run_once(matches[0]["id"], matches[0]["name"])
         return matches[0]["name"]
+
+    # ------------------------------------------------- fixture injection
+
+    def inject(self, target: str, content: str = "",
+               attributes: Optional[Dict[str, str]] = None,
+               wait: Optional[float] = None) -> dict:
+        """Mint a FlowFile of your own choosing and follow it.
+
+        Every other start point waits for the flow to produce something: a
+        file already queued, a source worth running, a port someone else
+        feeds. This one is the debugger's own input — the content and the
+        attributes you want, at the component you care about — minted by the
+        same temporary GenerateFlowFile the test harness uses
+        (:func:`niflow.testing.inject_flowfile`), which is created stopped and
+        triggered exactly once so nothing else on the quiesced canvas moves.
+
+        The injector is recorded on the session: replaced on replay, removed
+        when the session ends and the fixture has left its queue.
+
+        ``target`` is a processor or a **nested** input port, by name,
+        ``path/name`` or id.
+        """
+        resolved = self._injection_target(target)
+        label = f"{resolved['path']}/{resolved['name']}".lstrip("/")
+        # GenerateFlowFile names its file after a fresh UUID, which would make
+        # every replay differ at every hop for a reason that is not the flow's.
+        # Pinning it keeps the comparison honest — and a rename BY the flow is
+        # still visible, which is why filename is not simply ignored later.
+        attributes = {"filename": FIXTURE_FILENAME, **(attributes or {})}
+        self.cleanup_injector()  # never leave two injectors on one canvas
+        proc_id, conn_id = inject_flowfile(
+            self.client, resolved, content=content, attributes=attributes,
+            start_target=False)
+        self.session.injector = {"processor": proc_id, "connection": conn_id,
+                                 "target": resolved["id"], "label": label}
+        self.session.fixture = {"target": target, "kind": resolved["kind"],
+                                "label": label, "content": content,
+                                "attributes": dict(attributes or {})}
+        self._save()
+        wait = self.poll_timeout * 4 if wait is None else wait
+        try:
+            picked = self.pick_flowfile(queue_ids=[conn_id], wait=wait)
+        except FollowError as exc:
+            errors = self._validation_errors(proc_id)
+            self.cleanup_injector()
+            detail = f" ({'; '.join(errors)})" if errors else ""
+            raise FollowError(
+                f"the injector minted nothing into {label!r}{detail} — "
+                "nothing was left on the canvas, so it is safe to retry") from exc
+        picked["injected"] = label
+        return picked
+
+    def _injection_target(self, spec: str) -> dict:
+        """Resolve an injection target to ``{kind,id,name,path,group_id,...}``."""
+        candidates = [
+            {"kind": "processor", "id": proc["id"], "name": proc["name"],
+             "path": proc.get("path", ""), "group_id": proc.get("group_id", "")}
+            for proc in self.client.find_processors(group=self.pg_id)
+        ] + [
+            {"kind": "input_port", "id": port["id"], "name": port["name"],
+             "path": port.get("path", ""), "group_id": port.get("group_id", "")}
+            for port in _input_ports(self.client, self.pg_id)
+        ]
+        matches = [c for c in candidates
+                   if spec in (c["id"], c["name"],
+                               f"{c['path']}/{c['name']}".lstrip("/"))]
+        if not matches:
+            raise FollowError(
+                f"no processor or input port named {spec!r} in {self.group!r} "
+                "— `niflow follow <group> --list` shows what is there")
+        if len(matches) > 1:
+            paths = ", ".join(f"{m['path']}/{m['name']}".lstrip("/")
+                              for m in matches)
+            raise FollowError(f"{spec!r} is ambiguous ({paths}); use a path or id")
+        target = matches[0]
+        if target["kind"] == "input_port":
+            # A port is fed from outside its own group, so the injector has to
+            # live in the parent. For the followed group's OWN port that parent
+            # is outside the journey: the connection would not even show up in
+            # its queues, so the file would be un-followable.
+            if target["group_id"] == self.pg_id:
+                raise FollowError(
+                    f"{spec!r} is {self.group!r}'s own input port — it is fed "
+                    "from outside the followed group, so the injector would "
+                    "land outside it too. Inject at the processor it feeds.")
+            parent = self._parent_group(target["group_id"])
+            if not parent:
+                raise FollowError(
+                    f"could not find the group that feeds input port {spec!r} "
+                    "— inject at the processor it feeds instead")
+            target["parent_group_id"] = parent
+        return target
+
+    def _parent_group(self, pg_id: str) -> str:
+        try:
+            entity = self.client._get_json(f"/process-groups/{pg_id}")
+        except Exception as exc:  # a missing parent is a clear message, not a traceback
+            logger.debug("Could not read the parent of %s: %s", pg_id, exc)
+            return ""
+        return (entity.get("component") or {}).get("parentGroupId") or ""
+
+    def injector_holds_file(self) -> bool:
+        """Is the fixture still sitting in the injector's queue, unstepped?"""
+        record = self.session.injector
+        if not record:
+            return False
+        try:
+            queues = self._queues()
+        except FollowError:  # at teardown, an unreadable group means leave it be
+            return True
+        return any(q.get("id") == record.get("connection") and q.get("queued")
+                   for q in queues)
+
+    def cleanup_injector(self) -> bool:
+        """Remove this session's temporary injector; False if there was none.
+
+        Best effort by design: a leftover injector is a tidiness problem, and
+        failing to delete it must not be the thing that ends a session.
+        """
+        record = self.session.injector
+        if not record:
+            return False
+        try:
+            remove_injector(self.client, record.get("processor"),
+                            record.get("connection"))
+        except Exception as exc:
+            logger.warning("Could not remove the injector (%s) — it is on the "
+                           "canvas as %r", exc, INJECTOR_NAME)
+            return False
+        self.session.injector = None
+        self._save()
+        return True
+
+    def replay(self, wait: Optional[float] = None) -> dict:
+        """Re-inject the recorded fixture and start the journey over.
+
+        The loop this closes: step through, see the bug, fix the flow, push,
+        replay — the same bytes and attributes go in at the same place, and
+        :func:`compare_runs` says what the fix changed. The finished run is
+        archived first so there is something to compare against.
+        """
+        fixture = self.session.fixture
+        if not fixture:
+            raise FollowError(
+                "nothing to replay — this journey did not start from a "
+                "fixture. Start one with `--inject-at NAME` (with --content "
+                "and --attr) and replay re-runs exactly that.")
+        self.cleanup_injector()
+        run = self.session.archive_run()
+        self._save()
+        picked = self.inject(fixture["target"], content=fixture.get("content", ""),
+                             attributes=fixture.get("attributes") or {},
+                             wait=wait)
+        picked["run"] = run["n"] + 1
+        return picked
+
+    # ------------------------------------------------------------ watches
+
+    def watch(self, spec: str) -> bool:
+        """Watch an attribute (or glob, or ``@size``) across every hop."""
+        added = self.session.add_watch(spec)
+        if added:
+            self._save()
+        return added
+
+    def unwatch(self, spec: str) -> bool:
+        removed = self.session.remove_watch(spec)
+        if removed:
+            self._save()
+        return removed
+
+    def watch_table(self, uuid: Optional[str] = None) -> Tuple[List[str], List[dict]]:
+        """``(columns, rows)`` for one branch's hop x attribute table."""
+        return watch_rows(self.session.history(uuid), self.session.watches)
 
     def start_from(self, entry: dict, wait: Optional[float] = None) -> dict:
         """Begin a journey at one :func:`entry_points` entry.
@@ -1790,7 +2231,9 @@ _REASON_LINES: Dict[str, str] = {
 }
 
 _KEYS = ("Enter=step  r=retry poll  b=branches [all]  s=switch N  m=mute SPEC  "
-         "u=unmute SPEC  h=history [N]  a=attrs  c=content  q=quit")
+         "u=unmute SPEC  a=attrs  c=content  h=history [N]  q=quit\n"
+         "        w=watch table [NAME|-NAME|clear]  rr=replay the fixture  "
+         "cmp=compare runs [N]")
 
 
 def format_entry(index: int, entry: dict) -> str:
@@ -1845,6 +2288,11 @@ def follow_command(
     queue: Optional[str] = None,
     source: Optional[str] = None,
     start: Optional[str] = None,
+    inject_at: Optional[str] = None,
+    content: str = "",
+    attributes: Optional[Dict[str, str]] = None,
+    watch: Sequence[str] = (),
+    replay: bool = False,
     list_only: bool = False,
     auto: bool = False,
     max_hops: int = 50,
@@ -1869,6 +2317,11 @@ def follow_command(
             print_fn(format_entry(i, entry))
         return 0
 
+    if replay and not resume:
+        print_fn("--replay needs a saved session: it re-injects the fixture a "
+                 "previous run recorded. Add --resume.")
+        return 1
+
     session = None
     if resume:
         session = FollowSession.latest(group, session_dir)
@@ -1886,8 +2339,18 @@ def follow_command(
         rule = follower.mute(spec)["rule"]
         print_fn(f"Muted {rule} — that branch keeps running in NiFi, the "
                  "stepper just ignores it.")
+    for spec in watch or ():
+        follower.watch(spec)
+    if follower.session.watches:
+        print_fn(f"Watching {', '.join(follower.session.watches)} — `w` prints "
+                 "the hop table.")
 
     hop_no = 0
+
+    def reset_hop_numbers() -> None:
+        """A replay is run 2 of the same journey, so hop 1 is hop 1 again."""
+        nonlocal hop_no
+        hop_no = 0
 
     def render(outcome: dict) -> None:
         nonlocal hop_no
@@ -1909,14 +2372,23 @@ def follow_command(
             print_fn(f"Queue feeds a {kind} ({end.get('name', '')!r}) — "
                      "run-once cannot cross it.")
 
+    render.reset = reset_hop_numbers  # type: ignore[attr-defined]
+
     try:
-        if resume and not fresh and follower.uuid:
+        if resume and not fresh and replay:
+            print_fn(f"Resumed session {session.id}; replaying its fixture.")
+            _replay(follower, render, print_fn)
+        elif resume and not fresh and follower.uuid:
             print_fn(f"Resumed session {session.id} — following "
                      f"{follower.uuid} ({len(session.history())} hop(s) "
                      "already taken).")
         else:
+            if replay:
+                print_fn("No saved session to replay — starting a fresh "
+                         "journey instead.")
             picked = _start(follower, client, group, uuid=uuid, queue=queue,
-                            source=source, start=start, auto=auto,
+                            source=source, start=start, inject_at=inject_at,
+                            content=content, attributes=attributes, auto=auto,
                             input_fn=input_fn, print_fn=print_fn)
             if picked is None:
                 return 1
@@ -1933,6 +2405,7 @@ def follow_command(
             print_fn(_KEYS)
             _interactive(follower, client, render, input_fn, print_fn)
     finally:
+        _retire_injector(follower, print_fn)
         path = follower.session.save()
         if path:
             print_fn(f"Session saved to {path} (`--resume` picks it up).")
@@ -1975,11 +2448,21 @@ def _start(
     queue: Optional[str],
     source: Optional[str],
     start: Optional[str],
+    inject_at: Optional[str],
+    content: str,
+    attributes: Optional[Dict[str, str]],
     auto: bool,
     input_fn: Callable[[str], str],
     print_fn: Callable[[str], None],
 ) -> Optional[dict]:
     """Resolve where the journey begins, prompting only when it has to."""
+    if inject_at:
+        picked = follower.inject(inject_at, content=content,
+                                 attributes=attributes)
+        print_fn(f"Injected a fixture FlowFile at {picked['injected']!r} "
+                 f"({len(content)} byte(s) of content, "
+                 f"{len(attributes or {})} attribute(s)).")
+        return picked
     if uuid or queue:
         return follower.pick_flowfile(queue_id=queue, uuid=uuid)
     if source:
@@ -2085,6 +2568,16 @@ def _interactive(
             continue
         if key == "h":
             _show_history(follower, arg, print_fn)
+            continue
+        if key == "w":
+            _watch(follower, arg, print_fn)
+            continue
+        if key in ("rr", "replay"):
+            _replay(follower, render, print_fn)
+            last_hop = None
+            continue
+        if key in ("cmp", "compare"):
+            _compare(follower, arg, print_fn)
             continue
         if key in ("m", "u", "s") and not arg:
             print_fn(f"{key} needs an argument — {_KEYS}")
@@ -2200,6 +2693,78 @@ def _show_history(follower: FlowFollower, arg: str,
         return
     for i, hop in enumerate(hops, 1):
         print_fn(format_hop(i, hop))
+
+
+def _watch(follower: FlowFollower, arg: str,
+           print_fn: Callable[[str], None]) -> None:
+    """`w` — add/remove a watch, then print the hop x attribute table."""
+    if arg.lower() in ("clear", "none", "-"):
+        follower.session.watches = []
+        follower._save()
+        print_fn("Watching nothing.")
+        return
+    if arg.startswith("-") and len(arg) > 1:
+        spec = arg[1:].strip()
+        print_fn(f"No longer watching {spec!r}." if follower.unwatch(spec)
+                 else f"{spec!r} was not being watched.")
+    elif arg:
+        follower.watch(arg)
+        print_fn(f"Watching {arg!r}.")
+    columns, rows = follower.watch_table()
+    print_fn(format_watch_table(columns, rows))
+
+
+def _replay(follower: FlowFollower, render: Callable[[dict], None],
+            print_fn: Callable[[str], None]) -> None:
+    """`rr` — re-inject the recorded fixture and start the journey again."""
+    try:
+        picked = follower.replay()
+    except FollowError as exc:
+        print_fn(str(exc))
+        return
+    # The renderer numbers hops across the whole journey; a replay is a new
+    # journey, so hop 1 has to be hop 1 again.
+    getattr(render, "reset", lambda: None)()
+    queue = picked["queue"]
+    print_fn(f"Run {picked['run']}: re-injected the fixture at "
+             f"{picked['injected']!r} — now following {picked['uuid']} in "
+             f"{queue['source']} -> {queue['destination']}. Step it, then "
+             "`cmp` says what the fix changed.")
+
+
+def _compare(follower: FlowFollower, arg: str,
+             print_fn: Callable[[str], None]) -> None:
+    """`cmp` — this run against a finished one (the previous one by default)."""
+    runs = follower.session.runs
+    if not runs:
+        print_fn("Only one run so far — `rr` replays the fixture, and `cmp` "
+                 "then compares the two.")
+        return
+    which = int(arg) if arg.isdigit() else len(runs)
+    if not 1 <= which <= len(runs):
+        print_fn(f"No run {which} — there are {len(runs)}.")
+        return
+    rows = compare_runs(follower.session.run_hops(which),
+                        follower.session.flat_hops())
+    print_fn(format_run_comparison(which, len(runs) + 1, rows))
+
+
+def _retire_injector(follower: FlowFollower,
+                     print_fn: Callable[[str], None]) -> None:
+    """Take the temporary injector away — unless doing so kills the fixture.
+
+    Removing the injector means draining its connection, and if the fixture
+    FlowFile has not been stepped out of that queue yet, the drain *is* the
+    file. Leaving it there is the option that keeps `--resume` honest.
+    """
+    if not follower.session.injector:
+        return
+    if follower.injector_holds_file():
+        print_fn(f"Left the {INJECTOR_NAME!r} processor in place: the fixture "
+                 "FlowFile is still in its queue, and removing it would drop "
+                 "the file. `--resume` picks the journey up.")
+    elif follower.cleanup_injector():
+        print_fn(f"Removed the temporary {INJECTOR_NAME!r} processor.")
 
 
 def _branch_spec(follower: FlowFollower, arg: str) -> str:

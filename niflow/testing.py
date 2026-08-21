@@ -77,6 +77,110 @@ class CaseResult:
         return "\n".join(lines)
 
 
+# ------------------------------------------------------------------ injection
+
+
+#: Name of the temporary ``GenerateFlowFile`` that mints a fixture FlowFile.
+#: Deliberately recognisable on the canvas: an interrupted run can leave one
+#: behind, and "what is this processor" should answer itself.
+INJECTOR_NAME = "niflow-inject"
+
+
+def injector_properties(major_version: int, content: str = "",
+                        attributes: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """GenerateFlowFile properties that mint exactly one chosen FlowFile.
+
+    ``File Size`` is 0 B because the body (when there is one) comes from the
+    custom-text property, and dynamic properties become the FlowFile's
+    attributes.
+
+    2.x renamed the custom-text property and **direct REST creates are not
+    config-migrated** the way snapshot imports are, so the per-line name has
+    to be picked here (verified in tests/fixtures/real/): the 1.x machine name
+    silently becomes a dynamic property on 2.x and the injected file arrives
+    empty.
+    """
+    properties: Dict[str, str] = {"File Size": "0B"}
+    if content:
+        key = "Custom Text" if major_version >= 2 else "generate-ff-custom-text"
+        properties[key] = content
+    properties.update(attributes or {})  # dynamic props -> FlowFile attributes
+    return properties
+
+
+def inject_flowfile(
+    client: Any,
+    target: Dict[str, Any],
+    *,
+    content: str = "",
+    attributes: Optional[Dict[str, str]] = None,
+    name: str = INJECTOR_NAME,
+    position: Optional[Dict[str, float]] = None,
+    start_target: bool = True,
+) -> Tuple[str, str]:
+    """Mint one FlowFile into ``target``; returns ``(processor, connection)``.
+
+    ``target`` is ``{"kind", "id", "group_id", "parent_group_id"}``: a
+    processor, or an input port — which is fed from *outside* its own group,
+    so the generator lives in the parent and the connection crosses the
+    boundary.
+
+    The generator is created stopped and triggered exactly once, which is what
+    makes this safe on a quiesced canvas: the only thing that moves is the
+    file it mints. ``start_target=False`` leaves the destination stopped —
+    what the stepper wants, since it drives the destination itself with
+    run-once; the test harness passes True because its target has to consume.
+
+    Both ids belong to the caller to clean up (:func:`remove_injector`).
+    """
+    if target.get("kind") == "input_port":
+        gen_group = target.get("parent_group_id") or target["group_id"]
+        dest_type = "INPUT_PORT"
+    else:
+        gen_group = target["group_id"]
+        dest_type = "PROCESSOR"
+
+    proc_id = client.create_processor(
+        gen_group,
+        {
+            "type": "org.apache.nifi.processors.standard.GenerateFlowFile",
+            "name": name,
+            "position": position or {"x": -420.0, "y": -160.0},
+            "config": {
+                "properties": injector_properties(
+                    client._major_version(), content, attributes),
+                "schedulingPeriod": "1 hour",
+            },
+        },
+    )
+    conn_id = client.create_connection(
+        gen_group,
+        source={"id": proc_id, "groupId": gen_group, "type": "PROCESSOR"},
+        destination={"id": target["id"], "groupId": target["group_id"],
+                     "type": dest_type},
+        relationships=["success"],
+    )
+    if start_target and target.get("kind") == "processor":
+        # The target may have been stopped as a source; it must consume.
+        client.start_processor(target["id"])
+    client.run_processor_once(proc_id)
+    return proc_id, conn_id
+
+
+def remove_injector(client: Any, proc_id: Optional[str],
+                    conn_id: Optional[str]) -> None:
+    """Delete a temporary injector, draining its queue first.
+
+    NiFi refuses to delete a connection that still holds FlowFiles, and the
+    fixture file is exactly what is in there — so the drain is not optional.
+    """
+    if conn_id:
+        client.drain_connection(conn_id)
+        client._delete_component("connections", conn_id)
+    if proc_id:
+        client._delete_component("processors", proc_id)
+
+
 class FlowTester:
     """Runs :class:`TestCase` s against a sandbox copy of a flow."""
 
@@ -221,45 +325,10 @@ class FlowTester:
     # ------------------------------------------------------------- injection
 
     def _inject(self, case: TestCase, target: dict) -> Tuple[str, str]:
-        properties: Dict[str, str] = {"File Size": "0B"}
-        if case.content:
-            # 2.x renamed the property; direct REST creates are NOT migrated
-            # the way snapshot imports are, so pick the real per-line name
-            # (verified in tests/fixtures/real/): the 1.x machine name would
-            # silently become a dynamic property on 2.x -> empty content.
-            key = "Custom Text" if self.client._major_version() >= 2 else "generate-ff-custom-text"
-            properties[key] = case.content
-        properties.update(case.attributes)  # dynamic props -> FlowFile attributes
-
-        if target["kind"] == "input_port":
-            # A group's input port is fed from OUTSIDE: the generator lives in
-            # the parent group and the connection crosses the boundary.
-            gen_group = target["parent_group_id"] or self.pg_id
-            dest_type = "INPUT_PORT"
-        else:
-            gen_group = target["group_id"]
-            dest_type = "PROCESSOR"
-
-        proc_id = self.client.create_processor(
-            gen_group,
-            {
-                "type": "org.apache.nifi.processors.standard.GenerateFlowFile",
-                "name": "niflow-test-inject",
-                "position": {"x": -420.0, "y": -160.0},
-                "config": {"properties": properties, "schedulingPeriod": "1 hour"},
-            },
-        )
-        conn_id = self.client.create_connection(
-            gen_group,
-            source={"id": proc_id, "groupId": gen_group, "type": "PROCESSOR"},
-            destination={"id": target["id"], "groupId": target["group_id"], "type": dest_type},
-            relationships=["success"],
-        )
-        if target["kind"] == "processor":
-            # The target may have been stopped as a source; it must consume.
-            self.client.start_processor(target["id"])
-        self.client.run_processor_once(proc_id)
-        return proc_id, conn_id
+        """One case's FlowFile, minted by the shared injector above."""
+        return inject_flowfile(
+            self.client, target, content=case.content,
+            attributes=case.attributes, name="niflow-test-inject")
 
     # ------------------------------------------------------------- collection
 
@@ -289,11 +358,7 @@ class FlowTester:
     def _cleanup_case(self, temp_proc: Optional[str], temp_conn: Optional[str]) -> None:
         try:
             self.client._set_group_state(self.pg_id, "STOPPED")
-            if temp_conn:
-                self.client.drain_connection(temp_conn)
-                self.client._delete_component("connections", temp_conn)
-            if temp_proc:
-                self.client._delete_component("processors", temp_proc)
+            remove_injector(self.client, temp_proc, temp_conn)
             self.client.purge_queues(self.pg_id)
         except Exception as exc:  # cleanup must never mask the case's outcome
             logger.warning("Sandbox cleanup issue (continuing): %s", exc)
